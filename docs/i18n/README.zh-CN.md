@@ -46,7 +46,7 @@ AnyXboxX 专注于一个版本：**Xbox Series 版《Grand Theft Auto VI》，�
 - **GPU 指令：70%。** 主机游戏的着色器是针对 Series X 的 RDNA 2 GPU 编译的。1,490 种 RDNA 2 编码中已有 1,046 种可在参考解释器中运行，RDNA 2 → DXIL 重编译器已能用 D3D12 绘制首个顶点着色器和像素着色器。
 - **系统函数：66%。** 测试包中各 DLL 导入的 1 337 个函数里，有这个比例在隔离模式下已被解析。
 - **主机专用 DLL**：`xmem.dll`（4/4）和 `d3d12_xs.dll`（2/2）已针对该包用到的函数完成翻译。D3D12.X（设备和 `ID3D12*` 接口）由 TomBox 的 `d3d12_xs.dll` 提供，尚未用游戏测试。
-- **GDK 运行时：396 个函数中的 210 个**是在 AnyXboxX 中用 C++ 编写的：任务队列（`XTaskQueue`、`XAsync`、`XThread`）、用户（`XUser`，一个离线的本地档案）、Xbox Series X 的身份（`XSystem`、Title ID、分析数据、运行时功能）、存档（`XGameSave`、`XGameSaveFiles`、`XPersistentLocalStorage`）游戏包（`XPackage`），离线商店（`XStore`），以及离线的邀请、激活和错误报告（`XGameInvite`、`XGameActivation`、`XGameProtocol`、`XError`），以及 PC 的真实 HDR 状态和网络连接（`XDisplayTryEnableHdrMode`、`XNetworkingGetConnectivityHint`）。当 AnyXboxX 单独管理运行时（没有 Gaming Services，或使用 `ANYXBOXX_SYSTEM_RUNTIME=0`）时，它们才会生效。如果存在 Windows 的 GDK 运行时，则由它提供所有接口（包括任务队列），因为其 API 只接受它自己的队列。跟踪（`ANYXBOXX_TRACE=1`）会列出每个被请求接口的名称。
+- **GDK 运行时：396 个函数中的 241 个**是在 AnyXboxX 中用 C++ 编写的：任务队列（`XTaskQueue`、`XAsync`、`XThread`）、用户（`XUser`，一个离线的本地档案）、Xbox Series X 的身份（`XSystem`、Title ID、分析数据、运行时功能）、存档（`XGameSave`、`XGameSaveFiles`、`XPersistentLocalStorage`）游戏包（`XPackage`），离线商店（`XStore`），以及离线的邀请、激活和错误报告（`XGameInvite`、`XGameActivation`、`XGameProtocol`、`XError`），没有任何串流客户端的游戏串流（`XGameStreaming`），以及 PC 的真实 HDR 状态和网络连接（`XDisplayTryEnableHdrMode`、`XNetworkingGetConnectivityHint`）。当 AnyXboxX 单独管理运行时（没有 Gaming Services，或使用 `ANYXBOXX_SYSTEM_RUNTIME=0`）时，它们才会生效。如果存在 Windows 的 GDK 运行时，则由它提供所有接口（包括任务队列），因为其 API 只接受它自己的队列。跟踪（`ANYXBOXX_TRACE=1`）会列出每个被请求接口的名称。
 
 该图表由 `scarlett.py --traduction <包文件夹> docs/images/traduction.svg` 重新生成。
 
@@ -114,7 +114,7 @@ C++ 运行时会为游戏 DXGI 交换链的每次 `Present` 计时，即使 DXGI
 | 将主机 DXIL 转换为 PC DXIL（`dxil-ms-xb2` → `dxil-ms-dx`，无需经过 HLSL）：Xbox2Windows 的工具（MIT），连同其测试原样复制到 `third_party/xbox2windows/`；`python third_party/xbox2windows/tools/dxil_retarget.py <输入> <输出>` 或 `--pe <game.exe>` | ✅ 已完成 |
 | 拉取请求检查：每个拉取请求都运行 lint 并核对 9 个 README 的同步（行、图片、测试数量） | ✅ 已完成 |
 | Rust 实现的主机纹理：从 Xbox2Windows（MIT）移植的 BC7 解码和 GFX10 `SW_4K_S` 去平铺，复现了参考摘要；`anyxboxx_texture bc7 <blocks.bin> <宽> <高> <out.png> [--4k-s]` | 🟡 进行中 |
-| 由 AnyXboxX 自行编写的其他 GDK 接口（`XGameUi`、`XNetworking`…） | ⏳ 待完成 |
+| 由 AnyXboxX 自行编写的其他 GDK 接口（`XGameUi`、`XNetworking`…） | 🟡 进行中 |
 | RDNA 2 → DXIL 着色器重编译器：首批程序已翻译为 HLSL、编译为 DXIL 并通过 D3D12 在 PC 的 GPU 上运行（`--hlsl`、`anyxboxx_gpu_run.exe`，无 GPU 时用 WARP），内存与 wave32 参考解释器的结果完全一致，该解释器可执行 1,490 种编码中的 1,046 种（标量、VOP1/VOP2/VOPC/VOP3/VOP3P、内存：SMEM、LDS、GLOBAL、带 V# 边界和类型化格式的 MUBUF/MTBUF、原子操作、分支、`exec` 分歧）；首个顶点着色器和像素着色器（EXP 导出、VINTRP 插值）已用 D3D12 绘制，逐顶点、逐像素一致：`scarlett.py --rdna2 <shader.bin> --executer` | 🟡 进行中 |
 | 在 wave 为 32 通道的 GPU 上运行 wave64 计算程序（#70）：每个 64 通道 wave 作为一个 64 线程的线程组运行（通道掩码和通道读取通过 groupshared 内存，不用 `WaveSize`），在 RTX（32 通道 wave）和 WARP 上内存与 wave64 参考解释器完全一致；DPP 和 SDWA 比较仍按名称拒绝 | 🟡 进行中 |
 | 着色器缓存：翻译后的着色器只编译一次为 DXIL，之后从磁盘（1.4 ms）或内存（0.8 ms）复用，而不再调用 dxc（22 ms）；`%LOCALAPPDATA%\AnyXboxX\shader-cache` 或 `ANYXBOXX_SHADER_CACHE`，大小有上限 | 🟡 进行中 |
