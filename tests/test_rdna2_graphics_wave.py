@@ -127,6 +127,25 @@ def test_translate_pixel_allows_explicit_wave_lanes_override():
     assert "WaveActiveBallot(bit && !IsHelperLane())" in hlsl
 
 
+def test_run_pixel_wave_supports_per_lane_primitives():
+    """NVIDIA drivers can pack pixels from multiple primitives into a single warp;
+    `run_pixel_wave` interpolates each lane using its own primitive's parameters."""
+    memory = bytearray(graphics.MEMORY_SIZE)
+    # prim 0: attr0.x = 0.75 (always >= 0.5); prim 1: attr0.x = 0.25 (always < 0.5)
+    struct.pack_into("<3f", memory, graphics.parameter_address(0, 0, 0), 0.75, 0.0, 0.0)
+    struct.pack_into("<3f", memory, graphics.parameter_address(1, 0, 0), 0.25, 0.0, 0.0)
+    pixels = {lane: (float_bits(0.1 * lane), 0) for lane in range(8)}
+    primitives = {lane: 0 if lane < 4 else 1 for lane in range(8)}
+    exports = rdna2_exec_graphics.run_pixel_wave(
+        _ps_lane_dependent_wave(), pixels, primitives, {}, bytes(memory), exec_mask=0xFF
+    )
+    mrt0 = exports[graphics.TARGET_MRT0]
+    for lane in range(8):
+        expected_v2 = float_bits(0.75 if lane < 4 else 1.25)
+        expected_narrow = 0xF0 if lane >= 4 else 0
+        assert mrt0[lane] == [expected_v2, 0xF0, float_bits(0.75), expected_narrow]
+
+
 @gpu
 @pytest.mark.parametrize("geometry, verts", [
     ("fullscreen", [(-1.0, -1.0, 0.0), (3.0, -1.0, 2.5), (-1.0, 3.0, 0.0)]),
@@ -157,7 +176,9 @@ def test_multi_lane_pixel_shader_lane_dependent_matches_interpreter(geometry, ve
     pixel_hlsl = rdna2_hlsl_graphics.translate_pixel(shader, WIDTH)
     after = rdna2_gpu.draw(vertex_hlsl, pixel_hlsl, bytes(memory), vertex_count, WIDTH, HEIGHT)
 
-    # Reconstruct exact GPU waves keyed by (primitive, first_active_i, first_active_j, init_exec).
+    # Reconstruct exact GPU waves keyed by (first_active_i, first_active_j, init_exec).
+    # A single GPU warp (e.g. on NVIDIA) may contain pixels from multiple primitives, so
+    # primitive is tracked per lane rather than splitting the wave key.
     waves = {}
     covered = 0
     for pixel in range(WIDTH * HEIGHT):
@@ -167,19 +188,20 @@ def test_multi_lane_pixel_shader_lane_dependent_matches_interpreter(geometry, ve
         covered += 1
         mrt0 = words(after, record + 16, 4)
         gpu_lane, init_exec, first_i, first_j = words(after, record + 32, 4)
-        key = (primitive, first_i, first_j, init_exec)
-        waves.setdefault(key, {})[gpu_lane] = (pixel, i_bits, j_bits, mrt0)
+        key = (first_i, first_j, init_exec)
+        waves.setdefault(key, {})[gpu_lane] = (pixel, i_bits, j_bits, primitive, mrt0)
     assert covered == WIDTH * HEIGHT
 
     saw_divergence = False
     lane2_values = set()
-    for (primitive, _, _, init_exec), lane_map in waves.items():
-        wave_pixels = {lane: (i_bits, j_bits) for lane, (_, i_bits, j_bits, _) in lane_map.items()}
+    for (_, _, init_exec), lane_map in waves.items():
+        wave_pixels = {lane: (i_bits, j_bits) for lane, (_, i_bits, j_bits, _, _) in lane_map.items()}
+        wave_primitives = {lane: prim for lane, (_, _, _, prim, _) in lane_map.items()}
         expected = rdna2_exec_graphics.run_pixel_wave(
-            shader, wave_pixels, primitive, {}, bytes(memory), exec_mask=init_exec
+            shader, wave_pixels, wave_primitives, {}, bytes(memory), exec_mask=init_exec
         )[graphics.TARGET_MRT0]
-        for lane, (pixel, _, _, got_mrt0) in lane_map.items():
-            assert got_mrt0 == expected[lane], f"{geometry} prim {primitive} pixel {pixel} lane {lane}"
+        for lane, (pixel, _, _, prim, got_mrt0) in lane_map.items():
+            assert got_mrt0 == expected[lane], f"{geometry} prim {prim} pixel {pixel} lane {lane}"
             _, ballot, lane2_val, _ = got_mrt0
             if 0 < ballot < init_exec:
                 saw_divergence = True

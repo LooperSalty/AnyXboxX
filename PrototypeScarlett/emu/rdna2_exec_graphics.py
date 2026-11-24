@@ -25,10 +25,15 @@ def _interpolate(wave, name, fields):
 
     if fields["attr"] >= graphics.PARAMETER_COUNT:
         raise Untranslated(f"{name} : attribut {fields['attr']} au-delà de param{graphics.PARAMETER_COUNT - 1}")
-    address = graphics.parameter_address(wave.primitive, fields["attr"], fields["chan"])
-    p0, p10, p20 = wave.memory.read_words(address, 3)
+    primitives = getattr(wave, "primitives", None)
+    cache = {}
     destination, source = wave.v[fields["vdst"]], fields["vsrc"]
     for lane in wave.active():
+        primitive = primitives.get(lane, wave.primitive) if primitives is not None else wave.primitive
+        if primitive not in cache:
+            address = graphics.parameter_address(primitive, fields["attr"], fields["chan"])
+            cache[primitive] = wave.memory.read_words(address, 3)
+        p0, p10, p20 = cache[primitive]
         if name == "v_interp_p1_f32":
             destination[lane] = _multiply_add(p10, wave.v[source][lane], p0)
         elif name == "v_interp_p2_f32":
@@ -82,6 +87,7 @@ def run_pixel_wave(data, pixels, primitive, sgprs, memory, exec_mask=None):
     """Exports {cible: {ligne: [4 mots]}} du pixel shader pour un wave32 (1 à 32 pixels).
 
     `pixels` : liste [(i, j), ...] (lignes 0..n-1) ou dict {ligne: (i, j)}.
+    `primitive` : indice de primitive commun (int), ou par ligne (dict {ligne: prim} ou liste).
     `exec_mask` : masque EXEC initial (par défaut les bits des lignes présentes dans `pixels`)."""
     from emu import rdna2_exec
 
@@ -97,7 +103,13 @@ def run_pixel_wave(data, pixels, primitive, sgprs, memory, exec_mask=None):
     wave.s[rdna2_exec.EXEC_LO] = default_mask if exec_mask is None else (exec_mask & 0xFFFF_FFFF)
     for number, value in (sgprs or {}).items():
         wave.s[number] = value
-    wave.exports, wave.primitive = {}, primitive
+    wave.exports = {}
+    if isinstance(primitive, dict):
+        wave.primitive, wave.primitives = 0, dict(primitive)
+    elif isinstance(primitive, (list, tuple)):
+        wave.primitive, wave.primitives = 0, dict(enumerate(primitive))
+    else:
+        wave.primitive, wave.primitives = primitive, None
     rdna2_exec.run(data, wave)
     return {target: dict(lanes) for target, lanes in wave.exports.items()}
 
