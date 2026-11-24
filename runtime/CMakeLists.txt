@@ -47,6 +47,7 @@ anyxboxx_dll(xgameruntime xgameruntime/xgameruntime.cpp xgameruntime/served_inte
              xgameruntime/platform_interface.cpp xgameruntime/gamer_picture.cpp
              xgameruntime/store_interface.cpp xgameruntime/streaming_interface.cpp
              xgameruntime/gameui_interface.cpp xgameruntime/gameui_requests.cpp
+             xgameruntime/accessibility_interface.cpp
              xgameruntime/xgameruntime.def)
 target_link_libraries(xgameruntime PRIVATE anyxboxx_task dxgi ole32 iphlpapi)
 anyxboxx_dll(xmem xmem/xmem.cpp xmem/era_heap.cpp xmem/era_query.cpp xmem/aligned_pages.cpp
