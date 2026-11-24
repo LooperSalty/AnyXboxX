@@ -15,10 +15,26 @@ COMMON = """// Généré par AnyXboxX (emu/rdna2_hlsl_graphics.py) : {stage} RDN
 #define END_PC 0xFFFFFFFFu
 RWByteAddressBuffer g_memory : register(u0);
 
-uint Ballot(uint lane, bool bit) {{ return bit ? 1u : 0u; }}            // wave d'une ligne
-uint ReadLane(uint lane, uint value, uint other) {{ return value; }}
+{wave_helpers}
 {images}
 """
+SINGLE_LANE_HELPERS = """uint Ballot(uint lane, bool bit) { return bit ? 1u : 0u; }            // wave d'une ligne
+uint ReadLane(uint lane, uint value, uint other) { return value; }"""
+# SM 6.6 (ps_6_6) : `!IsHelperLane()` exclut les helper lanes des quads partiellement couverts
+# de `s[126]` (EXEC) et de chaque `Ballot()` (appelé par rdna2_hlsl.py avec `t = active && cond`).
+# Sur un wave de 64 lignes (ou plus), `WaveGetLaneIndex() >> 5` sélectionne la tranche de 32 lignes
+# correspondante (`b.x` pour 0..31, `b.y` pour 32..63, etc.) et `ReadLane` ajoute la base
+# `WaveGetLaneIndex() & ~31u`, sans recouvrement entre les lignes 32..63 et 0..31.
+MULTI_LANE_HELPERS = """uint WaveBallot32(bool bit) {
+  uint4 b = WaveActiveBallot(bit && !IsHelperLane());
+  uint h = WaveGetLaneIndex() >> 5;
+  return h == 0u ? b.x : (h == 1u ? b.y : (h == 2u ? b.z : b.w));
+}
+uint Ballot(uint lane, bool bit) { return WaveBallot32(bit); }
+uint ReadLane(uint lane, uint value, uint other) {
+  uint base = WaveGetLaneIndex() & ~31u;
+  return WaveReadLaneAt(value, base + (other & 31u));
+}"""
 REGISTERS = """  uint lane = 0u;
   uint s[128];
   uint v[256];
@@ -27,6 +43,28 @@ REGISTERS = """  uint lane = 0u;
   for (uint i = 0; i < 128; ++i) s[i] = 0u;
   for (uint j = 0; j < 256; ++j) v[j] = 0u;
   s[126] = 1u;"""
+MULTI_LANE_REGISTERS = """  uint lane = WaveGetLaneIndex() & 31u;
+  uint s[128];
+  uint v[256];
+  uint s_null = 0u;
+  bool scc = false;
+  for (uint i = 0; i < 128; ++i) s[i] = 0u;
+  for (uint j = 0; j < 256; ++j) v[j] = 0u;
+  s[126] = WaveBallot32(true);"""
+CROSS_LANE_OPS = frozenset({"v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32",
+                            "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_wqm_b32"})
+
+
+def _uses_wave_ops(data):
+    """Vrai si le shader utilise des opérations inter-lignes (ballot, readlane, masques EXEC)."""
+    for instruction in rdna2.decode(data):
+        if instruction.family == "VOPC":
+            return True
+        name = rdna2.mnemonic(instruction.family, instruction.opcode) or ""
+        if name in CROSS_LANE_OPS or name.startswith(("v_cmp_", "v_cmpx_", "s_and_saveexec", "s_or_saveexec",
+                                                      "s_andn2_saveexec", "s_xor_saveexec")):
+            return True
+    return False
 
 
 def _sources(fields):
@@ -100,7 +138,8 @@ def render_targets(data):
 
 def translate_vertex(data, sgprs=None):
     """Vertex shader HLSL (vs_6_0) : v0 = SV_VertexID, exports enregistrés dans VERTEX_RECORDS."""
-    lines = [COMMON.format(stage="vertex shader", images=ALU_HELPERS + "\n" + rdna2_hlsl_image.HELPERS),
+    lines = [COMMON.format(stage="vertex shader", wave_helpers=SINGLE_LANE_HELPERS,
+                           images=ALU_HELPERS + "\n" + rdna2_hlsl_image.HELPERS),
              "struct VSOut { float4 position : SV_Position; float2 bary : TEXCOORD0; };",
              "VSOut main(uint vertex : SV_VertexID) {", REGISTERS,
              "  VSOut o_out;", "  o_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);",
@@ -112,21 +151,29 @@ def translate_vertex(data, sgprs=None):
     return "\n".join(lines + ["  return o_out;", "}", ""])
 
 
-def translate_pixel(data, width, sgprs=None):
-    """Pixel shader HLSL (ps_6_0) : v0 = i, v1 = j ; entrées et exports dans PIXEL_RECORDS."""
+def translate_pixel(data, width, sgprs=None, multi_lane=None):
+    """Pixel shader HLSL (ps_6_0) : v0 = i, v1 = j ; entrées et exports dans PIXEL_RECORDS.
+
+    `multi_lane` : active les intrinsèques SM 6.0 (`WaveActiveBallot`, `WaveReadLaneAt`,
+    `WaveGetLaneIndex`) ; par défaut, détecté automatiquement si le shader emploie ballot/readlane."""
+    wave_mode = _uses_wave_ops(data) if multi_lane is None else bool(multi_lane)
     targets = render_targets(data)
     outputs = " ".join(f"float4 t{t} : SV_Target{t};" for t in targets)
     returned = "PSOut" if targets else "void"
-    lines = [COMMON.format(stage="pixel shader", images=ALU_HELPERS + "\n" + rdna2_hlsl_image.HELPERS)]
+    lines = [COMMON.format(stage="pixel shader",
+                           wave_helpers=MULTI_LANE_HELPERS if wave_mode else SINGLE_LANE_HELPERS,
+                           images=ALU_HELPERS + "\n" + rdna2_hlsl_image.HELPERS)]
     if targets:
         lines.append(f"struct PSOut {{ {outputs} }};")
     lines += [f"{returned} main(float4 position : SV_Position, float2 bary : TEXCOORD0, "
-              "uint primitive : SV_PrimitiveID) {", REGISTERS]
+              "uint primitive : SV_PrimitiveID) {",
+              MULTI_LANE_REGISTERS if wave_mode else REGISTERS]
     if targets:
         lines += ["  PSOut o_out;"] + [f"  o_out.t{t} = float4(0.0f, 0.0f, 0.0f, 0.0f);" for t in targets]
     lines += [f"  uint record = {graphics.PIXEL_RECORDS}u + (uint(position.y) * {width}u + uint(position.x)) * "
               f"{graphics.PIXEL_STRIDE}u;",
               "  v[0] = asuint(bary.x);", "  v[1] = asuint(bary.y);",
-              "  g_memory.Store4(record, uint4(1u, v[0], v[1], primitive));"]
+              "  if (!IsHelperLane()) g_memory.Store4(record, uint4(1u, v[0], v[1], primitive));"
+              if wave_mode else "  g_memory.Store4(record, uint4(1u, v[0], v[1], primitive));"]
     lines += body(data, sgprs, "return o_out;" if targets else "return;", _special("ps"))
     return "\n".join(lines + ["  return o_out;" if targets else "  return;", "}", ""])
