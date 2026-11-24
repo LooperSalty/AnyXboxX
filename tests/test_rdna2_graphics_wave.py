@@ -148,7 +148,7 @@ def test_run_pixel_wave_supports_per_lane_primitives():
 
 @gpu
 @pytest.mark.parametrize("geometry, verts", [
-    ("fullscreen", [(-1.0, -1.0, 0.0), (3.0, -1.0, 2.5), (-1.0, 3.0, 0.0)]),
+    ("fullscreen", [(-1.0, -1.0, 0.0), (3.0, -1.0, 2.5), (-1.0, 3.0, 1.0)]),
     ("diagonal_split", [
         (-1.0, -1.0, 0.0), (1.0, -1.0, 1.25), (1.0, 1.0, 0.8),
         (-1.0, -1.0, 0.0), (1.0, 1.0, 0.8), (-1.0, 1.0, 0.2),
