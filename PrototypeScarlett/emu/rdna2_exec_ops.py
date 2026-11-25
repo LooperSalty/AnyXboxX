@@ -14,6 +14,7 @@ MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 EXEC = 126                                  # exec_lo ; exec_hi en 127
 INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
 POSITIVE_INFINITY, NEGATIVE_INFINITY = 0x7F80_0000, 0xFF80_0000
+ALMOST_ONE_F32 = 0x3F7F_FFFF                # plus grand flottant sous 1.0
 
 
 def float_bits(value):
@@ -61,9 +62,18 @@ def _exp2(x):
         return math.inf
 
 
+def _signed_round(function):
+    """Arrondi entier qui garde le signe de x (IEEE 754 roundToIntegral : trunc(-0.5) = -0.0) ; ±infini
+    inchangé ; NaN : ValueError, rattrapée par _float_op."""
+    return lambda x: x if math.isinf(x) else math.copysign(float(function(x)), x)
+
+
 def _fract(x):
-    """x + -floor(x) (ISA) : NaN pour ±infini, où floor ne donne pas d'entier."""
-    return math.nan if math.isinf(x) else x - math.floor(x)
+    """x + -floor(x) (ISA), au plus le plus grand flottant sous 1.0 comme le modèle de LLVM
+    (ConstantFolding, amdgcn_fract) ; NaN pour ±infini, où floor ne donne pas d'entier."""
+    if math.isinf(x):
+        return math.nan
+    return min(x - _signed_round(math.floor)(x), bits_float(ALMOST_ONE_F32))
 
 
 def ldexp(x, exponent):
@@ -290,7 +300,7 @@ def _legacy_fma(x, y, z):
 
 
 def _round_even(x):
-    return x if math.isinf(x) or math.isnan(x) else float(round(x))
+    return x if math.isinf(x) or math.isnan(x) else math.copysign(float(round(x)), x)
 
 
 def _frexp_exponent(x):
@@ -348,9 +358,9 @@ VECTOR = {
     "v_log_f32": _unary_float(_log2),
     "v_sin_f32": _unary_float(lambda x: math.sin(x * 2 * math.pi)),
     "v_cos_f32": _unary_float(lambda x: math.cos(x * 2 * math.pi)),
-    "v_floor_f32": _unary_float(lambda x: x if math.isinf(x) else float(math.floor(x))),
-    "v_ceil_f32": _unary_float(lambda x: x if math.isinf(x) else float(math.ceil(x))),
-    "v_trunc_f32": _unary_float(lambda x: x if math.isinf(x) else float(math.trunc(x))),
+    "v_floor_f32": _unary_float(_signed_round(math.floor)),
+    "v_ceil_f32": _unary_float(_signed_round(math.ceil)),
+    "v_trunc_f32": _unary_float(_signed_round(math.trunc)),
     "v_rndne_f32": _unary_float(_round_even),
     "v_fract_f32": _unary_float(_fract),
     "v_add_f32": _binary_float(lambda x, y: x + y),

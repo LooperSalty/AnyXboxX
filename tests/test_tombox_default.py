@@ -15,7 +15,7 @@ else:
 pytestmark = pytest.mark.skipif(runtime is None, reason="exécution native sous Windows")
 
 ROOT = Path(__file__).resolve().parents[1]
-CI_CRATES = ("d3d12_xs", "xg_xs", "xmem", "d3d12_x", "xaudio2_9", "xapu", "xgs12")
+CI_CRATES = ("d3d12_xs", "xg_xs", "xmem", "d3d12_x", "xaudio2_9", "xapu", "xgs12", "xcrdapi", "acphal", "chad")
 
 
 def build_script():

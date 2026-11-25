@@ -350,6 +350,8 @@ Ils demandent le build `diag`.
 
 Pour arrêter le jeu : `taskkill /F /IM victory.exe`. La commande `timeout` de Git Bash ne tue pas l'exécutable.
 
+Pour mesurer un lancement, envoyez le journal de VIctory (stderr) dans un fichier, par exemple `.\tools\lancer_victory.ps1 -GameDir <dossier> 2> victory.log`, puis résumez-le avec `python tools/resume_journal_victory.py victory.log`. Le script garde les lignes d'images du monde (100 draws par image ou plus, `--draws-min` change le seuil) et donne la médiane et l'étendue de chaque partie de l'image (préparation, copies, textures, GPU, copie de retour, draws, draws perdus faute de pipeline hôte), ainsi que le nombre d'avertissements (shaders qui ne se traduisent pas, pipelines refusés, périphérique perdu). Avec deux journaux (`avant.log apres.log`), il compare les médianes colonne par colonne, pour juger un changement sur la partie de l'image qu'il vise. `--markdown` écrit des tableaux à coller dans une issue. Seuls des comptes et des temps sont écrits.
+
 ## Anciennes branches
 
 Les branches `anyxboxx/stable` et `anyxboxx/essai` de `LooperSalty/victory` ne sont plus l'épinglage : le fork ci-dessus les remplace. Les sections qui les citent décrivent des mesures antérieures.

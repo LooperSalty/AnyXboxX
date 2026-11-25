@@ -7,6 +7,16 @@ vdst et vdst + 1. Modificateurs VOP3 : abs/neg sur le bit de signe des sources f
 clamp/omod sur un résultat flottant. Les doubles Python suivent IEEE 754 (arrondi au plus près) ;
 v_fma_f64 arrondit une seule fois (calcul exact en fractions). D'après la documentation publique
 d'AMD (« RDNA 2 Instruction Set Architecture »).
+
+Arrondis et v_fract_f64 rendent un NaN d'entrée silencieux, signe et charge utile gardés
+(IEEE 754) ; les arrondis (trunc, ceil, floor, rndne) gardent le signe de zéro (trunc(-0.5) = -0.0).
+v_fract_f64 suit la formule de l'ISA (S0 + -floor(S0)), bornée au plus grand double sous 1.0 comme
+le modèle de l'instruction dans LLVM (ConstantFolding, amdgcn_fract : « fract(-small) » ne rend
+jamais 1.0) ; lu dans LLVM, pas mesuré sur le matériel.
+
+Écart connu : l'ISA donne v_rcp_f64, v_rsq_f64 et v_sqrt_f64 à 2^29 ULP près ; l'interpréteur rend
+le résultat arrondi au plus près, dans cette marge mais pas forcément au bit près du matériel. Ces
+trois instructions ne sont pas traduites en HLSL, rien ne compare encore leurs derniers bits.
 """
 import math
 import struct
@@ -17,6 +27,8 @@ from emu.rdna2_exec_ops import INT32_MAX, INT32_MIN, MASK32, MASK64, _to_int, bi
 
 LITERAL = 255
 SIGNS = {"f32": 1 << 31, "f64": 1 << 63}
+QUIET_F64 = 1 << 51
+ALMOST_ONE = 0x3FEF_FFFF_FFFF_FFFF                       # plus grand double sous 1.0
 OUTPUT_SCALE = {1: 2.0, 2: 4.0, 3: 0.5}
 
 
@@ -28,9 +40,19 @@ def double_bits(value):
     return struct.unpack("<Q", struct.pack("<d", value))[0]
 
 
+def _quiet(x):
+    """NaN rendu silencieux, signe et charge utile gardés."""
+    return double(double_bits(x) | QUIET_F64)
+
+
 def _rounded(function):
-    """Fonction d'arrondi : ±infini et NaN rendus tels quels."""
-    return lambda x: x if math.isinf(x) or math.isnan(x) else float(function(x))
+    """Fonction d'arrondi : ±infini rendu tel quel, NaN rendu silencieux ; le résultat a le signe de x
+    (IEEE 754 roundToIntegral : trunc(-0.5) = -0.0, floor(-0.0) = -0.0)."""
+    def operation(x):
+        if math.isnan(x):
+            return _quiet(x)
+        return x if math.isinf(x) else math.copysign(float(function(x)), x)
+    return operation
 
 
 def _divide(numerator, x):
@@ -50,7 +72,12 @@ def _rsq(x):
 
 
 def _fract(x):
-    return math.nan if math.isinf(x) else x - math.floor(x)
+    """S0 + -floor(S0) (ISA), au plus le plus grand double sous 1.0 ; NaN rendu silencieux, ±infini → NaN."""
+    if math.isnan(x):
+        return _quiet(x)
+    if math.isinf(x):
+        return math.nan
+    return min(x - _rounded(math.floor)(x), double(ALMOST_ONE))
 
 
 def _frexp_mantissa(x):

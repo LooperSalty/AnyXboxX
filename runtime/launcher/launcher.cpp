@@ -363,6 +363,36 @@ void AdoptCommandLine() {
   if (length > 0 && std::strlen(narrow) + 1 >= static_cast<size_t>(length)) std::memcpy(narrow, ansi.c_str(), length);
 }
 
+// La première exception (0x80000003 compris) sur stderr, avec son module et sa RVA ; le traitement
+// continue comme avant. Les exceptions d'information (0x4xxxxxxx : OutputDebugString, nom de thread)
+// ne comptent pas. Sans allocation : l'exception peut venir du tas.
+LONG WINAPI ReportFirstException(EXCEPTION_POINTERS* pointers) {
+  static LONG reported = 0;
+  const DWORD code = pointers->ExceptionRecord->ExceptionCode;
+  if ((code >> 30) == 1 || InterlockedExchange(&reported, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+  const auto address = reinterpret_cast<uintptr_t>(pointers->ExceptionRecord->ExceptionAddress);
+  auto start = reinterpret_cast<uintptr_t>(g_game.base);
+  wchar_t path[MAX_PATH] = L"?";
+  HMODULE module = nullptr;
+  if (address - start < g_game.size) {
+    wcsncpy_s(path, g_game.path.c_str(), _TRUNCATE);  // mappé à la main : inconnu du chargeur de Windows
+  } else if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(address), &module)) {
+    GetModuleFileNameW(module, path, MAX_PATH);
+    start = reinterpret_cast<uintptr_t>(module);
+  } else {
+    start = 0;
+  }
+  const wchar_t* name = path;
+  for (const wchar_t* c = path; *c != L'\0'; ++c) {
+    if (*c == L'\\' || *c == L'/') name = c + 1;
+  }
+  fwprintf(stderr, L"[anyxboxx] première exception 0x%08lX : %ls+0x%llX\n", code, name,
+           static_cast<unsigned long long>(address - start));
+  fflush(stderr);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // Dossier de paquet : l'exécutable déclaré par <Executable Name="…"> de MicrosoftGame.config.
 std::wstring ResolveTarget(const std::wstring& target) {
   const DWORD attributes = GetFileAttributesW(target.c_str());
@@ -440,6 +470,7 @@ int wmain(int argc, wchar_t** argv) {
   SetCurrentDirectoryW(g_game.folder.c_str());
   if (MapImage(bytes) || Relocate() || BindImports()) return 1;
   Protect();
+  AddVectoredExceptionHandler(1, ReportFirstException);  // avant les rappels TLS, qui sont du code du jeu
   if (RegisterExceptionsAndTls()) return 1;
   AdoptCommandLine();
   using Entry = int(WINAPI*)();

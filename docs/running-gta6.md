@@ -350,6 +350,8 @@ These need the `diag` build.
 
 To stop the game: `taskkill /F /IM victory.exe`. The `timeout` command of Git Bash does not kill the executable.
 
+To measure a run, send VIctory's log (stderr) to a file, for example `.\tools\lancer_victory.ps1 -GameDir <folder> 2> victory.log`, then summarise it with `python tools/resume_journal_victory.py victory.log`. The script keeps the frame lines of the world (100 draws per frame or more, `--draws-min` changes the threshold) and gives the median and range of each part of the frame (preparing, copies, textures, GPU, copying back, draws, draws dropped without a host pipeline), plus the count of warnings (shaders that do not translate, refused pipelines, device removed). With two logs (`before.log after.log`) it compares the medians column by column, so a change is judged on the part of the frame it targets. `--markdown` prints tables to paste into an issue. Only counts and times are printed.
+
 ## Former branches
 
 The branches `anyxboxx/stable` and `anyxboxx/essai` of `LooperSalty/victory` are no longer the pin: the fork above replaces them. The sections above that mention them describe earlier measurements.

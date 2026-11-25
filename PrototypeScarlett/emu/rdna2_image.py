@@ -7,6 +7,8 @@ Positions des champs et constantes :
   runtime/src/gfx10_descriptors.h (GPL-3.0, d'après Mesa src/amd/registers/gfx10-rsrc.json, MIT).
 - Encodage MIMG gfx10 : LLVM SIInstrFormats.td (MIMGe_gfx10, Apache 2.0).
 - Noms des formats : data/gfx10_formats.json (Leonida).
+- Ordre des registres d'adresse MIMG (`[offset], [z_ref], s, t, [lod]`) et décalages signés sur
+  6 bits (`off_x = bits[5:0]`, `off_y = bits[13:8]`) : AMD RDNA 2 ISA, Table 8.9.
 - Sens de comparaison profondeur (`z_ref <op> texel`) : AMD RDNA 2 ISA / D3D12 `SampleCmp`.
 - Arrondi UNORM8 en écriture (`floor(v * 255 + 0.5)`) : D3D12 Functional Spec §3.2.3.6.
 - Ordre des 4 texels de `image_gather4` (`(x0, y1), (x1, y1), (x1, y0), (x0, y0)`) :
@@ -14,11 +16,12 @@ Positions des champs et constantes :
 
 Opérations prises en charge (le reste est refusé en le nommant) : image 2D linéaire à un seul
 niveau mip (BASE_LEVEL = LAST_LEVEL = 0, lignes de width × taille du texel), formats
-8_8_8_8_UNORM et 32_32_32_32_FLOAT ; lecture/écriture directe (image_load, image_store,
-image_get_resinfo) ; échantillonnage (image_sample[_lz], image_sample_c[_lz],
-image_gather4[_lz]) au plus proche ou bilinéaire, adressage wrap, mirror, clamp-to-edge,
-mirror-once-to-edge, clamp-to-border et mirror-once-to-border (couleurs de bordure standard).
-L'interpréteur et le HLSL font le même calcul, au bit près.
+8_UNORM, 8_8_UNORM, 8_8_8_8_UNORM, 32_FLOAT, 32_32_FLOAT et 32_32_32_32_FLOAT ; lecture/écriture
+directe (image_load[_mip], image_store[_mip], image_get_resinfo) ; échantillonnage
+(image_sample[_lz|_l][_o], image_sample_c[_lz|_l][_o], image_gather4[_lz|_l][_o]) au plus proche
+ou bilinéaire, adressage wrap, mirror, clamp-to-edge, mirror-once-to-edge, clamp-to-border et
+mirror-once-to-border (couleurs de bordure standard). L'interpréteur et le HLSL font le même
+calcul, au bit près.
 """
 import json
 import struct
@@ -27,8 +30,20 @@ from pathlib import Path
 DWORD = 4
 FORMAT_NAMES = {int(code): name for code, name in
                 json.loads((Path(__file__).parent / "data" / "gfx10_formats.json").read_text(encoding="utf-8")).items()}
-FORMAT_8_8_8_8_UNORM, FORMAT_32_32_32_32_FLOAT = 56, 77
-TEXEL_BYTES = {FORMAT_8_8_8_8_UNORM: 4, FORMAT_32_32_32_32_FLOAT: 16}
+FORMAT_8_UNORM = 1
+FORMAT_8_8_UNORM = 14
+FORMAT_32_FLOAT = 22
+FORMAT_8_8_8_8_UNORM = 56
+FORMAT_32_32_FLOAT = 64
+FORMAT_32_32_32_32_FLOAT = 77
+TEXEL_BYTES = {
+    FORMAT_8_UNORM: 1,
+    FORMAT_8_8_UNORM: 2,
+    FORMAT_32_FLOAT: 4,
+    FORMAT_8_8_8_8_UNORM: 4,
+    FORMAT_32_32_FLOAT: 8,
+    FORMAT_32_32_32_32_FLOAT: 16,
+}
 TYPE_2D = 9
 DIM_2D = 1
 CLAMP_WRAP = 0
@@ -49,10 +64,19 @@ SELECT_ZERO, SELECT_ONE, SELECT_X = 0, 1, 4
 ONE_BITS = 0x3F800000
 # float32 exact de c / 255 (conversion UNORM 8 bits), table partagée avec le HLSL.
 UNORM8 = tuple(struct.unpack("<I", struct.pack("<f", value / 255.0))[0] for value in range(256))
-DIRECT_OPS = frozenset({"image_load", "image_store", "image_get_resinfo"})
-SAMPLE_OPS = frozenset({"image_sample", "image_sample_lz"})
-COMPARE_OPS = frozenset({"image_sample_c", "image_sample_c_lz"})
-GATHER_OPS = frozenset({"image_gather4", "image_gather4_lz"})
+DIRECT_OPS = frozenset({"image_load", "image_load_mip", "image_store", "image_store_mip", "image_get_resinfo"})
+SAMPLE_OPS = frozenset({
+    "image_sample", "image_sample_lz", "image_sample_l",
+    "image_sample_o", "image_sample_lz_o", "image_sample_l_o",
+})
+COMPARE_OPS = frozenset({
+    "image_sample_c", "image_sample_c_lz", "image_sample_c_l",
+    "image_sample_c_o", "image_sample_c_lz_o", "image_sample_c_l_o",
+})
+GATHER_OPS = frozenset({
+    "image_gather4", "image_gather4_lz", "image_gather4_l",
+    "image_gather4_o", "image_gather4_lz_o", "image_gather4_l_o",
+})
 SAMPLER_OPS = SAMPLE_OPS | COMPARE_OPS | GATHER_OPS
 SUPPORTED_OPS = DIRECT_OPS | SAMPLER_OPS
 
@@ -83,13 +107,23 @@ def check_instruction(name, fields):
         raise ImageError(f"{name} : dmask 0x{fields['dmask']:x} non pris en charge (un seul canal)")
 
 
+def has_offset(name):
+    return "o" in name.split("_")[2:]
+
+
+def has_lod(name):
+    return "l" in name.split("_")[2:]
+
+
 def address_count(name):
-    """Nombre de VGPR d'adresse attendus en 2D : mip (1), (s, t) ou (x, y) (2), (z_ref, s, t) (3)."""
+    """Nombre de VGPR d'adresse attendus en 2D (Table 8.9 RDNA 2)."""
     if name == "image_get_resinfo":
         return 1
-    if name in COMPARE_OPS:
+    if name in ("image_load_mip", "image_store_mip"):
         return 3
-    return 2
+    if name in DIRECT_OPS:
+        return 2
+    return 2 + int(has_offset(name)) + int(name in COMPARE_OPS) + int(has_lod(name))
 
 
 def address_registers(name, fields):
@@ -99,6 +133,19 @@ def address_registers(name, fields):
         return tuple(fields["vaddr"][:count])
     base = fields["vaddr"][0]
     return tuple(base + i for i in range(count))
+
+
+def parse_sampler_addrs(name, addrs):
+    """Décompose les VGPR d'adresse d'un sample/gather 2D : (offset_reg, z_reg, s_reg, t_reg, lod_reg)."""
+    idx = 0
+    off_reg = addrs[idx] if has_offset(name) else None
+    idx += int(off_reg is not None)
+    z_reg = addrs[idx] if name in COMPARE_OPS else None
+    idx += int(z_reg is not None)
+    s_reg, t_reg = addrs[idx], addrs[idx + 1]
+    idx += 2
+    lod_reg = addrs[idx] if has_lod(name) else None
+    return off_reg, z_reg, s_reg, t_reg, lod_reg
 
 
 def coordinate_registers(fields):

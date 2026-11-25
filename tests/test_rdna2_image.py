@@ -115,8 +115,8 @@ def test_unsupported_cases_are_named():
         rdna2_hlsl.translate(one_d)
     with pytest.raises(rdna2_exec.Untranslated, match="anisotrope"):
         run_interpreter(sampling_program(), {**sgprs, S_SHARP + 2: 2 << 20}, memory)
-    with pytest.raises(rdna2_exec.Untranslated, match="GFX10_FORMAT_32_FLOAT"):
-        run_interpreter(sampling_program(), {**sgprs, **descriptors(22, 8, 4, images.CLAMP_WRAP)}, memory)
+    with pytest.raises(rdna2_exec.Untranslated, match="GFX10_FORMAT_16_16_16_16_FLOAT"):
+        run_interpreter(sampling_program(), {**sgprs, **descriptors(71, 8, 4, images.CLAMP_WRAP)}, memory)
 
 
 @gpu

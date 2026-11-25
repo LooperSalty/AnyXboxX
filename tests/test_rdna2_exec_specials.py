@@ -3,12 +3,15 @@
 Avant correction, v_cvt_i32_f32, v_cvt_u32_f32 et v_fract_f32 (±infini), v_exp_f32 et
 v_ldexp_f32 (dépassement) levaient OverflowError au lieu de rendre un résultat.
 """
+import struct
+
 import pytest
 
 from emu import rdna2_exec, rdna2_exec_ops, rdna2_exec_vop3, rdna2_gpu
 from emu.rdna2_exec_ops import float_bits
 from test_rdna2_exec import V, program, vop1, vop3
-from test_rdna2_hlsl import compare, store_lane, with_lane_offset
+from test_rdna2_exec_memory import INPUT
+from test_rdna2_hlsl import compare, global_, store_lane, with_lane_offset
 
 LITERAL = 255
 PLUS_INF, MINUS_INF, NAN, MAX, ONE = 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0x7F7F_FFFF, 0x3F80_0000
@@ -64,4 +67,41 @@ def specials_program():
 @gpu
 def test_special_values_match_on_gpu():
     expected, actual = compare(specials_program())
+    assert actual == expected
+
+
+NEG_ZERO = 0x8000_0000
+ROUNDINGS = ["v_fract_f32", "v_trunc_f32", "v_ceil_f32", "v_rndne_f32", "v_floor_f32"]
+# NaN, ±infini (fract → NaN) et dénormaux exclus : NaN produit et vidage des dénormaux diffèrent selon le GPU (mesuré)
+ROUNDING_SOURCES = [float_bits(-1e-20), float_bits(-0.5), NEG_ZERO, 0, float_bits(-0.25), float_bits(-1e-7),
+                    float_bits(2.5), float_bits(-2.5), float_bits(1.5), float_bits(-1.5), float_bits(0.5),
+                    MAX, MAX | 1 << 31, float_bits(-0.75), float_bits(7.0e6), float_bits(-8388607.5)]
+
+
+@pytest.mark.parametrize("name, value, expected", [
+    ("v_trunc_f32", float_bits(-0.5), NEG_ZERO), ("v_ceil_f32", float_bits(-0.5), NEG_ZERO),
+    ("v_rndne_f32", float_bits(-0.5), NEG_ZERO), ("v_floor_f32", NEG_ZERO, NEG_ZERO),
+    ("v_floor_f32", float_bits(0.5), 0), ("v_fract_f32", NEG_ZERO, 0),
+    ("v_fract_f32", float_bits(-1e-20), 0x3F7F_FFFF),                # jamais 1.0 (LLVM, WARP, Intel UHD)
+    ("v_fract_f32", float_bits(-0.25), float_bits(0.75)),
+])
+def test_rounding_keeps_the_sign_of_zero_and_fract_stays_below_one(name, value, expected):
+    assert lane0(vop1("v_mov_b32", 1, LITERAL), value, vop1(name, 2, V + 1)) == expected
+
+
+def rounding_program():
+    """Chaque ligne arrondit sa source (INPUT + 4 × ligne) par les cinq instructions."""
+    words = [*global_("global_load_dword", addr=31, vdst=1, saddr=0)]
+    for slot, name in enumerate(ROUNDINGS):
+        words += [vop1(name, 2 + slot, V + 1)]
+    for slot in range(len(ROUNDINGS)):
+        words += store_lane(2 + slot, slot)
+    return with_lane_offset(*words)
+
+
+@gpu
+def test_rounding_and_fract_match_on_gpu():
+    memory = bytearray(INPUT + 128)
+    memory[INPUT:] = struct.pack("<32I", *(ROUNDING_SOURCES * 2))
+    expected, actual = compare(rounding_program(), memory=bytes(memory))
     assert actual == expected

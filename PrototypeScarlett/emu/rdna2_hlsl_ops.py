@@ -194,7 +194,8 @@ VECTOR = {
     "v_ceil_f32": "asuint(ceil(asfloat({a})))",
     "v_trunc_f32": "asuint(trunc(asfloat({a})))",
     "v_rndne_f32": "asuint(round(asfloat({a})))",
-    "v_fract_f32": "asuint(frac(asfloat({a})))",
+    # frac(-1e-20) rend 1.0 sur RTX 4060, 0x3F7FFFFF sur WARP et Intel UHD : borné comme rdna2_exec_ops._fract
+    "v_fract_f32": "(frac(asfloat({a})) >= 1.0f ? 0x3F7FFFFFu : asuint(frac(asfloat({a}))))",
     "v_ldexp_f32": "asuint(ldexp(asfloat({a}), (float)asint({b})))",
     "v_cvt_f32_u32": "asuint((float){a})",
     "v_cvt_f32_i32": "asuint((float)asint({a}))",

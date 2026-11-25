@@ -16,7 +16,7 @@ from emu.rdna2_hlsl_ops import NULL, Untranslatable, source, source_high
 
 LITERAL, VGPR_FIRST = 255, 256
 INLINE_DOUBLES = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 246: 4.0, 247: -4.0,
-                  248: 0.15915494309189535}
+                  248: 0.15915494309189532}    # 0x3FC45F306DC9C882 (ISA §6.2), comme rdna2_exec_cmp64
 
 HELPERS = """bool IsNanF64(uint lo, uint hi) {
   uint h = hi & 0x7FFFFFFFu;
@@ -40,7 +40,7 @@ uint SatF64ToU32(uint lo, uint hi) {
 DOUBLE = {
     "v_add_f64": "({a} + {b})", "v_mul_f64": "({a} * {b})", "v_fma_f64": "fma({a}, {b}, {c})",
     "v_min_f64": "min({a}, {b})", "v_max_f64": "max({a}, {b})",
-    "v_cvt_f64_f32": "(double)asfloat({u})", "v_cvt_f64_u32": "(double){u}",
+    "v_cvt_f64_u32": "(double){u}",
     "v_cvt_f64_i32": "(asint({u}) < 0 ? -(double)(0u - {u}) : (double){u})",   # par u32 : voir plus haut
 }
 TO_32 = {
@@ -49,7 +49,7 @@ TO_32 = {
     "v_cvt_u32_f64": "SatF64ToU32({a_lo}, {a_hi})",
 }
 SHIFTS = frozenset({"v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"})
-TRANSLATED = frozenset(DOUBLE) | frozenset(TO_32) | SHIFTS
+TRANSLATED = frozenset(DOUBLE) | frozenset(TO_32) | SHIFTS | {"v_cvt_f64_f32"}
 
 
 def _words(code):
@@ -62,6 +62,16 @@ def _words(code):
     return ("0u", "0u") if code == NULL else (source(code), source_high(code))
 
 
+def _float32(code, index, abs_bits, neg_bits):
+    """Bits d'une source f32, abs/neg appliqués au bit de signe comme rdna2_exec_wide._modify."""
+    bits = source(code)
+    if abs_bits >> index & 1:
+        bits = f"({bits} & 0x7FFFFFFFu)"
+    if neg_bits >> index & 1:
+        bits = f"({bits} ^ 0x80000000u)"
+    return bits
+
+
 def _double(code, index, abs_bits, neg_bits):
     low, high = _words(code)
     value = f"asdouble({low}, {high})"
@@ -70,6 +80,18 @@ def _double(code, index, abs_bits, neg_bits):
     if neg_bits >> index & 1:
         value = f"(-{value})"
     return value
+
+
+def _f32_to_f64(bits, vdst):
+    """v_cvt_f64_f32 en entiers, exacte (ISA : 0 ULP, dénormaux gardés) : signe gardé, NaN rendu
+    silencieux avec sa charge utile comme dans l'interpréteur. Mesuré : (double)asfloat(x) rend
+    0x7FFFFFFFE0000000 pour tout NaN sur RTX 4060 (signe et charge utile perdus)."""
+    return (f"{{ uint cw = {bits}, cs = cw & 0x80000000u, ce = cw >> 23 & 0xFFu, cm = cw & 0x7FFFFFu, cx; "
+            "if (ce == 0xFFu) cx = 0x7FF00000u | (cm != 0u ? 0x80000u : 0u); "
+            "else if (ce != 0u) cx = (ce + 896u) << 20; "
+            "else if (cm == 0u) cx = 0u; "
+            "else { uint cn = 23u - firstbithigh(cm); cm = cm << cn & 0x7FFFFFu; cx = (897u - cn) << 20; } "
+            f"v[{vdst}] = cm << 29; v[{vdst + 1}] = cs | cx | cm >> 3; }}")
 
 
 def _shift(name, amount, low, high, vdst):
@@ -102,8 +124,12 @@ def statements(name, codes, vdst, active, abs_bits=0, neg_bits=0, clamp=0, omod=
         if kind == "f64":
             values["abc"[index]] = _double(codes[index], index, abs_bits, neg_bits)
             values[f"{'abc'[index]}_lo"], values[f"{'abc'[index]}_hi"] = _words(codes[index])
+        elif kind == "f32":
+            values["u"] = _float32(codes[index], index, abs_bits, neg_bits)
         else:
             values["u"] = source(codes[index])
+    if name == "v_cvt_f64_f32":
+        return [f"if ({active}) {_f32_to_f64(values['u'], vdst)}"]
     if name in TO_32:
         return [f"if ({active}) v[{vdst}] = {TO_32[name].format(**values)};"]
     expression = DOUBLE[name].format(**values)

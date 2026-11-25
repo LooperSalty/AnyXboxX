@@ -16,7 +16,7 @@ from emu.rdna2_exec_ops import FLOAT_TESTS, INTEGER_TESTS, MASK64, signed
 VGPR_FIRST, LITERAL, EXEC_LO, VCC_LO = 256, 255, 126, 106
 INLINE_INTEGERS = range(128, 209)
 INLINE_DOUBLES = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 246: 4.0, 247: -4.0,
-                  248: 0.15915494309189535}
+                  248: 0.15915494309189532}       # 1/(2π) = 0x3FC45F306DC9C882, valeur exacte de l'ISA (§6.2)
 SIGN32, SIGN64 = 1 << 31, 1 << 63
 # (bits d'exposant, bits de mantisse) par largeur
 FORMATS = {32: (8, 23), 64: (11, 52)}

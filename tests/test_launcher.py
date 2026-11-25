@@ -1,4 +1,5 @@
 """anyxboxx.exe : le lanceur natif en C++, sans Python dans le processus du jeu."""
+import ctypes
 import os
 import subprocess
 import sys
@@ -59,6 +60,27 @@ def test_package_without_its_executable_says_so(tmp_path, runtime_dir):
     result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(tmp_path)], capture_output=True, timeout=30)
     stderr = result.stderr.decode("utf-8", errors="replace") + result.stderr.decode("mbcs", errors="replace")
     assert result.returncode == 1 and "game_scarlett_master.exe" in stderr
+
+
+SEM_NOGPFAULTERRORBOX = 0x0002
+
+
+def launch_without_crash_window(runtime_dir, target):
+    """Comme launch, sans la fenêtre de rapport d'erreurs de Windows : l'enfant hérite du mode d'erreur."""
+    kernel32 = ctypes.windll.kernel32
+    previous = kernel32.GetErrorMode()
+    kernel32.SetErrorMode(previous | SEM_NOGPFAULTERRORBOX)
+    try:
+        return launch(runtime_dir, target)
+    finally:
+        kernel32.SetErrorMode(previous)
+
+
+def test_first_exception_names_the_module_and_rva(tmp_path, runtime_dir):
+    exe = build_pe(tmp_path / "trap.exe", lambda iat: Asm().mov_eax(1).raw(b"\xcc").ret().build(), dll=False)
+    result = launch_without_crash_window(runtime_dir, exe)          # int3 à la RVA 0x1005, après mov eax, 1
+    assert result.returncode & 0xFFFF_FFFF == 0x8000_0003
+    assert "0x80000003" in result.stderr and "trap.exe+0x1005" in result.stderr
 
 
 # W13 (first-boot-1021.md) : le titre importe GameInput.dll!#1, le GameInputCreate v0 du GameInput.lib
@@ -136,6 +158,21 @@ def test_tombox_dir_serves_esram_apu_and_umd_libraries(tmp_path, runtime_dir):
     imports = list(NEW_TOMBOX_LIBRARIES.items())
     exe = build_pe(tmp_path / "libs.exe", lambda iat: Asm().mov_eax(42).ret().build(), imports=imports, dll=False)
     assert launch(runtime_dir, exe).returncode != 42                 # bibliothèques absentes d'AnyXboxX
+    environment = {**os.environ, "ANYXBOXX_TOMBOX_DIR": str(TOMBOX_DIR)}
+    result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(exe)], capture_output=True, text=True,
+                            timeout=60, env=environment)
+    assert result.returncode == 42, result.stderr
+
+
+AUDIO_TOMBOX_LIBRARIES = {"AcpHal.dll": "AcpHalCreate", "chad.dll": "XDspConnectWithMaximumStreamLimit"}
+
+
+@pytest.mark.skipif(not all((TOMBOX_DIR / name.lower()).is_file() for name in AUDIO_TOMBOX_LIBRARIES),
+                    reason="DLL audio de TomBox non compilées (tools/build_tombox.py acphal chad)")
+def test_tombox_dir_serves_acphal_and_chad_audio_libraries(tmp_path, runtime_dir):
+    imports = list(AUDIO_TOMBOX_LIBRARIES.items())
+    exe = build_pe(tmp_path / "audio_libs.exe", lambda iat: Asm().mov_eax(42).ret().build(), imports=imports, dll=False)
+    assert launch(runtime_dir, exe).returncode != 42
     environment = {**os.environ, "ANYXBOXX_TOMBOX_DIR": str(TOMBOX_DIR)}
     result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(exe)], capture_output=True, text=True,
                             timeout=60, env=environment)
