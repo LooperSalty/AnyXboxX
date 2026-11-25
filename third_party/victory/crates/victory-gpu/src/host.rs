@@ -298,6 +298,12 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// The last submission that has landed: the card ran it and what it wrote
+/// is back in title memory.
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -2476,8 +2482,9 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes; and
+    /// whether the list copies from it.
+    Texture(std::sync::Arc<crate::texture::Staging>, bool),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3083,7 +3090,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -5987,7 +5994,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            submission: this_submission,
+            ..Batch::default()
+        };
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -7289,8 +7299,10 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// `copies`: whether the list recorded a copy from the staging buffer
+    /// (`crate::texture::Staging::note_copy`).
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, copies: bool) {
+        self.deferred().copies.push(Step::Texture(staging, copies));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -7366,9 +7378,12 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, copies) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        staging.refresh(batch.submission);
+                    }
+                    if *copies {
+                        staging.note_copy(batch.submission);
                     }
                     continue;
                 }
@@ -7414,6 +7429,8 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The number of the submission being prepared (0 outside one).
+    submission: u64,
 }
 
 impl Batch {
@@ -8246,6 +8263,13 @@ impl Meter {
                 per(waited),
                 per(held),
                 longest as f64 / 1000.0
+            );
+        }
+        let guarded = crate::texture::GUARDED.swap(0, Ordering::Relaxed) as f64 / frames;
+        if guarded > 0.0 {
+            tracing::info!(
+                "texture refreshes put off per frame because a submission still on the card copies from the \
+                 texture's staging buffer (VICTORY_STAGING_GUARD): {guarded:.1}"
             );
         }
         let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
