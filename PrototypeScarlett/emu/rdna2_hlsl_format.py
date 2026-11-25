@@ -11,8 +11,13 @@ charge, DST_SEL refusé, SWIZZLE_ENABLE, ADD_TID_ENABLE) donne des zéros en lec
 rien, alors que l'interpréteur le refuse en le nommant (comme emu/rdna2_hlsl_image.py). Les
 éléments à cheval sur deux mots sont lus mot par mot ; les mots écrits en partie le sont par
 InterlockedAnd/InterlockedOr, pour ne pas effacer les octets voisins écrits par d'autres lignes.
+
+The _d16 forms (emu/rdna2_buffer_d16.py) narrow each 32-bit result with BufNarrow (float32 → float16
+with integer operations only, no double: Intel UHD has no FP64) and widen each stored half with
+BufWiden. A MUBUF d16 load of a 32-bit integer format, refused by the interpreter, reads zeros here, and
+a NaN the interpreter refuses gives a zero half.
 """
-from emu import rdna2_buffer_format as formats
+from emu import rdna2_buffer_d16 as d16, rdna2_buffer_format as formats
 from emu.rdna2_hlsl_ops import NULL, Untranslatable, source
 
 STORE_BARRIER = "AllMemoryBarrierWithGroupSync();"
@@ -126,6 +131,7 @@ uint BufSelect(uint4 c, uint info, uint sel) {{
 
 uint BufField(uint kind, uint value, uint n) {{
   if (n >= 32u) return value;
+  if (kind == {formats.FLOAT}u) return value & ((1u << n) - 1u);
   if (kind == {formats.UINT}u) return min(value, (1u << n) - 1u);
   int high = int((1u << (n - 1u)) - 1u);
   return uint(clamp(asint(value), -high - 1, high)) & ((1u << n) - 1u);
@@ -142,11 +148,53 @@ uint4 BufEncode(uint info, uint4 v) {{
   return w;
 }}
 
-bool BufStoreSelectsOk(uint info, uint word3, uint count) {{
+bool BufStorable(uint info, bool d16) {{
+  uint kind = info & 7u;
+  if (d16) return kind == {formats.UINT}u || kind == {formats.SINT}u || kind == {formats.FLOAT}u;
+  return ((info >> {STORABLE_SHIFT}) & 1u) != 0u;
+}}
+
+bool BufStoreSelectsOk(uint info, uint word3, uint count, bool d16) {{
   uint n = BufCount(info);
-  if (((info >> {STORABLE_SHIFT}) & 1u) == 0u || n != count) return false;
+  if (!BufStorable(info, d16) || n != count) return false;
   for (uint i = 0u; i < n; i++) if (((word3 >> (3u * i)) & 7u) != {formats.SELECT_X}u + i) return false;
   return n != 2u || ((word3 >> 6) & 7u) <= {formats.SELECT_ONE}u;
+}}
+
+// d16 (emu/rdna2_buffer_d16.py) : 32-bit integer formats are not loaded as 16 bits.
+uint BufD16Info(uint info) {{
+  uint kind = info & 7u;
+  return (kind == {formats.UINT}u || kind == {formats.SINT}u) && BufWidth(info, 0u) == 32u ? 0u : info;
+}}
+
+// float32 -> float16, round to nearest even, overflow to infinity, subnormals kept (half_from_float).
+uint BufHalfFromFloat(uint f) {{
+  uint sign = (f >> 16) & 0x8000u, e = (f >> 23) & 0xFFu, m = f & 0x7FFFFFu;
+  if (e == 0xFFu) {{
+    uint payload = m >> 13;
+    return m != 0u && payload == 0u ? 0u : sign | 0x7C00u | payload;
+  }}
+  if (e < {d16.LOWEST_ROUNDED_EXPONENT}u) return sign;
+  uint full = m | 0x800000u;
+  bool normal = e > {d16.HALF_NORMAL_BIAS}u;
+  uint drop = normal ? 13u : {d16.HALF_NORMAL_BIAS + 14}u - e;
+  uint q = full >> drop, r = full & ((1u << drop) - 1u), half = 1u << (drop - 1u);
+  if (r > half || (r == half && (q & 1u) != 0u)) q += 1u;
+  uint bits = normal ? ((e - {d16.HALF_NORMAL_BIAS + 1}u) << 10) + q : q;
+  return sign | min(bits, 0x7C00u);
+}}
+
+uint BufNarrow(uint info, uint value) {{
+  uint kind = info & 7u;
+  if (kind == {formats.UINT}u || kind == {formats.SINT}u) return value & 0xFFFFu;
+  return BufHalfFromFloat(value);
+}}
+
+uint BufWiden(uint info, uint c, uint h) {{
+  uint kind = info & 7u;
+  if (kind == {formats.SINT}u) return BufSigned(h, 16u);
+  if (kind == {formats.FLOAT}u && BufWidth(info, c) != 16u) return BufHalf(h);
+  return h;
 }}
 
 void BufWrite(uint address, uint size, uint4 e) {{
@@ -174,7 +222,7 @@ void BufWrite(uint address, uint size, uint4 e) {{
 def _checked(name, word):
     try:
         access = formats.access(name, word)
-        fmt = formats.format_for(access.fixed, access.store) if access.typed else None
+        fmt = formats.format_for(access.fixed, access.store, access.d16) if access.typed else None
     except formats.FormatError as error:
         raise Untranslatable(f"non traduite en HLSL : {error}") from None
     if fmt is not None and (access.count > fmt.count or access.store and access.count != fmt.count):
@@ -186,12 +234,15 @@ def _address_lines(access):
     """Adresse et test des bornes, comme emu/rdna2_exec_memory.py (_buffer) avec la taille de l'élément."""
     r = access.srsrc
     code = f"{access.fixed}u" if access.typed else f"((d.w >> {formats.WORD3_FORMAT_SHIFT}) & 0x7Fu)"
+    info = f"BufFormatInfo({code}, d)"
+    if access.d16 and not access.store:
+        info = f"BufD16Info({info})"
     soffset = "" if access.soffset in (NULL, INLINE_ZERO) else f" + {source(access.soffset)}"
     index = f"v[{access.vaddr}]" if access.idxen else "0u"
     offset = f"{access.offset}u + v[{access.vaddr + access.idxen}]" if access.offen else f"{access.offset}u"
     enabled = " && ((d.w >> 12) & 0x7Fu) != 0u" if access.typed else ""
     return [f"uint4 d = uint4(s[{r}], s[{r + 1}], s[{r + 2}], s[{r + 3}]);",
-            f"uint info = BufFormatInfo({code}, d), size = BufSize(info), stride = (d.y >> 16) & 0x3FFFu;",
+            f"uint info = {info}, size = BufSize(info), stride = (d.y >> 16) & 0x3FFFu;",
             f"uint index = {index}, offset = {offset};",
             f"bool inside = info != 0u{enabled} && (stride != 0u ? index < d.z"
             f" : (offset >= {access.offset}u && offset <= d.z && size <= d.z - offset));",
@@ -203,13 +254,41 @@ def statements(name, word, active):
     access = _checked(name, word)
     lines = _address_lines(access)
     if access.store:
-        values = ", ".join(f"v[{access.vdata + i}]" if i < access.count else "0u" for i in range(4))
-        allowed = "true" if access.typed else f"BufStoreSelectsOk(info, d.w, {access.count}u)"
+        values = ", ".join(_store_value(access, i) for i in range(4))
+        d16_flag = "true" if access.d16 else "false"
+        allowed = "true" if access.typed else f"BufStoreSelectsOk(info, d.w, {access.count}u, {d16_flag})"
         lines.append(f"if (inside && {allowed}) BufWrite(address, size, BufEncode(info, uint4({values})));")
         return [f"if ({active}) {{ " + " ".join(lines) + " }", STORE_BARRIER]
     lines.append("uint4 c = uint4(0u, 0u, 0u, 0u); if (inside) c = BufDecode(info, BufRead(address, size));")
     for i in range(access.count):
         value = f"c[{i}]" if access.typed else f"BufSelect(c, info, (d.w >> {3 * i}) & 7u)"
-        lines.append(f"uint r{i} = {value};")
-    lines += [f"v[{access.vdata + i}] = r{i};" for i in range(access.count)]
+        lines.append(f"uint r{i} = BufNarrow(info, {value});" if access.d16 else f"uint r{i} = {value};")
+    lines += _half_writes(access) if access.d16 else [f"v[{access.vdata + i}] = r{i};" for i in range(access.count)]
     return [f"if ({active}) {{ " + " ".join(lines) + " }"]
+
+
+def _store_value(access, i):
+    """Value of component i for BufEncode: the VGPR, or for d16 its half widened to 32 bits."""
+    if i >= access.count:
+        return "0u"
+    if not access.d16:
+        return f"v[{access.vdata + i}]"
+    reg, shift = d16.slots(access)[i]
+    return f"BufWiden(info, {i}u, (v[{access.vdata + reg}] >> {shift}u) & 0xFFFFu)"
+
+
+def _half_writes(access):
+    """d16: the 16-bit results r0… into their halves; a half the load does not fill keeps its bits."""
+    targets = {}
+    for i, (reg, shift) in enumerate(d16.slots(access)):
+        targets.setdefault(reg, []).append((i, shift))
+    lines = []
+    for reg, parts in targets.items():
+        target = f"v[{access.vdata + reg}]"
+        if len(parts) == 2:
+            lines.append(f"{target} = r{parts[0][0]} | (r{parts[1][0]} << 16);")
+        else:
+            (i, shift), = parts
+            keep = "0xFFFFu" if shift else "0xFFFF0000u"
+            lines.append(f"{target} = ({target} & {keep}) | (r{i} << {shift}u);")
+    return lines

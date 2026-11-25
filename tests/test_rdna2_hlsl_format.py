@@ -187,7 +187,8 @@ def test_untranslatable_forms_are_named():
         (typed("tbuffer_load_format_x", fmt=36), "10_11_11_FLOAT"),
         (typed("tbuffer_load_format_xyzw", fmt=64), "4 composantes"),
         (typed("buffer_load_format_x", tfe=1), "tfe"),
-        (typed("buffer_load_format_d16_x"), "buffer_load_format_d16_x"),
+        (typed("tbuffer_load_format_d16_x", fmt=20), "d16 load with format 32_UINT"),
+        (typed("tbuffer_store_format_d16_x", fmt=7), "d16 store with format 16_UNORM"),
     ]:
         with pytest.raises(Untranslatable, match=message):
             rdna2_hlsl.translate(program(*words))

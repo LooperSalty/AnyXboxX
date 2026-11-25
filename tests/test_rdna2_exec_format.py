@@ -162,18 +162,8 @@ def test_integer_stores_saturate_to_the_field():
     (typed("buffer_load_format_x", lds=1), word3(22, 4), "lds"),
     (typed("buffer_load_format_x", tfe=1), word3(22, 4), "tfe"),
     (typed("buffer_load_format_x", offset=2), word3(22, 4), "non alignée"),
-    (typed("buffer_load_format_d16_x"), word3(22, 4), "buffer_load_format_d16_x"),
-    (typed("tbuffer_load_format_d16_x", fmt=22), word3(22, 4), "tbuffer_load_format_d16_x"),
-    (typed("buffer_store_format_d16_x"), word3(22, 4), "buffer_store_format_d16_x"),
 ])
 def test_unsupported_forms_are_named(words, word3, message):
     with pytest.raises(rdna2_exec.Untranslated, match=message):
         run(words, bytes(16), records=16, word3=word3)
 
-
-def test_typed_buffer_instructions_count_in_coverage():
-    names = {name for name in MNEMONICS.values() if "buffer_" in name and "_format_" in name}
-    run_by_interpreter = {name for name in names if rdna2_exec.executable(
-        "MTBUF" if name.startswith("t") else "MUBUF", name)}
-    assert run_by_interpreter == {name for name in names if "_d16" not in name}
-    assert len(run_by_interpreter) == 14
