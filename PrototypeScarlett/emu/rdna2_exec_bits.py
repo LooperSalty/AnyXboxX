@@ -1,7 +1,7 @@
 """Instructions scalaires RDNA 2 de manipulation de bits, de champs et de masques d'EXEC.
 
 Complète la table SCALAR d'emu/rdna2_exec_ops.py : s_bfe_*, s_lshl{1-4}_add_u32, s_mul_hi_*,
-s_absdiff_i32, opérations 64 bits, s_wqm/s_quadmask/s_bitreplicate, s_bitset*, s_ff0/s_flbit
+s_absdiff_i32, s_pack_*_b32_b16, opérations 64 bits, s_wqm/s_quadmask/s_bitreplicate, s_bitset*, s_ff0/s_flbit
 signés et les variantes saveexec/wrexec restantes. Sémantique : documentation publique d'AMD
 « RDNA 2 Instruction Set Architecture », chapitre 5 (SOP2, SOPC, SOP1).
 
@@ -12,6 +12,10 @@ MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 NO_BIT = MASK32                              # « aucun bit trouvé » : -1 sur 32 bits
 WIDTH_SHIFT, WIDTH_MASK = 16, 0x7F           # largeur d'un s_bfe : S1[22:16]
 QUAD = 4
+HALF = 0xFFFF                                # one 16-bit half of a dword
+INLINE_FLOAT_CODES = range(240, 249)         # 0.5 ... 1/(2*PI)
+# s_pack sources of 16 bits in AMD's machine-readable RDNA 2 XML (OperandSize); the others are 32 bits.
+PACK_HALF_SOURCES = {"s_pack_ll_b32_b16": ("ssrc0", "ssrc1"), "s_pack_lh_b32_b16": ("ssrc0",)}
 
 
 def _signed(value, bits):
@@ -91,6 +95,22 @@ def _value(function):
     return lambda a, w: (function(a), None)
 
 
+def check_pack_sources(name, fields, error):
+    """Refuse an inline float on a 16-bit s_pack source: AMD's RDNA 2 XML gives these sources 16 bits (half
+    constants, ISA section 6.2) while LLVM declares them 32-bit (SOP2_32): the value is not settled."""
+    if any(fields[field] in INLINE_FLOAT_CODES for field in PACK_HALF_SOURCES.get(name, ())):
+        raise error(f"{name} with an inline float on a 16-bit source: half or single precision not settled")
+
+
+def _pack(name, execute):
+    def checked(wave, fields, literal):
+        from emu.rdna2_exec import Untranslated
+
+        check_pack_sources(name, fields, Untranslated)
+        execute(wave, fields, literal)
+    return checked
+
+
 def scalar_operations(sop1, sop2, logic, saveexec, compare):
     """{mnémonique: exécution} des instructions scalaires de ce module."""
     table = {
@@ -103,6 +123,10 @@ def scalar_operations(sop1, sop2, logic, saveexec, compare):
         "s_absdiff_i32": sop2(lambda a, b, w: (r := absdiff(a, b), r != 0)),
         "s_mul_hi_u32": sop2(lambda a, b, w: (a * b >> 32, None)),
         "s_mul_hi_i32": sop2(lambda a, b, w: (_signed(a, 32) * _signed(b, 32) >> 32, None)),
+        # D = {S1 half, S0 half}, SCC unchanged (ISA section 12.1, SOP2 opcodes 50-52, p. 106).
+        "s_pack_ll_b32_b16": _pack("s_pack_ll_b32_b16", sop2(lambda a, b, w: ((b & HALF) << 16 | a & HALF, None))),
+        "s_pack_lh_b32_b16": _pack("s_pack_lh_b32_b16", sop2(lambda a, b, w: (b & ~HALF & MASK32 | a & HALF, None))),
+        "s_pack_hh_b32_b16": _pack("s_pack_hh_b32_b16", sop2(lambda a, b, w: (b & ~HALF & MASK32 | a >> 16, None))),
         "s_orn2_b64": logic(lambda a, b: a | ~b, 2), "s_nand_b64": logic(lambda a, b: ~(a & b), 2),
         "s_nor_b64": logic(lambda a, b: ~(a | b), 2), "s_xnor_b64": logic(lambda a, b: ~(a ^ b), 2),
         "s_bitcmp0_b64": compare(lambda a, b: not a >> (b & 63) & 1, 2, second_width=1),

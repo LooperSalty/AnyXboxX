@@ -7,7 +7,8 @@ ne sont pas synchrones, d'où une barrière de groupe après chaque écriture.
 """
 from emu import rdna2_exec_lanes, rdna2_exec_smem, rdna2_hlsl_format, rdna2_hlsl_smem, rdna2_swizzle as swz
 from emu.rdna2_exec_atomic import STRIDE64
-from emu.rdna2_exec_memory import LDS_ATOMIC, LDS_PATTERN, SCALAR_PATTERN, VECTOR_ATOMIC, VECTOR_PATTERN, WIDTHS
+from emu.rdna2_exec_memory import (ADD_TID, LDS_ATOMIC, LDS_PATTERN, SCALAR_PATTERN, VECTOR_ATOMIC, VECTOR_PATTERN,
+                                   WIDTHS)
 from emu.rdna2_exec_ops import signed
 from emu.rdna2_hlsl_ops import NULL, OFF, Untranslatable, hexa, source
 
@@ -51,6 +52,11 @@ def _scalar(name, word):
 def _flat(family, name, word, active):
     offset = hexa(signed(word & 0xFFF, 12))
     addr, data, saddr, vdst = (word >> 32) & 0xFF, (word >> 40) & 0xFF, (word >> 48) & 0x7F, (word >> 56) & 0xFF
+    if name in ADD_TID:                 # SADDR + offset + lane × 4, no VGPR address (emu/rdna2_exec_memory.py)
+        if saddr == OFF:
+            raise Untranslatable(f"{name} with SADDR off: address not given by the RDNA 2 ISA")
+        return _vector_access(ADD_TID[name], f"(s[{saddr}] + {offset} + lane * 4u)", data, vdst, active,
+                              glc=0, inside="true")
     base = f"s[{saddr}] + v[{addr}]" if family == "GLOBAL" and saddr != OFF else f"v[{addr}]"
     address = f"({base} + {offset})"
     return _vector_access(name, address, data, vdst, active, glc=(word >> 16) & 1, inside="true")
@@ -169,7 +175,7 @@ def memory_statements(family, name, word, active):
         return rdna2_hlsl_format.statements(name, word, active)
     if family == "MUBUF" and (VECTOR_PATTERN.match(name) or VECTOR_ATOMIC.match(name)):
         return _buffer(name, word, active)
-    if family in ("GLOBAL", "FLAT") and (VECTOR_PATTERN.match(name) or VECTOR_ATOMIC.match(name)):
+    if family in ("GLOBAL", "FLAT") and (VECTOR_PATTERN.match(name) or VECTOR_ATOMIC.match(name) or name in ADD_TID):
         return _flat(family, name, word, active)
     raise Untranslatable(f"non traduite en HLSL : {name} ({family})")
 

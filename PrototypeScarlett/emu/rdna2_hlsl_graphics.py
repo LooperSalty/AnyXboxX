@@ -56,7 +56,8 @@ MULTI_LANE_REGISTERS = """  uint lane = WaveGetLaneIndex() & 31u;
   for (uint j = 0; j < 256; ++j) v[j] = 0u;
   s[126] = WaveBallot32(true);"""
 CROSS_LANE_OPS = frozenset({"v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32",
-                            "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_wqm_b32"})
+                            "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_wqm_b32",
+                            "global_load_dword_addtid", "global_store_dword_addtid"})    # lane id in the address
 
 
 def _uses_wave_ops(data):

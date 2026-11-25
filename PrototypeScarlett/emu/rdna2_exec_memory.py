@@ -46,6 +46,9 @@ HALF_BITS, HALF_MASK = 16, 0xFFFF
 CACHE_CONTROL = frozenset({"s_dcache_inv", "s_gl1_inv", "s_dcache_wb", "buffer_gl0_inv", "buffer_gl1_inv",
                            "ds_nop"})
 OTHER = frozenset({"s_memtime", "s_memrealtime", *rdna2_exec_lanes.NAMES})
+# No VGPR address: memory_Addr = sgpr_addr(64) + inst_offset(12) + tid*4 (ISA section 12.18.3, opcodes 22-23,
+# p. 230). The ISA gives no address without SADDR: SADDR = off is refused. {name: plain access}
+ADD_TID = {"global_load_dword_addtid": "global_load_dword", "global_store_dword_addtid": "global_store_dword"}
 
 
 class Memory:
@@ -80,7 +83,7 @@ class Memory:
 def supports(name):
     """Vrai si l'interpréteur exécute cette instruction mémoire."""
     vector = VECTOR_PATTERN.match(name)
-    return bool(name in CACHE_CONTROL or name in OTHER or vector and vector.group(3) in WIDTHS
+    return bool(name in CACHE_CONTROL or name in OTHER or name in ADD_TID or vector and vector.group(3) in WIDTHS
                 or VECTOR_ATOMIC.match(name) or SCALAR_PATTERN.match(name)
                 or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES
                 or rdna2_exec_atomic.vector(name) or rdna2_exec_atomic.lds(name)
@@ -261,12 +264,23 @@ def _lds_exchange2(wave, spec, base, offsets, sources, vdst, lane):
 def _flat(wave, family, name, word):
     offset = signed(word & 0xFFF, 12)
     addr, data, saddr, vdst = (word >> 32) & 0xFF, (word >> 40) & 0xFF, (word >> 48) & 0x7F, (word >> 56) & 0xFF
+    if name in ADD_TID:
+        return _add_tid(wave, name, offset, data, saddr, vdst)
     for lane in wave.active():
         if family == "GLOBAL" and saddr != OFF:
             address = (wave.s[saddr] | wave.s[saddr + 1] << 32) + wave.v[addr][lane]
         else:
             address = wave.v[addr][lane] | wave.v[addr + 1][lane] << 32
         _access(wave, name, address + offset, data, vdst, lane, returns=(word >> 16) & 1)
+
+
+def _add_tid(wave, name, offset, data, saddr, vdst):
+    if saddr == OFF:
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"{name} with SADDR off: address not given by the RDNA 2 ISA")
+    base = wave.s[saddr] | wave.s[saddr + 1] << 32
+    for lane in wave.active():
+        _access(wave, ADD_TID[name], base + offset + lane * DWORD, data, vdst, lane)
 
 
 def _buffer(wave, name, word):

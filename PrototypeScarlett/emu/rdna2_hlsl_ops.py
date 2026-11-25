@@ -8,6 +8,8 @@ référence emu/rdna2_exec*, contre lequel la traduction est vérifiée.
 """
 import re
 
+from emu.rdna2_exec_bits import check_pack_sources
+from emu.rdna2_exec_cmp16 import HALF_INLINE_FLOATS
 from emu.rdna2_exec_ops import SOPP_NO_EFFECT, float_bits, signed
 from emu.rdna2_hlsl_helpers import HELPERS  # noqa: F401  (réexporté : rdna2_hlsl, graphics, wave64)
 
@@ -25,8 +27,11 @@ def hexa(value):
     return f"0x{value & 0xFFFF_FFFF:X}u"
 
 
-def source(code, literal=None):
-    """Expression HLSL (uint) d'un opérande source 9 bits."""
+def source(code, literal=None, half=False):
+    """Expression HLSL (uint) d'un opérande source 9 bits ; `half` : constante flottante en demi-précision
+    (opérande de 16 bits, emu/rdna2_exec_cmp16.py)."""
+    if half and code in HALF_INLINE_FLOATS:
+        return hexa(HALF_INLINE_FLOATS[code])
     if code >= 256:
         return f"v[{code - 256}]"
     if code == NULL:
@@ -112,6 +117,9 @@ SCALAR = {
     "s_absdiff_i32": "{{ uint x = {a} - {b}; uint r = asint(x) < 0 ? 0u - x : x; scc = r != 0u; {d} = r; }}",
     "s_mul_hi_u32": "{d} = MulHiU32({a}, {b});",
     "s_mul_hi_i32": "{d} = MulHiI32({a}, {b});",
+    "s_pack_ll_b32_b16": "{d} = ({b} << 16) | ({a} & 0xFFFFu);",
+    "s_pack_lh_b32_b16": "{d} = ({b} & 0xFFFF0000u) | ({a} & 0xFFFFu);",
+    "s_pack_hh_b32_b16": "{d} = ({b} & 0xFFFF0000u) | ({a} >> 16);",
     "s_bcnt0_i32_b32": "{{ uint r = 32u - countbits({a}); scc = r != 0u; {d} = r; }}",
     "s_ff0_i32_b32": "{d} = firstbitlow(~{a});",
     "s_flbit_i32": "{d} = LeadingSignsI32({a});",
@@ -153,6 +161,7 @@ BRANCHES = {
 
 
 def scalar_statement(name, fields, literal):
+    check_pack_sources(name, fields, Untranslatable)
     template = SCALAR[name]
     if not template:
         return ""
@@ -283,7 +292,7 @@ VECTOR = {
     "v_cubema_f32": "asuint(Cube({a}, {b}, {c}).w)",
 }
 COMPARE = re.compile(r"^v_cmp(x?)_(f|lt|eq|le|gt|lg|ge|ne|neq|t|tru|o|u|nge|nlg|ngt|nle|nlt|class)"
-                     r"_(f32|u32|i32)$")
+                     r"_(f32|u32|i32|u16|i16)$")
 CONSTANT_TESTS = {"f": "false", "t": "true", "tru": "true"}
 # Tests flottants non ordonnés (vrais si une source est NaN) : négation du test ordonné.
 # NaN testé à part : sans cela, le pilote AMD RDNA 2 confond comparaisons ordonnées et non ordonnées (#134).
@@ -297,6 +306,9 @@ UNORDERED_F32 = {
 }
 
 
+HALF_CASTS = {"u16": "(({x}) & 0xFFFFu)", "i16": "(asint(({x}) << 16u) >> 16)"}
+
+
 def compare_condition(name, a, b):
     found = COMPARE.match(name)
     operation, kind = found.group(2), found.group(3)
@@ -306,8 +318,10 @@ def compare_condition(name, a, b):
         if kind != "f32":
             raise Untranslatable(f"non traduite en HLSL : {name}")
         return UNORDERED_F32[operation].format(a=a, b=b)
-    cast = {"f32": "asfloat", "u32": "", "i32": "asint"}[kind]
     symbol = COMPARE_OPERATORS[operation]
+    if kind in HALF_CASTS:                             # S0[15:0] vs S1[15:0] (emu/rdna2_exec_cmp16.py)
+        return f"{HALF_CASTS[kind].format(x=a)} {symbol} {HALF_CASTS[kind].format(x=b)}"
+    cast = {"f32": "asfloat", "u32": "", "i32": "asint"}[kind]
     if operation == "lg" and kind == "f32":            # ordonné et différent
         return f"(!IsNanF32({a}) && !IsNanF32({b}) && ({cast}({a}) < {cast}({b}) || {cast}({a}) > {cast}({b})))"
     if kind == "f32" and operation in ("lt", "le", "gt", "ge"):

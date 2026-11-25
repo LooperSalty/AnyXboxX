@@ -1,6 +1,7 @@
 """HLSL recompilation of RDNA 2 SDWA (0xF9), DPP16 (0xFA), and DPP8 (0xE9/0xEA)
 forms for VOP1, VOP2, and VOPC instructions (#21).
 """
+from emu import rdna2_exec_cmp16
 from emu.rdna2_exec_ext import operand_float_flags
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS
 from emu.rdna2_hlsl_ops import VECTOR, Untranslatable, compare_condition, is_compare, scalar_target, source
@@ -75,6 +76,8 @@ def _hlsl_sdwa(family, name, fields, ext, active):
         b = "0u"
 
     if family == "VOPC" or is_compare(name):
+        scalar_codes = [code for code, scalar in ((s0_code, s0_scalar), (s1_code, s1_scalar)) if scalar]
+        rdna2_exec_cmp16.check_sdwa_inline(name, scalar_codes, Untranslatable)
         if name.startswith("v_cmpx"):
             target = "s[126]"
         elif (ext >> 15) & 1:

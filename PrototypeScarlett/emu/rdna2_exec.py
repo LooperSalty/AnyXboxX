@@ -8,9 +8,9 @@ qui les nomme, ce qui mesure ce qui reste à traduire.
 """
 import struct
 
-from emu import (rdna2, rdna2_exec_cmp64, rdna2_exec_dot, rdna2_exec_ext, rdna2_exec_format, rdna2_exec_graphics,
-                 rdna2_exec_image, rdna2_exec_memory, rdna2_exec_movrel, rdna2_exec_pc, rdna2_exec_vop3,
-                 rdna2_exec_wide)
+from emu import (rdna2, rdna2_exec_cmp16, rdna2_exec_cmp64, rdna2_exec_dot, rdna2_exec_ext, rdna2_exec_format,
+                 rdna2_exec_graphics, rdna2_exec_image, rdna2_exec_memory, rdna2_exec_movrel, rdna2_exec_pc,
+                 rdna2_exec_vop3, rdna2_exec_wide)
 from emu.rdna2_exec_ops import SCALAR, VECTOR, VECTOR_COMPARE, VECTOR_NO_OPERATION, BRANCHES, float_bits
 
 LANES = 32
@@ -234,7 +234,8 @@ def _compare(wave, name, fields, literal):
     test, writes_exec = VECTOR_COMPARE[name]
     mask = 0
     for lane in wave.active():
-        if test(wave.read_lane(fields["src0"], lane, literal), wave.v[fields["vsrc1"]][lane]):
+        a = rdna2_exec_cmp16.operand(name, fields["src0"], wave.read_lane(fields["src0"], lane, literal))
+        if test(a, wave.v[fields["vsrc1"]][lane]):
             mask |= 1 << lane
     wave.write_mask(EXEC_LO if writes_exec else VCC_LO, mask)
 

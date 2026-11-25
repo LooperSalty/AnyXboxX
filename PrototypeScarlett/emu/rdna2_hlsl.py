@@ -11,9 +11,9 @@ from pathlib import Path
 import struct
 import sys
 
-from emu import (rdna2, rdna2_exec_div, rdna2_exec_wide, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext,
-                 rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_movrel, rdna2_hlsl_pc, rdna2_hlsl_sad,
-                 rdna2_hlsl_scalar64, rdna2_hlsl_wide)
+from emu import (rdna2, rdna2_exec_cmp16, rdna2_exec_div, rdna2_exec_wide, rdna2_hlsl_div, rdna2_hlsl_dot,
+                 rdna2_hlsl_ext, rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_movrel, rdna2_hlsl_pc,
+                 rdna2_hlsl_sad, rdna2_hlsl_scalar64, rdna2_hlsl_wide)
 from emu.rdna2_exec_ops import signed
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS, VECTOR_NO_OPERATION
 from emu.rdna2_exec_vop3 import MAD64, Fields, float_inputs, float_result
@@ -113,7 +113,7 @@ def branch_target(data, instruction):
 
 
 def _vector(name, fields, literal, active=ACTIVE):
-    a = source(fields["src0"], literal)
+    a = source(fields["src0"], literal, half=name in rdna2_exec_cmp16.COMPARE16)
     values = {"a": a, "b": f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u", "c": "s[106]",
               "d": f"v[{fields.get('vdst', 0)}]", "k": hexa(literal or 0)}
     if name == "v_readfirstlane_b32":
@@ -169,10 +169,19 @@ def modified(code, index, fields, literal, is_float):
     return operand
 
 
+def compare16_sources(name, fields, literal):
+    """(a, b) of a VOP3 16-bit compare (half inline floats, op_sel refused); None for other compares."""
+    if name not in rdna2_exec_cmp16.COMPARE16:
+        return None
+    rdna2_exec_cmp16.check_vop3(name, fields.op_sel, Untranslatable)
+    return tuple(source(code, literal, half=True) for code in fields.sources[:2])
+
+
 def _vop3(name, opcode, fields, literal, active=ACTIVE):
     is_float = float_result(name)
     a, b, c = (modified(code, i, fields, literal, float_inputs(name)) for i, code in enumerate(fields.sources))
     if opcode < 0x100 and is_compare(name):
+        a, b = compare16_sources(name, fields, literal) or (a, b)
         target = "s[126]" if name.startswith("v_cmpx") else scalar_target(fields.vdst)
         return [f"{{ bool t = ({active}) && ({compare_condition(name, a, b)}); {target} = Ballot(lane, t); }}"]
     if name in CARRY:

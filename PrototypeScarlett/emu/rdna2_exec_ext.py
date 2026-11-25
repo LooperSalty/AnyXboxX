@@ -5,6 +5,7 @@ Semantics follow AMD's public RDNA 2 ISA specification (sections 6.5 SDWA and 6.
 """
 import re
 
+from emu import rdna2_exec_cmp16
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS, VECTOR, VECTOR_COMPARE, bits_float, float_bits
 from emu.rdna2_operands_ext import BOUND_CTRL_BIT, CLAMP_BIT, DPP8, DPP8_FI, DPP16, FI_BIT, OMOD_SHIFT, SDWA
 
@@ -132,6 +133,8 @@ def _exec_sdwa(wave, family, name, fields, ext):
         return _apply_float_mods(val, absolute, neg) if src_is_float else val
 
     if family == "VOPC":
+        scalar_codes = [code for code, scalar in ((s0_code, s0_scalar), (s1_code, s1_scalar)) if scalar]
+        rdna2_exec_cmp16.check_sdwa_inline(name, scalar_codes, Untranslated)
         test, writes_exec = VECTOR_COMPARE[name]
         mask = 0
         for lane in wave.active():

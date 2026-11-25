@@ -15,8 +15,11 @@ import re
 
 from emu import (rdna2, rdna2_hlsl, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_format,
                  rdna2_hlsl_image, rdna2_hlsl_sad, rdna2_hlsl_wide)
+from emu.rdna2_exec_cmp16 import COMPARE16
+from emu.rdna2_exec_memory import ADD_TID
 from emu.rdna2_exec_vop3 import Fields, float_inputs
-from emu.rdna2_hlsl import CARRY, SCALAR_FAMILIES, _fields, _literal, _words, modified
+from emu.rdna2_hlsl_memory import memory_statements
+from emu.rdna2_hlsl import CARRY, SCALAR_FAMILIES, _fields, _literal, _words, compare16_sources, modified
 from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, NULL, Untranslatable, compare_condition,
                                 is_compare, scalar_target, source, source_high)
 
@@ -140,7 +143,7 @@ def _mad64(name, a, b, fields):
 
 def _vector(name, fields, literal):
     """VOP1/VOP2/VOPC sans SDWA ni DPP ; None si l'instruction ne dépend pas de la taille du wave."""
-    a = source(fields["src0"], literal)
+    a = source(fields["src0"], literal, half=name in COMPARE16)
     b = f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u"
     if name == "v_readfirstlane_b32":
         return [f"{scalar_target(fields['vdst'])} = ReadLane64(lane, {a}, FirstLane64(s[126], s[127]));"]
@@ -157,6 +160,7 @@ def _vop3(name, opcode, fields, literal):
     """VOP3 dépendant de la taille du wave ; None pour les autres."""
     a, b, _ = (modified(code, i, fields, literal, float_inputs(name)) for i, code in enumerate(fields.sources))
     if opcode < COMPARE_END and is_compare(name):
+        a, b = compare16_sources(name, fields, literal) or (a, b)
         return _compare(name, a, b, fields.vdst)
     if name in CARRY:
         return _carry(name, a, b, fields.sources[2], fields.vdst, fields.sdst)
@@ -196,6 +200,8 @@ def _specific(data, instruction, name):
         return _vop3(name, instruction.opcode, Fields(pair), _literal(data, instruction, 2))
     if family == "DS" and name == "ds_bpermute_b32":
         return _bpermute(pair)
+    if family == "GLOBAL" and name in ADD_TID:      # lane = SV_GroupIndex 0-63: the TID in the wave64
+        return memory_statements(family, name, pair, ACTIVE)
     return None
 
 

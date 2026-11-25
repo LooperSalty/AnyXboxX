@@ -8,7 +8,7 @@ traités à part.
 import math
 import struct
 
-from emu import rdna2_exec_bits
+from emu import rdna2_exec_bits, rdna2_exec_cmp16
 
 MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 EXEC = 126                                  # exec_lo ; exec_hi en 127
@@ -434,3 +434,4 @@ for _prefix, _writes_exec in (("v_cmp", False), ("v_cmpx", True)):
     for _name, _test in INTEGER_TESTS.items():
         VECTOR_COMPARE[f"{_prefix}_{_name}_u32"] = (lambda a, b, t=_test: t(a, b), _writes_exec)
         VECTOR_COMPARE[f"{_prefix}_{_name}_i32"] = (lambda a, b, t=_test: t(signed(a), signed(b)), _writes_exec)
+VECTOR_COMPARE.update(rdna2_exec_cmp16.COMPARE16)       # i16/u16: S0[15:0] vs S1[15:0]
