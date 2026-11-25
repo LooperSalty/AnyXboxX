@@ -8,7 +8,7 @@ traités à part.
 import math
 import struct
 
-from emu import rdna2_exec_bits, rdna2_exec_cmp16
+from emu import rdna2_exec_bits, rdna2_exec_cmp16, rdna2_exec_minmax
 
 MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 EXEC = 126                                  # exec_lo ; exec_hi en 127
@@ -381,8 +381,8 @@ VECTOR = {
     "v_subrev_f32": _binary_float(lambda x, y: y - x),
     "v_mul_f32": _binary_float(lambda x, y: x * y),
     "v_mul_legacy_f32": _binary_float(lambda x, y: 0.0 if x == 0.0 or y == 0.0 else x * y),
-    "v_min_f32": _binary_float(min),
-    "v_max_f32": _binary_float(max),
+    "v_min_f32": _binary_float(rdna2_exec_minmax.minimum),     # NaN and ±0 rules: emu/rdna2_exec_minmax.py
+    "v_max_f32": _binary_float(rdna2_exec_minmax.maximum),
     "v_fmac_f32": lambda a, b, d, k, c: _float_op(_fma)(F(a), F(b), F(d)),
     "v_mac_f32": lambda a, b, d, k, c: _float_op(_mul_add)(F(a), F(b), F(d)),
     "v_fmamk_f32": lambda a, b, d, k, c: _float_op(_fma)(F(a), F(k), F(b)),

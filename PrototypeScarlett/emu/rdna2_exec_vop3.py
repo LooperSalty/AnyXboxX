@@ -8,7 +8,7 @@ Sémantique d'après la documentation publique d'AMD (« RDNA 2 Instruction Set 
 import math
 
 from emu import (rdna2_exec_cmp16, rdna2_exec_cmp64, rdna2_exec_cmpf16, rdna2_exec_div, rdna2_exec_f16,
-                 rdna2_exec_movrel, rdna2_exec_sad, rdna2_exec_wide)
+                 rdna2_exec_minmax, rdna2_exec_movrel, rdna2_exec_sad, rdna2_exec_wide)
 from emu.rdna2_exec_ops import (MASK32, SIXTEEN_BIT_RESULTS, VECTOR, VECTOR_COMPARE, VECTOR_NO_OPERATION,
                                 _float_op, _fma, _legacy_fma, _mul_add, bits_float, float_bits, ldexp, signed)
 
@@ -104,9 +104,9 @@ VECTOR3 = {
     "v_bfi_b32": lambda a, b, c: (a & b) | (~a & c),
     "v_alignbit_b32": lambda a, b, c: ((a << 32 | b) >> (c & 31)) & MASK32,
     "v_alignbyte_b32": lambda a, b, c: ((a << 32 | b) >> ((c & 3) * 8)) & MASK32,
-    "v_min3_f32": _float3(lambda x, y, z: min(x, y, z)),
-    "v_max3_f32": _float3(lambda x, y, z: max(x, y, z)),
-    "v_med3_f32": _float3(_median),
+    "v_min3_f32": _float3(rdna2_exec_minmax.minimum3),
+    "v_max3_f32": _float3(rdna2_exec_minmax.maximum3),
+    "v_med3_f32": _float3(rdna2_exec_minmax.median3),
     "v_min3_u32": min, "v_max3_u32": max, "v_med3_u32": _median,
     "v_min3_i32": lambda a, b, c: min(signed(a), signed(b), signed(c)),
     "v_max3_i32": lambda a, b, c: max(signed(a), signed(b), signed(c)),
