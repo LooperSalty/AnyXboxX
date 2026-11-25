@@ -34,6 +34,19 @@ def test_a_slow_second_breaks_the_60_fps_target():
     assert not perf.summarize(perf.parse_csv(slow)).constant_60
 
 
+@pytest.mark.parametrize("rows", [0, 1], ids=["vide", "seulement la chauffe"])
+def test_a_capture_without_a_second_after_the_warm_up_has_no_verdict(rows):
+    with pytest.raises(ValueError, match="chauffe"):
+        perf.summarize(perf.parse_csv(CSV)[:rows])
+    assert "polyline" in perf.svg(perf.parse_csv(CSV)[:rows], "x")      # la courbe reste tracée, en orange
+
+
+def test_only_the_seconds_after_the_warm_up_decide_the_verdict():
+    rows = perf.parse_csv("secondes,images,fps,ms_moyen,ms_p99\n1.000,60,60.00,16.667,16.667\n2.000,30,30.00,33.333,33.333\n")
+    summary = perf.summarize(rows)
+    assert (summary.seconds, summary.minimum_fps, summary.constant_60) == (1, 30.0, False)
+
+
 def test_chart_is_valid_svg_with_the_60_fps_line():
     image = perf.svg(perf.parse_csv(CSV), "SimpleTriangle")
     root = ET.fromstring(image)

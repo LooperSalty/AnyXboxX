@@ -48,9 +48,9 @@ def parse_csv(text):
 
 
 def summarize(rows):
-    measured = rows[WARM_UP_SECONDS:] if len(rows) > WARM_UP_SECONDS else rows
+    measured = rows[WARM_UP_SECONDS:]
     if not measured:
-        raise ValueError("Aucune image mesurée : le jeu n'a rien présenté.")
+        raise ValueError("Mesure trop courte : aucune seconde après la chauffe, pas de verdict.")
     fps = [row.fps for row in measured]
     return Summary(len(measured), sum(fps) / len(fps), min(fps),
                    1000.0 / max(row.p99_ms for row in measured),
@@ -77,7 +77,7 @@ def svg(rows, title):
         return HEIGHT - MARGIN - plot_h * fps / top
 
     points = " ".join(f"{x(row.seconds):.1f},{y(row.fps):.1f}" for row in rows)
-    color = GREEN if rows and summarize(rows).constant_60 else ORANGE
+    color = GREEN if len(rows) > WARM_UP_SECONDS and summarize(rows).constant_60 else ORANGE
     return "\n".join([
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" '
         f'viewBox="0 0 {WIDTH} {HEIGHT}" font-family="Segoe UI, Arial, sans-serif" font-size="12">',
