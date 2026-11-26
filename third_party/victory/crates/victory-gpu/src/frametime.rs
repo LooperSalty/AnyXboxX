@@ -98,7 +98,9 @@ cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
 copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
 texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
-twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct\n";
+twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,\
+lazy_deferred_pages,lazy_veh_faults,lazy_self_bypass_hits,lazy_bytes_readback,\
+lazy_materialize_ms,lazy_protect_ms\n";
 
 /// The `#` block a dump starts with: the machine and the switches, so a file
 /// from another PC can be compared and reproduced. `pandas.read_csv(...,
@@ -391,8 +393,15 @@ pub(crate) struct Row {
     pub depth_planes: f64,
     pub ram_mb: f64,
     pub cpu_pct: f64,
+    pub lazy_deferred_pages: f64,
+    pub lazy_veh_faults: f64,
+    pub lazy_self_bypass_hits: f64,
+    pub lazy_bytes_readback: f64,
+    pub lazy_materialize_ms: f64,
+    pub lazy_protect_ms: f64,
 }
 
+/// Formats and writes `r` as a single CSV line into `out`.
 fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
     writeln!(
         out,
@@ -403,7 +412,9 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
          {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
          {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
-         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3}",
+         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3},\
+         {lazy_deferred_pages:.3},{lazy_veh_faults:.3},{lazy_self_bypass_hits:.3},\
+         {lazy_bytes_readback:.3},{lazy_materialize_ms:.3},{lazy_protect_ms:.3}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,
@@ -440,6 +451,12 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
         depth_planes = r.depth_planes,
         ram_mb = r.ram_mb,
         cpu_pct = r.cpu_pct,
+        lazy_deferred_pages = r.lazy_deferred_pages,
+        lazy_veh_faults = r.lazy_veh_faults,
+        lazy_self_bypass_hits = r.lazy_self_bypass_hits,
+        lazy_bytes_readback = r.lazy_bytes_readback,
+        lazy_materialize_ms = r.lazy_materialize_ms,
+        lazy_protect_ms = r.lazy_protect_ms,
     )
 }
 
@@ -493,5 +510,42 @@ mod tests {
         let line = String::from_utf8(buf).unwrap();
         let row_cols = line.trim_end().split(',').count();
         assert_eq!(row_cols, header_cols);
+    }
+
+    #[test]
+    fn frametime_header_matches_row_columns_and_includes_lazy_telemetry() {
+        let header_cols: Vec<&str> = HEADER.trim_end().split(',').collect();
+        let row = Row {
+            frame: 42,
+            lazy_deferred_pages: 1024.0,
+            lazy_veh_faults: 3.0,
+            lazy_self_bypass_hits: 100.0,
+            lazy_bytes_readback: 196_608.0,
+            lazy_materialize_ms: 6.75,
+            lazy_protect_ms: 0.02,
+            ..Row::default()
+        };
+        let mut buf = Vec::new();
+        write_row(&mut buf, 1234, &row).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let row_cols: Vec<&str> = line.trim_end().split(',').collect();
+        assert_eq!(header_cols.len(), row_cols.len());
+        let tail = &header_cols[header_cols.len() - 6..];
+        assert_eq!(
+            tail,
+            &[
+                "lazy_deferred_pages",
+                "lazy_veh_faults",
+                "lazy_self_bypass_hits",
+                "lazy_bytes_readback",
+                "lazy_materialize_ms",
+                "lazy_protect_ms",
+            ]
+        );
+        let values = &row_cols[row_cols.len() - 6..];
+        assert_eq!(
+            values,
+            &["1024.000", "3.000", "100.000", "196608.000", "6.750", "0.020"]
+        );
     }
 }
