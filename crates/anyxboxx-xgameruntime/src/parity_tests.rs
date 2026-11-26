@@ -2,7 +2,7 @@
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 
-fn check(source: &str, array: &str, methods: Vec<(usize, *const c_void)>, refusals: &[usize]) {
+fn cpp_slots(source: &str, array: &str) -> Vec<usize> {
     let table = source
         .split_once(&format!("{array}[] = {{"))
         .expect("C++ interface table")
@@ -10,25 +10,81 @@ fn check(source: &str, array: &str, methods: Vec<(usize, *const c_void)>, refusa
         .split_once("};")
         .expect("end of C++ interface table")
         .0;
-    let slots: BTreeSet<_> = methods.into_iter().map(|(slot, _)| slot).collect();
-    let mut checked = 0;
-    for line in table
+    let slots: Vec<_> = table
         .lines()
         .filter(|line| line.contains("ANYXBOXX_METHOD("))
-    {
-        let (_, comment) = line.split_once("//").expect("C++ slot comment");
-        let slot = comment
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<usize>().ok())
-            .expect("numeric C++ slot");
-        checked += 1;
+        .map(|line| {
+            let (_, comment) = line.split_once("//").expect("C++ slot comment");
+            comment
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("numeric C++ slot")
+        })
+        .collect();
+    assert!(!slots.is_empty(), "{array} has no checked C++ methods");
+    slots
+}
+
+fn check(source: &str, array: &str, methods: Vec<(usize, *const c_void)>, refusals: &[usize]) {
+    let slots: BTreeSet<_> = methods.into_iter().map(|(slot, _)| slot).collect();
+    for slot in cpp_slots(source, array) {
         assert!(
             slots.contains(&slot) || refusals.contains(&slot),
-            "{array} slot {slot} is implemented in C++ but absent in Rust: {line}"
+            "{array} slot {slot} is implemented in C++ but absent in Rust"
         );
     }
-    assert!(checked > 0, "{array} has no checked C++ methods");
+}
+
+#[test]
+fn cpp_task_queue_methods_do_not_point_to_rust_missing_stubs() {
+    let source =
+        include_str!("../../../third_party/victory/crates/victory-hle/src/modules/xasync.rs")
+            .replace("\r\n", "\n");
+    let table = source
+        .split_once("static VTABLE: Methods<31> = Methods([")
+        .unwrap()
+        .1
+        .split_once("]);")
+        .unwrap()
+        .0;
+    let methods: Vec<_> = table
+        .lines()
+        .map(|line| line.split("//").next().unwrap().trim())
+        .filter(|line| !line.is_empty())
+        .flat_map(|line| {
+            line.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+        })
+        .collect();
+    assert_eq!(methods.len(), 31);
+    for slot in cpp_slots(
+        include_str!("../../../runtime/xgameruntime/task_queue_interface.cpp"),
+        "kMethods",
+    ) {
+        let method = methods
+            .get(slot)
+            .expect("C++ slot must fit the Rust vtable");
+        assert!(
+            !method.contains("missing::<"),
+            "task queue slot {slot} is unimplemented"
+        );
+        if *method == "REGISTER_WAITER" || *method == "UNREGISTER_WAITER" {
+            let declaration = format!("#[cfg(windows)]\nconst {method}: *const () = ");
+            let target = source
+                .split_once(&declaration)
+                .expect("Windows waiter declaration")
+                .1
+                .split_once(';')
+                .unwrap()
+                .0;
+            assert!(
+                !target.contains("missing::<"),
+                "task queue slot {slot} is unimplemented"
+            );
+        }
+    }
 }
 
 #[test]
