@@ -390,7 +390,8 @@ pub(crate) struct Row {
     pub twins_into_colour: f64,
     pub depth_planes: f64,
     pub ram_mb: f64,
-    pub cpu_pct: f64,
+    /// `None` writes an empty cell: a base that does not measure it must not invent a figure.
+    pub cpu_pct: Option<f64>,
 }
 
 fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
@@ -403,7 +404,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
          {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
          {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
-         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3}",
+         {depth_planes:.3},{ram_mb:.3},{cpu_pct}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,
@@ -439,7 +440,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
         twins_into_colour = r.twins_into_colour,
         depth_planes = r.depth_planes,
         ram_mb = r.ram_mb,
-        cpu_pct = r.cpu_pct,
+        cpu_pct = r.cpu_pct.map_or_else(String::new, |v| format!("{v:.3}")),
     )
 }
 
@@ -493,5 +494,21 @@ mod tests {
         let line = String::from_utf8(buf).unwrap();
         let row_cols = line.trim_end().split(',').count();
         assert_eq!(row_cols, header_cols);
+    }
+
+    #[test]
+    fn a_missing_value_is_an_empty_cell_not_a_zero() {
+        let mut buf = Vec::new();
+        let row = Row { cpu_pct: None, ram_mb: 1.5, ..Row::default() };
+        write_row(&mut buf, 1, &row).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let cells: Vec<&str> = line.trim_end().split(',').collect();
+        let cpu = HEADER.trim_end().split(',').position(|c| c == "cpu_pct").unwrap();
+        assert_eq!(cells[cpu], "");
+        assert_eq!(cells[cpu - 1], "1.500");
+        let mut buf = Vec::new();
+        write_row(&mut buf, 1, &Row { cpu_pct: Some(12.5), ..Row::default() }).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert_eq!(line.trim_end().split(',').nth(cpu), Some("12.500"));
     }
 }

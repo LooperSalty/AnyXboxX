@@ -623,6 +623,20 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         let refresh = |cpu: &mut Cpu, gpu: &mut Option<Gpu3d>| {
             let stats = sample(cpu, gpu.as_mut(), adapter.as_ref(), &names);
             *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
+            // (local) The panel's figures in the log every 5 s, so they can be read without the screen.
+            static TICKS: AtomicU64 = AtomicU64::new(0);
+            if TICKS.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
+                let s = &stats;
+                tracing::info!(
+                    "overlay: {:.1} fps {:.1} ms, cpu {:.0}%, gpu {}, ram {:.1}/{:.1} GB (process {:.1}), vram {}, {:.0} draws, 30 s {}",
+                    s.fps, s.ms, s.cpu,
+                    s.gpu.map_or("?".into(), |g| format!("{g:.0}%")),
+                    s.ram.1, s.ram.2, s.ram.0,
+                    s.vram.map_or("?".into(), |(u, b)| format!("{u:.1}/{b:.1} GB")),
+                    s.draws,
+                    s.half_minute.map_or("...".into(), |(h, l, m)| format!("high {h:.1} low {l:.1} avg {m:.1}")),
+                );
+            }
             let mut client = std::mem::zeroed::<RECT>();
             let mut origin = POINT { x: 0, y: 0 };
             let show = VISIBLE.load(Ordering::Relaxed)

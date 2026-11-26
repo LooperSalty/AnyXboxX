@@ -1,4 +1,4 @@
-//! (Neptune) Discord Rich Presence while a title runs: "Playing Grand Theft Auto VI" with
+//! (AnyXboxX, from the Neptune base) Discord Rich Presence while a title runs: "Playing Grand Theft Auto VI" with
 //! the time played, through the Discord client's own pipe on this PC (`\\.\pipe\discord-ipc-N`).
 //! Nothing goes over the network from here, and nothing happens if Discord is not running.
 //! Off unless asked for (AnyXboxX): `VICTORY_DISCORD=1` turns it on; `VICTORY_DISCORD_APP`
