@@ -1,3 +1,10 @@
+
+uint4 ImageGather4(uint4 t, uint4 q, uint s_bits, uint t_bits, uint unorm_bit, uint channel, int2 off) {
+  uint un = unorm_bit | ((q.x >> 15) & 1u);
+  uint cx = q.x & 7u;
+  uint cy = (q.x >> 3) & 7u;
+  uint border = (q.w >> 30) & 3u;
+  uint w = ImageWidth(t);
   uint h = ImageHeight(t);
   float fx = 0.0f;
   float fy = 0.0f;
@@ -42,11 +49,11 @@ void ImageStore(uint4 t, uint x, uint y, uint mip, uint dmask, uint4 vals) {
     if ((dmask & 2u) != 0u) g_memory.Store(addr + 4u, vals.y);
     if ((dmask & 4u) != 0u) g_memory.Store(addr + 8u, vals.z);
     if ((dmask & 8u) != 0u) g_memory.Store(addr + 12u, vals.w);
-  } else if (format == 64u) {
+  } else if (format == 64u || format == 62u || format == 63u) {
     uint addr = base + pixel * 8u;
     if ((dmask & 1u) != 0u) g_memory.Store(addr, vals.x);
     if ((dmask & 2u) != 0u) g_memory.Store(addr + 4u, vals.y);
-  } else if (format == 22u) {
+  } else if (format == 22u || format == 20u || format == 21u) {
     if ((dmask & 1u) != 0u) g_memory.Store(base + pixel * 4u, vals.x);
   } else if (format == 56u) {
     uint addr = base + pixel * 4u;
@@ -81,6 +88,57 @@ void ImageStore(uint4 t, uint x, uint y, uint mip, uint dmask, uint4 vals) {
 
 uint4 ImageResInfo(uint4 t, uint mip) {
   return mip == 0u ? uint4(ImageWidth(t), ImageHeight(t), 1u, 1u) : uint4(0u, 0u, 0u, 1u);
+}
+
+uint ImageAtomic32(uint4 t, uint x, uint y, uint op, uint data0, uint data1) {
+  uint w = ImageWidth(t);
+  uint h = ImageHeight(t);
+  if (x >= w || y >= h) return 0u;
+  uint format = (t.y >> 20) & 0x1FFu;
+  if (format != 20u && format != 21u && format != 22u) return 0u;
+  uint addr = (t.x << 8) + (y * w + x) * 4u;
+  uint old = 0u;
+  if (op == 0u) { g_memory.InterlockedExchange(addr, data0, old); return old; }
+  if (op == 1u) { g_memory.InterlockedCompareExchange(addr, data1, data0, old); return old; }
+  if (op == 2u) { g_memory.InterlockedAdd(addr, data0, old); return old; }
+  if (op == 3u) { g_memory.InterlockedAdd(addr, 0u - data0, old); return old; }
+  if (op == 5u) { g_memory.InterlockedMin(addr, data0, old); return old; }
+  if (op == 7u) { g_memory.InterlockedMax(addr, data0, old); return old; }
+  if (op == 8u) { g_memory.InterlockedAnd(addr, data0, old); return old; }
+  if (op == 9u) { g_memory.InterlockedOr(addr, data0, old); return old; }
+  if (op == 10u) { g_memory.InterlockedXor(addr, data0, old); return old; }
+  uint cur = g_memory.Load(addr);
+  for (uint iter = 0u; iter < 256u; ++iter) {
+    uint next = cur;
+    if (op == 4u) {
+      next = (asint(data0) < asint(cur)) ? data0 : cur;
+    } else if (op == 6u) {
+      next = (asint(data0) > asint(cur)) ? data0 : cur;
+    } else if (op == 11u) {
+      next = (cur >= data0) ? 0u : (cur + 1u);
+    } else if (op == 12u) {
+      next = (cur == 0u || cur > data0) ? data0 : (cur - 1u);
+    } else if (op == 13u) {
+      bool cur_nan = ((cur & 0x7F800000u) == 0x7F800000u) && ((cur & 0x007FFFFFu) != 0u);
+      bool cmp_nan = ((data1 & 0x7F800000u) == 0x7F800000u) && ((data1 & 0x007FFFFFu) != 0u);
+      next = (!cur_nan && !cmp_nan && (asfloat(cur) == asfloat(data1))) ? data0 : cur;
+    } else if (op == 14u) {
+      bool cur_nan = ((cur & 0x7F800000u) == 0x7F800000u) && ((cur & 0x007FFFFFu) != 0u);
+      bool dat_nan = ((data0 & 0x7F800000u) == 0x7F800000u) && ((data0 & 0x007FFFFFu) != 0u);
+      if (cur_nan || dat_nan) next = (cur_nan && !dat_nan) ? data0 : cur;
+      else next = (asfloat(data0) < asfloat(cur)) ? data0 : cur;
+    } else if (op == 15u) {
+      bool cur_nan = ((cur & 0x7F800000u) == 0x7F800000u) && ((cur & 0x007FFFFFu) != 0u);
+      bool dat_nan = ((data0 & 0x7F800000u) == 0x7F800000u) && ((data0 & 0x007FFFFFu) != 0u);
+      if (cur_nan || dat_nan) next = (cur_nan && !dat_nan) ? data0 : cur;
+      else next = (asfloat(data0) > asfloat(cur)) ? data0 : cur;
+    }
+    uint prev;
+    g_memory.InterlockedCompareExchange(addr, cur, next, prev);
+    if (prev == cur) return prev;
+    cur = prev;
+  }
+  return cur;
 }
 
 
@@ -240,61 +298,3 @@ uint BufD16Info(uint info) {
   uint kind = info & 7u;
   return (kind == 5u || kind == 6u) && BufWidth(info, 0u) == 32u ? 0u : info;
 }
-
-// float32 -> float16, subnormals kept (half_from_float): round to nearest even with overflow to infinity,
-// or toward zero with finite values past the range giving 65504.
-uint BufHalfFromFloat(uint f, bool rtz) {
-  uint sign = (f >> 16) & 0x8000u, e = (f >> 23) & 0xFFu, m = f & 0x7FFFFFu;
-  if (e == 0xFFu) {
-    uint payload = m >> 13;
-    return sign | 0x7C00u | (m != 0u && payload == 0u ? 1u : payload);
-  }
-  if (e < 101u) return sign;
-  uint full = m | 0x800000u;
-  bool normal = e > 112u;
-  uint drop = normal ? 13u : 126u - e;
-  uint q = full >> drop, r = full & ((1u << drop) - 1u), half = 1u << (drop - 1u);
-  if (!rtz && (r > half || (r == half && (q & 1u) != 0u))) q += 1u;
-  uint bits = normal ? ((e - 113u) << 10) + q : q;
-  return sign | min(bits, rtz ? 31743u : 0x7C00u);
-}
-
-uint BufNarrow(uint info, uint value) {
-  uint kind = info & 7u;
-  if (kind == 5u || kind == 6u) return value & 0xFFFFu;
-  return BufHalfFromFloat(value, kind == 7u);
-}
-
-uint BufWiden(uint info, uint c, uint h) {
-  uint kind = info & 7u;
-  if (kind == 6u) return BufSigned(h, 16u);
-  if (kind == 7u && BufWidth(info, c) != 16u) return BufHalf(h);
-  return h;
-}
-
-void BufWrite(uint address, uint size, uint4 e) {
-  uint base = address & ~3u, a = address & 3u, shift = a * 8u, need = (a + size + 3u) >> 2;
-  uint data[5] = { e.x, e.y, e.z, e.w, 0u };
-  uint mask[5] = { 0u, 0u, 0u, 0u, 0u };
-  for (uint j = 0u; j < 4u; j++)
-    mask[j] = size >= 4u * j + 4u ? 0xFFFFFFFFu : (size > 4u * j ? (1u << (8u * (size - 4u * j))) - 1u : 0u);
-  for (uint k = 0u; k < need; k++) {
-    uint value = data[k] << shift, bits = mask[k] << shift;
-    if (shift != 0u && k > 0u) {
-      value |= data[k - 1u] >> (32u - shift);
-      bits |= mask[k - 1u] >> (32u - shift);
-    }
-    if (bits == 0xFFFFFFFFu) g_memory.Store(base + 4u * k, value);
-    else if (bits != 0u) {
-      g_memory.InterlockedAnd(base + 4u * k, ~bits);
-      g_memory.InterlockedOr(base + 4u * k, value & bits);
-    }
-  }
-}
-
-uint DotPacked(uint a, uint b, uint c, uint width, bool sgn) {
-  // v_dot2/4/8 : c + somme des produits des éléments de `width` bits, modulo 2^32 (calcul non signé).
-  uint r = c;
-  [unroll] for (uint i = 0u; i < 32u; i += width) {
-    uint x = (a >> i) & ((1u << width) - 1u), y = (b >> i) & ((1u << width) - 1u);
-    if (sgn) {

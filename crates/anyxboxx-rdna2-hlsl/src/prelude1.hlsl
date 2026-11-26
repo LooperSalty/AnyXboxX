@@ -163,8 +163,15 @@ uint4 ImageTexel(uint4 t, int x, int y) {
     uint2 v2 = g_memory.Load2(base + pixel * 8u);
     return uint4(v2.x, v2.y, 0u, 0x3f800000u);
   }
+  if (format == 62u || format == 63u) {
+    uint2 v2 = g_memory.Load2(base + pixel * 8u);
+    return uint4(v2.x, v2.y, 0u, 1u);
+  }
   if (format == 22u) {
     return uint4(g_memory.Load(base + pixel * 4u), 0u, 0u, 0x3f800000u);
+  }
+  if (format == 20u || format == 21u) {
+    return uint4(g_memory.Load(base + pixel * 4u), 0u, 0u, 1u);
   }
   if (format == 56u) {
     uint w = g_memory.Load(base + pixel * 4u);
@@ -291,10 +298,3 @@ uint4 ImageSampleCompare(uint4 t, uint4 q, uint z_bits, uint s_bits, uint t_bits
   }
   return ImageSwizzle(uint4(pcf, pcf, pcf, 0x3f800000u), t.w);
 }
-
-uint4 ImageGather4(uint4 t, uint4 q, uint s_bits, uint t_bits, uint unorm_bit, uint channel, int2 off) {
-  uint un = unorm_bit | ((q.x >> 15) & 1u);
-  uint cx = q.x & 7u;
-  uint cy = (q.x >> 3) & 7u;
-  uint border = (q.w >> 30) & 3u;
-  uint w = ImageWidth(t);
