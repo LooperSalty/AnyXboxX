@@ -37,7 +37,7 @@ def test_lds_write_then_read(mode, width, mask, monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(512)) == expected
 
 
-@pytest.mark.parametrize("name", ["ds_write_b8", "ds_read_u16", "ds_add_u32"])
+@pytest.mark.parametrize("name", ["ds_write_b8", "ds_read_u16", "ds_sub_u32"])
 def test_untranslated_ds_is_named(name):
     result = rust(program(*ds(name, 1, data0=2, vdst=10)))
     assert result.returncode != 0 and name.encode() in result.stderr
