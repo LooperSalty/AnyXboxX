@@ -50,7 +50,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -249,18 +249,45 @@ pub(crate) static TRIMMED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRIMMED_AT: AtomicU64 = AtomicU64::new(0);
 static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Compact pipeline name stored while a library call is in flight so 32-byte
+/// pipeline hash keys do not allocate on the heap during normal operation.
+enum CallName {
+    Inline([u8; 32], u8),
+    Heap(String),
+}
+
+impl CallName {
+    fn new(name: &str) -> Self {
+        let bytes = name.as_bytes();
+        if bytes.len() <= 32 {
+            let mut buf = [0u8; 32];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline(buf, bytes.len() as u8)
+        } else {
+            Self::Heap(name.to_owned())
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline(buf, len) => std::str::from_utf8(&buf[..usize::from(*len)]).unwrap_or(""),
+            Self::Heap(s) => s.as_str(),
+        }
+    }
+}
+
 /// The library calls running now: thread, what (load, make, store,
-/// serialise), the pipeline, and since when (`crate::host::now_us`).
-static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new());
+/// serialise), the pipeline name and label, and since when (`crate::host::now_us`).
+static CALLS: Mutex<Vec<(u32, &'static str, CallName, Arc<str>, u64)>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
-    static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static LABEL: std::cell::RefCell<Arc<str>> = std::cell::RefCell::new(Arc::from(""));
 }
 
 /// Names the pipeline this thread makes next.
 pub(crate) fn label(text: String) {
-    LABEL.with(|l| *l.borrow_mut() = text);
+    LABEL.with(|l| *l.borrow_mut() = Arc::from(text));
 }
 
 /// A library call of this thread, listed in [`CALLS`] until dropped.
@@ -268,11 +295,11 @@ struct Call(u32, u64);
 
 fn call(what: &'static str, name: &str) -> Call {
     let (thread, since) = (crate::host::thread_id(), crate::host::now_us());
-    let label = LABEL.with(|l| l.borrow().clone());
+    let label = LABEL.with(|l| Arc::clone(&l.borrow()));
     CALLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((thread, what, format!("{name} {label}"), since));
+        .push((thread, what, CallName::new(name), label, since));
     Call(thread, since)
 }
 
@@ -281,7 +308,7 @@ impl Drop for Call {
         CALLS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|c| (c.0, c.3) != (self.0, self.1));
+            .retain(|c| (c.0, c.4) != (self.0, self.1));
     }
 }
 
@@ -301,11 +328,13 @@ pub(crate) fn removal_note() -> String {
         if calls.is_empty() {
             text.push_str("no call running");
         }
-        for (i, (thread, what, name, since)) in calls.iter().enumerate() {
+        for (i, (thread, what, name, label, since)) in calls.iter().enumerate() {
             let _ = write!(
                 text,
-                "{}{what} of {name} running for {:.1} ms on thread {thread}",
+                "{}{what} of {} {} running for {:.1} ms on thread {thread}",
                 if i == 0 { "" } else { ", " },
+                name.as_str(),
+                label,
                 now.saturating_sub(*since) as f64 / 1000.0
             );
         }
@@ -748,7 +777,14 @@ pub(crate) fn save(now: bool) {
     // With what earlier runs listed: a run that asks for no title pipeline
     // (`victory warm`) wrote an empty list over theirs, and the next world
     // began with every pipeline still to be asked for.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    ensure_used();
+    let used: Vec<String> = USED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -817,11 +853,14 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static USED: RwLock<Option<HashSet<String>>> = RwLock::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+fn ensure_used() {
+    if USED.read().unwrap_or_else(|e| e.into_inner()).is_some() {
+        return;
+    }
+    let mut used = USED.write().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
@@ -831,19 +870,33 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
     }
-    used
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    ensure_used();
+    USED.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
+    ensure_used();
+    {
+        let used = USED.read().unwrap_or_else(|e| e.into_inner());
+        if used
+            .as_ref()
+            .is_some_and(|s| s.len() >= EARLY_MAX || s.contains(key))
+        {
+            return;
+        }
+    }
+    let mut used = USED.write().unwrap_or_else(|e| e.into_inner());
     let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if set.len() < EARLY_MAX && !set.contains(key) {
+        set.insert(key.to_owned());
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -1047,5 +1100,38 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn call_name_inlines_short_keys_and_formats_in_removal_note() {
+        let short = "0123456789abcdef0123456789abcdef";
+        assert_eq!(short.len(), 32);
+        let inline = CallName::new(short);
+        assert!(matches!(inline, CallName::Inline(_, 32)));
+        assert_eq!(inline.as_str(), short);
+
+        let long = "a-pipeline-name-longer-than-thirty-two-bytes";
+        let heap = CallName::new(long);
+        assert!(matches!(heap, CallName::Heap(_)));
+        assert_eq!(heap.as_str(), long);
+
+        label("vs=1 ps=2".to_owned());
+        {
+            let _guard = call("load", short);
+            let note = removal_note();
+            assert!(note.contains(&format!("load of {short} vs=1 ps=2 running for")));
+        }
+        label(String::new());
+    }
+
+    #[test]
+    fn note_used_and_wanted_early_track_keys_idempotently() {
+        let key = "test-pipeline-library-early-key-unique";
+        assert!(!wanted_early(key));
+        note_used(key);
+        assert!(wanted_early(key));
+        // Second call hits the read-only fast path without error.
+        note_used(key);
+        assert!(wanted_early(key));
     }
 }

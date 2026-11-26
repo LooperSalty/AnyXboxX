@@ -142,7 +142,12 @@ impl Cpu {
 }
 
 /// The 3D engines' load summed over the instances (PDH, English names so any Windows language works).
-struct Gpu3d(*mut std::ffi::c_void, *mut std::ffi::c_void);
+struct Gpu3d {
+    query: *mut std::ffi::c_void,
+    counter: *mut std::ffi::c_void,
+    /// Reusable 8-byte-aligned buffer for `PdhGetFormattedCounterArrayW`.
+    buf: Vec<u64>,
+}
 impl Gpu3d {
     fn new() -> Option<Self> {
         use windows_sys::Win32::System::Performance::*;
@@ -159,23 +164,30 @@ impl Gpu3d {
             }
             PdhCollectQueryData(query);
         }
-        Some(Gpu3d(query, counter))
+        Some(Gpu3d {
+            query,
+            counter,
+            buf: Vec::new(),
+        })
     }
-    fn percent(&self) -> Option<f64> {
+    fn percent(&mut self) -> Option<f64> {
         use windows_sys::Win32::System::Performance::*;
         // SAFETY: the sizing call, then a buffer of the size it named (8-aligned).
         unsafe {
-            if PdhCollectQueryData(self.0) != 0 {
+            if PdhCollectQueryData(self.query) != 0 {
                 return None;
             }
             let (mut size, mut count) = (0u32, 0u32);
-            PdhGetFormattedCounterArrayW(self.1, PDH_FMT_DOUBLE, &mut size, &mut count, std::ptr::null_mut());
+            PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, std::ptr::null_mut());
             if size == 0 {
                 return None;
             }
-            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
-            let items = buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-            if PdhGetFormattedCounterArrayW(self.1, PDH_FMT_DOUBLE, &mut size, &mut count, items) != 0 {
+            let words = (size as usize).div_ceil(8);
+            if self.buf.len() < words {
+                self.buf.resize(words, 0);
+            }
+            let items = self.buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+            if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, items) != 0 {
                 return None;
             }
             let sum = (0..count as usize)
@@ -184,6 +196,14 @@ impl Gpu3d {
                 .map(|item| item.FmtValue.Anonymous.doubleValue)
                 .sum::<f64>();
             Some(sum.clamp(0.0, 100.0))
+        }
+    }
+}
+impl Drop for Gpu3d {
+    fn drop(&mut self) {
+        if !self.query.is_null() {
+            // SAFETY: query handle opened in `Gpu3d::new`.
+            unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(self.query) };
         }
     }
 }
@@ -208,7 +228,7 @@ fn cpu_name() -> String {
 const MB: f64 = 1024.0 * 1024.0;
 const GB: f64 = MB * 1024.0;
 
-fn sample(cpu: &mut Cpu, gpu: Option<&Gpu3d>, adapter: Option<&IDXGIAdapter3>, names: &(String, String)) -> Stats {
+fn sample(cpu: &mut Cpu, gpu: Option<&mut Gpu3d>, adapter: Option<&IDXGIAdapter3>, names: &(String, String)) -> Stats {
     // SAFETY: plain structs filled by the calls.
     let (working, used, total) = unsafe {
         let mut pm = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
@@ -273,6 +293,27 @@ const VALUE: usize = 1;
 const ROW: usize = 2;
 const SMALL: usize = 3;
 
+/// Encodes `text` as UTF-16 into a stack buffer for typical overlay strings,
+/// falling back to a heap `Vec` only beyond 128 UTF-16 code units.
+fn with_utf16<R>(text: &str, f: impl FnOnce(&[u16]) -> R) -> R {
+    let mut stack = [0u16; 128];
+    let mut len = 0usize;
+    let mut iter = text.encode_utf16();
+    while len < stack.len() {
+        match iter.next() {
+            Some(unit) => {
+                stack[len] = unit;
+                len += 1;
+            }
+            None => return f(&stack[..len]),
+        }
+    }
+    let mut heap = Vec::with_capacity(len + iter.size_hint().0);
+    heap.extend_from_slice(&stack[..len]);
+    heap.extend(iter);
+    f(&heap)
+}
+
 /// GDI as a glyph rasteriser only: each run is drawn white on black into a scratch DIB, and its
 /// grey level becomes the coverage the pure canvas blends in the run's colour.
 struct Gdi {
@@ -308,68 +349,72 @@ impl Gdi {
         Some(g)
     }
 
-    fn measure(&self, font: usize, text: &str) -> (i32, i32) {
-        let t: Vec<u16> = text.encode_utf16().collect();
+    fn measure_wide(&self, font: usize, wide: &[u16]) -> (i32, i32) {
         let mut size = SIZE { cx: 0, cy: 0 };
         // SAFETY: live DC and font, a slice and its length.
         unsafe {
             SelectObject(self.dc, self.fonts[font]);
-            GetTextExtentPoint32W(self.dc, t.as_ptr(), t.len() as i32, &mut size);
+            GetTextExtentPoint32W(self.dc, wide.as_ptr(), wide.len() as i32, &mut size);
         }
         (size.cx, size.cy)
     }
 
+    fn measure(&self, font: usize, text: &str) -> (i32, i32) {
+        with_utf16(text, |wide| self.measure_wide(font, wide))
+    }
+
     /// Draws `text` with its top-left at (x, y) in `rgb`.
     fn draw(&self, canvas: &mut Bitmap, font: usize, text: &str, x: i32, y: i32, rgb: [u8; 3]) {
-        let t: Vec<u16> = text.encode_utf16().collect();
-        let (w, h) = self.measure(font, text);
-        let (w, h) = (w + 2, h);
-        if w <= 2 || h <= 0 {
-            return;
-        }
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
-            },
-            bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
-        };
-        let mut bits = std::ptr::null_mut();
-        // SAFETY: a DIB section of w x h x 4 bytes (zeroed: black) selected for the text, read after
-        // GdiFlush, and freed here.
-        unsafe {
-            let dib = CreateDIBSection(self.dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-            if dib.is_null() || bits.is_null() {
+        with_utf16(text, |t| {
+            let (w, h) = self.measure_wide(font, t);
+            let (w, h) = (w + 2, h);
+            if w <= 2 || h <= 0 {
                 return;
             }
-            let old = SelectObject(self.dc, dib);
-            SelectObject(self.dc, self.fonts[font]);
-            SetBkMode(self.dc, TRANSPARENT as i32);
-            SetTextColor(self.dc, 0x00ff_ffff);
-            TextOutW(self.dc, 0, 0, t.as_ptr(), t.len() as i32);
-            GdiFlush();
-            let grey = std::slice::from_raw_parts(bits.cast::<u8>(), (w * h) as usize * 4);
-            for row in 0..h {
-                for col in 0..w {
-                    let (px, py) = (x + col, y + row);
-                    if px >= 0 && py >= 0 {
-                        // Green channel: grey-scale anti-aliasing leaves all three equal.
-                        canvas.over(px as usize, py as usize, rgb, u32::from(grey[((row * w + col) * 4 + 1) as usize]));
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
+            };
+            let mut bits = std::ptr::null_mut();
+            // SAFETY: a DIB section of w x h x 4 bytes (zeroed: black) selected for the text, read after
+            // GdiFlush, and freed here.
+            unsafe {
+                let dib = CreateDIBSection(self.dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+                if dib.is_null() || bits.is_null() {
+                    return;
+                }
+                let old = SelectObject(self.dc, dib);
+                SelectObject(self.dc, self.fonts[font]);
+                SetBkMode(self.dc, TRANSPARENT as i32);
+                SetTextColor(self.dc, 0x00ff_ffff);
+                TextOutW(self.dc, 0, 0, t.as_ptr(), t.len() as i32);
+                GdiFlush();
+                let grey = std::slice::from_raw_parts(bits.cast::<u8>(), (w * h) as usize * 4);
+                for row in 0..h {
+                    for col in 0..w {
+                        let (px, py) = (x + col, y + row);
+                        if px >= 0 && py >= 0 {
+                            // Green channel: grey-scale anti-aliasing leaves all three equal.
+                            canvas.over(px as usize, py as usize, rgb, u32::from(grey[((row * w + col) * 4 + 1) as usize]));
+                        }
                     }
                 }
+                SelectObject(self.dc, old);
+                DeleteObject(dib);
             }
-            SelectObject(self.dc, old);
-            DeleteObject(dib);
-        }
+        });
     }
 }
 
@@ -571,12 +616,12 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         tracing::info!(gpu = %gpu_name, "overlay on (VICTORY_OVERLAY=0 turns it off)");
         let mut cpu = Cpu(0, 0);
         cpu.percent();
-        let gpu = Gpu3d::new();
+        let mut gpu = Gpu3d::new();
         let (mut f10, mut f12) = (false, false);
         SetTimer(window, REFRESH, 500, None);
         SetTimer(window, KEYS, 40, None);
-        let refresh = |cpu: &mut Cpu| {
-            let stats = sample(cpu, gpu.as_ref(), adapter.as_ref(), &names);
+        let refresh = |cpu: &mut Cpu, gpu: &mut Option<Gpu3d>| {
+            let stats = sample(cpu, gpu.as_mut(), adapter.as_ref(), &names);
             *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
             let mut client = std::mem::zeroed::<RECT>();
             let mut origin = POINT { x: 0, y: 0 };
@@ -596,12 +641,12 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
             present(window, &bm, at);
             SetWindowPos(window, HWND_TOPMOST, at.x, at.y, bm.w as i32, bm.h as i32, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         };
-        refresh(&mut cpu);
+        refresh(&mut cpu, &mut gpu);
         let mut msg = std::mem::zeroed::<MSG>();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             if msg.message == WM_TIMER && msg.hwnd == window {
                 if msg.wParam == REFRESH {
-                    refresh(&mut cpu);
+                    refresh(&mut cpu, &mut gpu);
                 } else {
                     // Edge-triggered: acts on the press, not the hold.
                     let down = |vk| GetAsyncKeyState(vk) < 0;
@@ -609,7 +654,7 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
                     let front = ours_in_front();
                     if front && d10 && !f10 {
                         VISIBLE.fetch_xor(true, Ordering::Relaxed);
-                        refresh(&mut cpu);
+                        refresh(&mut cpu, &mut gpu);
                     }
                     if front && d12 && !f12 {
                         crate::screenshot::request();
@@ -620,6 +665,28 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_utf16_matches_encode_utf16_for_stack_and_heap_paths() {
+        let cases = [
+            String::new(),
+            "60 FPS".to_owned(),
+            "12.3 GB  \u{b7}  24.0 / 32 GB".to_owned(),
+            "x".repeat(128),
+            "x".repeat(129),
+            format!("{}🚀{}", "a".repeat(127), "b".repeat(10)),
+        ];
+        for text in &cases {
+            let expected: Vec<u16> = text.encode_utf16().collect();
+            let got = with_utf16(text, |wide| wide.to_vec());
+            assert_eq!(got, expected, "mismatch for len {}", text.len());
         }
     }
 }
