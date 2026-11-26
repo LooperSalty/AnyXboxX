@@ -53,7 +53,7 @@ def test_word_access_text_and_warp(family, width, mask, monkeypatch):
 def test_unsafe_flat_forms_are_named():
     for data, name in [(program(*flat("flat_load_dword", 1, vdst=10, offset=0x800)), b"flat_load_dword"),
                        (program(*flat("flat_load_dwordx2", 1, vdst=1)), b"flat_load_dwordx2"),
-                       (program(*global_("global_atomic_add", 1, data=4)), b"global_atomic_add")]:
+                       (program(*global_("global_atomic_sub", 1, data=4)), b"global_atomic_sub")]:
         result = rust(data)
         assert result.returncode != 0 and name in result.stderr
 

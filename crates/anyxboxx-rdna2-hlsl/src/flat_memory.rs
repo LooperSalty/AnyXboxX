@@ -9,6 +9,9 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
     let rest = name
         .strip_prefix(prefix)
         .ok_or_else(|| format!("untranslated instruction: {name}"))?;
+    if let Some(kind) = rest.strip_prefix("atomic_") {
+        return crate::flat_atomic::statements(name, family, kind, word);
+    }
     let (store, width) = if let Some(width) = rest.strip_prefix("load_") {
         (false, width)
     } else if let Some(width) = rest.strip_prefix("store_") {

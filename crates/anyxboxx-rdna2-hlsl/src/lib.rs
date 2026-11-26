@@ -2,6 +2,7 @@
 
 use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
 
+mod flat_atomic;
 mod flat_memory;
 mod lds;
 mod lds_lanes;
