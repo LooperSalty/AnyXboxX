@@ -6,6 +6,7 @@ mod scalar;
 mod scalar_binary;
 mod scalar_compare;
 mod scalar_immediate;
+mod scalar_movrel;
 mod scalar_wide;
 
 const PRELUDE: &str = concat!(
@@ -32,6 +33,17 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
                 let offset = instruction.offset;
                 let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                 if let Some(line) = scalar_immediate::statement(&name, word)? {
+                    lines.push_str("  ");
+                    lines.push_str(&line);
+                    lines.push('\n');
+                }
+            }
+            _ if instruction.family == "SOP1" && scalar_movrel::supports(&name) => {
+                let offset = instruction.offset;
+                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                let literal = (instruction.size > 1)
+                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
+                if let Some(line) = scalar_movrel::statement(&name, word, literal)? {
                     lines.push_str("  ");
                     lines.push_str(&line);
                     lines.push('\n');
