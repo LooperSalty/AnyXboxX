@@ -13,6 +13,16 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
     };
     let b = format!("v[{}]", (word >> 9) & 0xff);
     let d = (word >> 17) & 0xff;
+    if let Some((result, carry)) = match name {
+        "v_add_co_ci_u32" => Some(("x + y + k", "(r < x) || (k != 0 && r == x)")),
+        "v_sub_co_ci_u32" => Some(("x - y - k", "(x < y) || (k != 0 && x == y)")),
+        "v_subrev_co_ci_u32" => Some(("y - x - k", "(y < x) || (k != 0 && y == x)")),
+        _ => None,
+    } {
+        return Ok(format!(
+            "{{ uint x = {a}, y = {b}, k = (s[106] >> lane) & 1u, r = 0u; bool o = false; if (((s[126] >> lane) & 1u) != 0) {{ r = {result}; o = {carry}; v[{d}] = r; }} s[106] = Ballot(lane, o); }}"
+        ));
+    }
     let expression = match name {
         "v_mul_legacy_f32" => format!("MulLegacyF32({a}, {b})"),
         "v_fmac_f32" => format!("FmaF32({a}, {b}, v[{d}])"),
