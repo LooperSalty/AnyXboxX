@@ -1018,6 +1018,35 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
     eprintln!("ran on the hardware device: permutes, row masks, swizzles and lane writes as on the console");
 }
 
+#[test]
+fn guarded_swizzles_read_zero_from_inactive_lanes() {
+    let mut w = vec![
+        vop2(0x25, 1, k(1), 0), // v1 = lane + 1, always nonzero
+        vop1(0x01, 2, k(42)),
+        vop1(0x01, 3, k(42)),
+        vop2(0x1B, 4, k(1), 0),
+        vopc(0xC2, k(0), 4),
+        sop1(0x24, 12, VCC), // even lanes active
+    ];
+    w.extend(ds(0x35, 2, 1, 0, 0x801B)); // reverse each quad: read an odd lane
+    w.extend(ds(0x35, 3, 1, 0, 0x401F)); // swap 16: read another even lane
+    w.push(sop1(0x04, EXEC, 12));
+    w.extend(stores([1, 2, 3, 4]));
+    let n = native(&w);
+    let p = ir::build(&n.code, true, n.vgprs).unwrap();
+    let shader = lowered(&n, &p, &HashSet::new()).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    let want: Vec<u32> = (0..64)
+        .flat_map(|lane| {
+            let (quad, swap) = if lane & 1 == 0 { (0, (lane ^ 16) + 1) } else { (42, 42) };
+            [lane + 1, quad, swap, lane & 1]
+        })
+        .collect();
+    same_as_console(&got, &want);
+    eprintln!("ran guarded swizzles across both halves");
+}
+
 /// [`program`]'s wave OR inside a per-lane branch, in the paired form: the OR of both halves'
 /// lanes, whichever take the branch; nothing stored when none does.
 #[test]
