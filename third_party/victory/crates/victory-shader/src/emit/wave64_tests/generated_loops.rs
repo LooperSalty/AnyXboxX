@@ -1,5 +1,6 @@
 //! Run with: cargo test -p victory-shader generated_loop_sweep -- --ignored --nocapture
-//! Set WAVE64_LOOP_CASE to 0..259 to replay one dispatch.
+//! Translate a synthetic container through the public entry point and check the
+//! explicitly paired form too if it differs. Set WAVE64_LOOP_CASE to 0..259 to replay.
 
 use super::*;
 
@@ -90,39 +91,55 @@ fn generated_loop_sweep() {
         if replay.is_some_and(|case| case / 65 != group) {
             continue;
         }
-        let shader = paired(&loop_program(partner_xor));
-        let (root, pipeline) = host
-            .compute_pipeline(&shader)
-            .expect("paired loop pipeline");
-        let arg = shader
-            .user_data
-            .iter()
-            .find(|u| matches!((u.root, u.slot, u.dword), (RootType::Constants, 0, 0)))
-            .expect("s0 cutoff");
-        for cutoff in 0..=64 {
-            let case = group * 65 + cutoff;
-            if replay.is_some_and(|id| id != case) {
-                continue;
-            }
-            let mut constants = vec![0; shader.user_data_dwords() as usize];
-            constants[arg.index as usize] = cutoff as u32;
-            let output = host
-                .dispatch(
-                    &root,
-                    &pipeline,
-                    &Dispatch {
-                        roots: vec![(0, Root::Constants(constants))],
-                        views: &[View::RawUav(256)],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("case {case}: {e}"));
-            let want = expected(partner_xor as usize, cutoff);
-            assert_eq!(output[0].len(), 256);
-            for (lane, actual) in output[0].chunks_exact(4).enumerate() {
-                assert_eq!(actual, want[lane], "WAVE64_LOOP_CASE={case}, lane {lane}");
-            }
+        let native = loop_program(partner_xor);
+        let selected = translate_wave64_uav(&native.code).expect("translate wave64 loop container");
+        let explicit = paired(&native);
+        let cases = replay.map_or(group * 65..=group * 65 + 64, |id| id..=id);
+        check_cases(&host, &selected, partner_xor, cases.clone(), "selected");
+        if selected != explicit {
+            check_cases(&host, &explicit, partner_xor, cases, "paired");
+        }
+    }
+}
+
+fn check_cases(
+    host: &Host,
+    shader: &HostShader,
+    partner_xor: u32,
+    cases: std::ops::RangeInclusive<usize>,
+    form: &str,
+) {
+    let (root, pipeline) = host
+        .compute_pipeline(shader)
+        .unwrap_or_else(|e| panic!("{form} loop pipeline: {e}"));
+    let arg = shader
+        .user_data
+        .iter()
+        .find(|u| matches!((u.root, u.slot, u.dword), (RootType::Constants, 0, 0)))
+        .expect("s0 cutoff");
+    for case in cases {
+        let cutoff = case % 65;
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[arg.index as usize] = cutoff as u32;
+        let output = host
+            .dispatch(
+                &root,
+                &pipeline,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{form} WAVE64_LOOP_CASE={case}: {e}"));
+        let want = expected(partner_xor as usize, cutoff);
+        assert_eq!(output[0].len(), 256);
+        for (lane, actual) in output[0].chunks_exact(4).enumerate() {
+            assert_eq!(
+                actual, want[lane],
+                "{form} WAVE64_LOOP_CASE={case}, lane {lane}"
+            );
         }
     }
 }

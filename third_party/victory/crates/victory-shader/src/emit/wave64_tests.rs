@@ -20,6 +20,24 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 mod generated_loops;
 mod generated_swizzles;
 
+/// Run the public translator on a synthetic container with the layout of `native()`.
+fn translate_wave64_uav(code: &[u8]) -> Result<HostShader, ShaderError> {
+    let container = crate::native::tests::wave64_uav_container(code);
+    let before = lower::TEST_HOST_WAVE.replace(Some(32));
+    let selected = super::translate(&container);
+    lower::TEST_HOST_WAVE.set(before);
+    selected
+}
+
+#[test]
+fn wave64_uav_container_preserves_the_test_program_and_bindings() {
+    let program = native(&stores([0, 0, 0, 0]));
+    let bytes = crate::native::tests::wave64_uav_container(&program.code);
+    let container = crate::Container::parse(&bytes).unwrap();
+    let dxil = container.part(crate::FourCC::DXIL).unwrap();
+    assert_eq!(crate::native_programs(dxil.data).unwrap(), [program]);
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.

@@ -48,8 +48,8 @@ fn generated_swizzle_sweep() {
         words.extend(store(1, 15, 0));
         words.extend(store(2, 15, 4));
         let n = native(&words);
-        let p = ir::build(&n.code, true, n.vgprs).unwrap();
-        let shader = lowered(&n, &p, &HashSet::new()).unwrap();
+        let shader = translate_wave64_uav(&n.code)
+            .unwrap_or_else(|e| panic!("translate SWIZZLE_CASE={case}: {e}"));
         let (root, pipeline) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("case {case}: {e}"));
