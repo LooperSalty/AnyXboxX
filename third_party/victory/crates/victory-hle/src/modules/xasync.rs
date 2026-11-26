@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(windows)]
+#[path = "xasync_waiter.rs"]
+mod waiter;
+
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
 /// The task-queue provider; it is also the interface id titles ask for.
@@ -66,10 +70,12 @@ impl Mode {
 }
 
 /// A title callback and its context (addresses, so tasks can cross threads).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Task {
     context: usize,
     callback: usize,
+    #[cfg(windows)]
+    waiter: Option<Arc<waiter::Waiter>>,
 }
 
 impl Task {
@@ -77,10 +83,17 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            #[cfg(windows)]
+            waiter: None,
         }
     }
 
     fn run(self, canceled: bool) {
+        #[cfg(windows)]
+        if let Some(waiter) = self.waiter {
+            waiter.invoke(canceled);
+            return;
+        }
         // SAFETY: built from a `Callback` in `new`.
         let callback: Callback = unsafe { std::mem::transmute(self.callback) };
         callback(self.context as *mut c_void, canceled);
@@ -197,6 +210,8 @@ pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
+    #[cfg(windows)]
+    waiters: Mutex<HashMap<u64, Arc<waiter::Waiter>>>,
 }
 
 impl Queue {
@@ -205,6 +220,8 @@ impl Queue {
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
+            #[cfg(windows)]
+            waiters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -235,6 +252,15 @@ impl Queue {
             // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
             let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
             callback(context as *mut c_void, Arc::as_ptr(self), port);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Queue {
+    fn drop(&mut self) {
+        for waiter in lock(&self.waiters).values() {
+            waiter.cancel();
         }
     }
 }
@@ -382,6 +408,10 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    #[cfg(windows)]
+    for waiter in lock(&queue.waiters).drain().map(|(_, waiter)| waiter) {
+        waiter.cancel();
+    }
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
         // Dispatches waiting on this queue end: nothing more will come.
@@ -631,7 +661,7 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
         match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
+            Some(queue) if queue.submit(COMPLETION, 0, task.clone()) == S_OK => {}
             _ => task.run(true),
         }
     }
@@ -884,6 +914,29 @@ pub static OBJECT: Object = Object::new("task queue", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, PROVIDER, &OBJECT)];
 
 type This = *const Object;
+/// IUnknown and the task-queue IID identify this static interface.
+extern "system" fn m_query_interface(
+    this: This,
+    iid: *const Guid,
+    out: *mut *const Object,
+) -> HRESULT {
+    const IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+    if out.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    // SAFETY: the caller supplies a writable output pointer and a valid IID or null.
+    unsafe {
+        out.write(std::ptr::null());
+        if iid
+            .as_ref()
+            .is_some_and(|id| *id == IUNKNOWN || *id == PROVIDER)
+        {
+            out.write(this);
+            return S_OK;
+        }
+    }
+    0x8000_4002_u32 as i32 // E_NOINTERFACE
+}
 extern "system" fn m_get_status(_: This, b: *mut AsyncBlock, wait: u8) -> HRESULT {
     XAsyncGetStatus(b, wait != 0)
 }
@@ -974,6 +1027,17 @@ extern "system" fn m_submit_delayed(
 ) -> HRESULT {
     XTaskQueueSubmitDelayedCallback(q, port, delay, context, callback)
 }
+#[cfg(windows)]
+extern "system" fn m_register_waiter(
+    _: This, q: *const Queue, port: u32, handle: *mut c_void, context: *mut c_void,
+    callback: Option<Callback>, token: *mut u64,
+) -> HRESULT {
+    waiter::register(q, port, handle, context, callback, token)
+}
+#[cfg(windows)]
+extern "system" fn m_unregister_waiter(_: This, q: *const Queue, token: u64) {
+    waiter::unregister(q, token)
+}
 extern "system" fn m_terminate(
     _: This,
     q: *const Queue,
@@ -1001,9 +1065,39 @@ extern "system" fn m_get_process_queue(_: This, out: *mut *const Queue) -> bool 
 extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
     XTaskQueueSetCurrentProcessTaskQueue(q)
 }
-/// The runtime's debug check that the caller is not a time-critical thread,
-/// which every runtime call in a title makes first.
-extern "system" fn m_check_thread(_: This) {}
+/// XThreadAssertNotTimeSensitive: break only when a debugger is attached.
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xthread/functions/xthreadassertnottimesensitive
+extern "system" fn m_check_thread(_: This) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            DebugBreak, IsDebuggerPresent, OutputDebugStringW,
+        };
+        check_thread(
+            TIME_SENSITIVE.with(Cell::get),
+            || {
+                // SAFETY: this Win32 function takes no arguments.
+                unsafe { IsDebuggerPresent() != 0 }
+            },
+            || {
+                let message: Vec<u16> =
+                    "Time-sensitive thread violation\0".encode_utf16().collect();
+                // SAFETY: the message is NUL-terminated and a debugger is attached.
+                unsafe {
+                    OutputDebugStringW(message.as_ptr());
+                    DebugBreak();
+                }
+            },
+        );
+    }
+}
+
+#[cfg(any(windows, test))]
+fn check_thread(sensitive: bool, debugger: impl FnOnce() -> bool, breakpoint: impl FnOnce()) {
+    if sensitive && debugger() {
+        breakpoint();
+    }
+}
 
 // XThread: the time-sensitivity mark is per thread (the C++ runtime keeps it in a thread_local).
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
@@ -1032,8 +1126,17 @@ extern "system" fn m_is_time_sensitive(_: This) -> bool {
     TIME_SENSITIVE.with(Cell::get)
 }
 
+#[cfg(windows)]
+const REGISTER_WAITER: *const () = m_register_waiter as *const ();
+#[cfg(not(windows))]
+const REGISTER_WAITER: *const () = missing::<20> as *const ();
+#[cfg(windows)]
+const UNREGISTER_WAITER: *const () = m_unregister_waiter as *const ();
+#[cfg(not(windows))]
+const UNREGISTER_WAITER: *const () = missing::<21> as *const ();
+
 static VTABLE: Methods<31> = Methods([
-    missing::<0> as *const (),         // 0x00 QueryInterface
+    m_query_interface as *const (),    // 0x00 QueryInterface
     add_ref as *const (),              // 0x08 AddRef
     add_ref as *const (),              // 0x10 Release: the object is static
     m_get_status as *const (),         // 0x18
@@ -1053,8 +1156,8 @@ static VTABLE: Methods<31> = Methods([
     m_close as *const (),              // 0x88
     m_submit as *const (),             // 0x90
     m_submit_delayed as *const (),     // 0x98
-    missing::<20> as *const (),        // 0xa0 register a wait handle
-    missing::<21> as *const (),        // 0xa8 unregister it
+    REGISTER_WAITER,                   // 0xa0 register a wait handle
+    UNREGISTER_WAITER,                 // 0xa8 unregister it
     m_terminate as *const (),          // 0xb0
     m_register_monitor as *const (),   // 0xb8
     m_unregister_monitor as *const (), // 0xc0
@@ -1071,6 +1174,15 @@ static VTABLE: Methods<31> = Methods([
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn time_sensitive_assert_breaks_only_under_a_debugger() {
+        let breaks = Cell::new(0);
+        for (sensitive, attached) in [(false, false), (false, true), (true, false), (true, true)] {
+            check_thread(sensitive, || attached, || breaks.set(breaks.get() + 1));
+        }
+        assert_eq!(breaks.get(), 1);
+    }
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)

@@ -1,8 +1,7 @@
 """Parity of the runtime DLLs ported to Rust (crates/anyxboxx-*) with the C++ ones (runtime/).
 
-For each ported DLL, a runtime folder is assembled from the C++ build with that one DLL replaced by
-the Rust cdylib, and the pytest files that check the C++ DLL run unchanged against it
-(ANYXBOXX_RUNTIME points at the mixed folder). The C++ DLL is deleted only once this passes.
+The packaged DLL must be the Rust cdylib, and its exports must match the separately built C++
+oracle. The runtime tests also run against a folder containing the release Rust DLL.
 """
 import os
 import re
@@ -69,11 +68,45 @@ def exports(path):
     return {(s.name, s.forwarder) for s in directory.symbols} if directory else set()
 
 
+def test_runtime_ships_the_rust_xgameruntime():
+    rust = RUST_RELEASE / "xgameruntime.dll"
+    shipped = RUNTIME_DIR / "xgameruntime.dll"
+    if not rust.is_file() or not shipped.is_file():
+        if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
+            pytest.fail(f"absent: {rust} or {shipped}")
+        pytest.skip("Rust DLL or runtime not built")
+    assert rust.read_bytes() == shipped.read_bytes()
+
+
+def test_cpp_oracle_passes_shared_runtime_tests(tmp_path):
+    oracle = RUNTIME_DIR / "xgameruntime_cpp.dll"
+    if not runtime_built() or not oracle.is_file():
+        if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
+            pytest.fail(f"runtime or C++ oracle absent: {oracle}")
+        pytest.skip("runtime or C++ oracle not built")
+    folder = tmp_path / "runtime"
+    shutil.copytree(RUNTIME_DIR, folder)
+    shutil.copyfile(oracle, folder / "xgameruntime.dll")
+    env = {**os.environ, "ANYXBOXX_RUNTIME": str(folder), "ANYXBOXX_REQUIRE_RUNTIME": "1"}
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+         "-k", "not unregister_suppresses_a_queued_waiter", "tests/test_runtime_cpp.py",
+         "tests/test_runtime_package.py", "tests/test_runtime_task_waiter.py"],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    passed = re.search(r"(\d+) passed", done.stdout)
+    skipped = [line for line in done.stdout.splitlines() if line.startswith("SKIPPED")]
+    unexpected = [line for line in skipped if not any(reason in line for reason in ALLOWED_SKIPS)]
+    assert passed and int(passed.group(1)) >= 30 and not unexpected, done.stdout
+
+
 @pytest.mark.parametrize("name", sorted(PORTED))
 def test_rust_dll_exports_what_the_cpp_dll_exports(name):
     rust = RUST_RELEASE / PORTED[name][0]
-    if not rust.is_file() or not (RUNTIME_DIR / name).is_file():
+    oracle = RUNTIME_DIR / "xgameruntime_cpp.dll"
+    if not rust.is_file() or not oracle.is_file():
         if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
-            pytest.fail(f"absent: {rust} or {RUNTIME_DIR / name}")
+            pytest.fail(f"absent: {rust} or {oracle}")
         pytest.skip("Rust DLL or C++ runtime not built")
-    assert exports(rust) == exports(RUNTIME_DIR / name)
+    assert exports(rust) == exports(oracle)
