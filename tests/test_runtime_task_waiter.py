@@ -1,5 +1,6 @@
 """Task queue waiters through the public GDK interface slots."""
 import ctypes
+import threading
 
 from test_runtime_cpp import (CALLBACK, MANUAL, S_OK, TASK_QUEUE_GUID, WORK_PORT,
                               TaskQueueApi, anyxboxx_only)
@@ -91,5 +92,45 @@ def test_manual_reset_waiter_can_unregister_itself(runtime_dir):
         assert calls == [(42, False)]
         assert not dispatch(queue, WORK_PORT, 100)
     finally:
+        close(queue)
+        kernel.CloseHandle(event)
+
+
+@anyxboxx_only
+def test_unregister_suppresses_a_queued_waiter(runtime_dir):
+    """Learn: no waiter callback is invoked after its registration is removed."""
+    api = TaskQueueApi(runtime_dir)
+    ptr = ctypes.c_void_p
+    create = api.method(12, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ptr))
+    register = api.method(20, ctypes.c_uint32, ptr, ctypes.c_int, ptr, ptr, CALLBACK,
+                          ctypes.POINTER(ctypes.c_uint64))
+    unregister = api.method(21, None, ptr, ctypes.c_uint64)
+    dispatch = api.method(16, ctypes.c_bool, ptr, ctypes.c_int, ctypes.c_uint32)
+    close = api.method(17, None, ptr)
+    monitor_type = ctypes.WINFUNCTYPE(None, ptr, ptr, ctypes.c_int)
+    monitor = api.method(23, ctypes.c_uint32, ptr, ptr, monitor_type, ctypes.POINTER(ctypes.c_uint64))
+    unmonitor = api.method(24, None, ptr, ctypes.c_uint64)
+    kernel = ctypes.windll.kernel32
+    kernel.CreateEventW.argtypes = (ptr, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p)
+    kernel.CreateEventW.restype = ptr
+    kernel.SetEvent.argtypes = (ptr,)
+    kernel.CloseHandle.argtypes = (ptr,)
+    queue = ptr()
+    assert create(MANUAL, MANUAL, ctypes.byref(queue)) == S_OK
+    event = kernel.CreateEventW(None, False, False, None)
+    assert event
+    queued, calls = threading.Event(), []
+    callback = CALLBACK(lambda context, canceled: calls.append((context, canceled)))
+    monitor_callback = monitor_type(lambda context, handle, port: queued.set())
+    monitor_token, waiter_token = ctypes.c_uint64(), ctypes.c_uint64()
+    try:
+        assert monitor(queue, None, monitor_callback, ctypes.byref(monitor_token)) == S_OK
+        assert register(queue, WORK_PORT, event, 42, callback, ctypes.byref(waiter_token)) == S_OK
+        assert kernel.SetEvent(event) and queued.wait(2)
+        unregister(queue, waiter_token)
+        assert dispatch(queue, WORK_PORT, 2000)
+        assert calls == []
+    finally:
+        unmonitor(queue, monitor_token)
         close(queue)
         kernel.CloseHandle(event)
