@@ -64,7 +64,7 @@ pub struct RunArgs {
     /// Passed unchanged to VICTORY_SKIP_PIPELINES.
     #[arg(long, alias = "SkipPipelines")]
     pub skip_pipelines: Option<String>,
-    /// Do not set the tuned variables (VICTORY_GAME_DIR, VICTORY_DISCORD and VICTORY_OCEAN_READBACK stay set).
+    /// Do not set the tuned variables (VICTORY_GAME_DIR and VICTORY_DISCORD stay set).
     #[arg(long, alias = "NoTunedSettings")]
     pub no_tuned_settings: bool,
     /// Launch profile whose variables are applied unless `--no-tuned-settings` is set.
