@@ -2,6 +2,7 @@
 
 use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
 
+mod flat_memory;
 mod lds;
 mod lds_lanes;
 mod scalar;
@@ -40,6 +41,18 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
         match name.as_str() {
             "s_nop" => (),
             "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
+            _ if matches!(instruction.family, "GLOBAL" | "FLAT") => {
+                let offset = instruction.offset;
+                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
+                    return Err(format!("truncated instruction: {name}"));
+                }
+                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                for line in flat_memory::statements(&name, instruction.family, word)? {
+                    lines.push_str("  ");
+                    lines.push_str(&line);
+                    lines.push('\n');
+                }
+            }
             _ if instruction.family == "DS" => {
                 let offset = instruction.offset;
                 if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
