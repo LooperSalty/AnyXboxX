@@ -1,8 +1,5 @@
 ﻿"""XPackage identity and installed-package queries, called through the runtime vtable."""
 import ctypes
-import os
-
-import pytest
 
 from test_runtime_cpp import GdkInterface, S_OK, anyxboxx_only
 
@@ -232,7 +229,6 @@ def test_package_install_order_and_uninstall_refusals(runtime_dir):
     assert api.method(34, ctypes.c_bool, ctypes.c_char_p)(None) is False
 
 
-@pytest.mark.skipif(os.environ.get("ANYXBOXX_TEST_RUST_XGAMERUNTIME") != "1", reason="Rust refusal differs from C++")
 def test_uninstall_chunks_is_explicitly_unimplemented(runtime_dir):
     api = GdkInterface(runtime_dir, PROVIDER, IID)
     assert api.method(19, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, P)(None, 0, None) == 0x80004001

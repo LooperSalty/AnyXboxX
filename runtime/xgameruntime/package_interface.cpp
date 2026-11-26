@@ -131,7 +131,10 @@ HRESULT XPackageFindChunkAvailability(const char*, uint32_t, void*, XPackageChun
 
 HRESULT XPackageEnumerateChunkAvailability(const char*, uint32_t, void*, void*) noexcept { return S_OK; }
 HRESULT XPackageChangeChunkInstallOrder(const char*, uint32_t, void*) noexcept { return S_OK; }
-HRESULT XPackageUninstallChunks(const char*, uint32_t, void*) noexcept { return S_OK; }
+HRESULT XPackageUninstallChunks(const char*, uint32_t, void*) noexcept {
+  ANYXBOXX_TRACE("[runtime] XPackageUninstallChunks: not implemented");
+  return E_NOTIMPL;
+}
 
 HRESULT XPackageEstimateDownloadSize(const char*, uint32_t, void*, uint64_t* size, bool* confirm) noexcept {
   if (size != nullptr) *size = 0;
