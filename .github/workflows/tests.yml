@@ -1,7 +1,9 @@
 name: tests
 on:
   push:
-    branches: [main]
+    # rust/full aussi : sans passage sur la branche elle-même, son cache Rust n'était jamais écrit
+    # et chaque PR vers rust/full recompilait tout l'espace Cargo (plus de 16 min).
+    branches: [main, rust/full]
   pull_request:
     branches: [main, rust/full]
   workflow_dispatch:
@@ -52,7 +54,7 @@ jobs:
   pytest:
     # Garder « pytest » : c'est le nom du check exigé par la protection de main.
     name: pytest
-    needs: lint
+    # Pas de « needs: lint » : les trois jobs démarrent ensemble ; lint reste exigé.
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -79,7 +81,7 @@ jobs:
             . -> target
             third_party/tombox -> target
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/rust/full' }}
       # Espace Cargo racine (crates/, docs/architecture-rust.md), passerelle vers TomBox comprise :
       # ses tests Rust, et les binaires que les tests de parité avec Python lancent.
       - name: Rust (espace racine, crates/)
@@ -112,5 +114,6 @@ jobs:
         if: steps.tombox-dlls.outputs.cache-hit != 'true'
         run: python tools/build_tombox.py
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      # pytest-xdist, un processus par cœur (mesuré sur main : 61 s en série, 15 s avec -n 4).
       - name: pytest (suite complète, nombre de tests comparé aux README)
-        run: python -m pytest
+        run: python -m pytest -n auto
