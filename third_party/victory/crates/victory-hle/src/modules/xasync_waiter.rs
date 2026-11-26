@@ -298,6 +298,44 @@ mod tests {
     }
 
     #[test]
+    fn unregister_suppresses_an_already_queued_callback() {
+        let mut handle = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut handle), S_OK);
+        let watched = event(false).unwrap();
+        let calls = AtomicU32::new(0);
+        let mut token = 0;
+        assert_eq!(
+            register(
+                handle,
+                WORK,
+                raw(&watched),
+                (&raw const calls).cast_mut().cast(),
+                Some(count),
+                &mut token,
+            ),
+            S_OK
+        );
+        // SAFETY: the test owns the event until the registration is canceled.
+        assert_ne!(unsafe { SetEvent(raw(&watched)) }, 0);
+        let queue = queue(handle).unwrap();
+        let port = &queue.ports[WORK as usize];
+        let (tasks, _) = port
+            .ready
+            .wait_timeout_while(lock(&port.tasks), Duration::from_secs(2), |tasks| {
+                tasks.is_empty()
+            })
+            .unwrap();
+        assert!(!tasks.is_empty(), "waiter callback was not queued");
+        drop(tasks);
+
+        unregister(handle, token);
+        assert!(XTaskQueueDispatch(handle, WORK, 0));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(queue);
+        XTaskQueueCloseHandle(handle);
+    }
+
+    #[test]
     fn terminate_cancels_a_waiter_before_dispatch() {
         let mut queue = std::ptr::null();
         assert_eq!(XTaskQueueCreate(0, 0, &mut queue), S_OK);
