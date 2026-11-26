@@ -106,7 +106,7 @@ TLS carrier finding: as a `no_std` cdylib, its TLS block holds exactly the carri
 - `runtime/gpu_runner`: retained as the `anyxboxx_gpu_run_cpp.exe` parity oracle; the GPU runner itself is `crates/anyxboxx-gpu-run` (`anyxboxx_gpu_run.exe`).
 - `runtime/third_party/libhttpclient-task`: goes with xgameruntime.
 
-**HLSL port in progress:** `crates/anyxboxx-rdna2-hlsl` translates straight-line wave32 programs for selected scalar, VOP1 and VOP2 operations (including VOP1 indexed moves and VOP2 f16 arithmetic), and VOPC integer (16/32-bit) and floating-point (f16/f32) comparisons. As in the Python emitter, dynamically out-of-range indexed moves return zero or do not write, whereas the interpreter rejects them. Parity tests compare HLSL text with Python and instrument state for WARP comparison with the interpreter. Control flow, wave64, other vector forms, memory and graphics remain to be ported; unsupported instructions are rejected by name.
+**HLSL port in progress:** `crates/anyxboxx-rdna2-hlsl` translates straight-line wave32 programs for selected scalar, VOP1 and VOP2 operations (including VOP1 indexed moves and VOP2 f16 arithmetic), and VOPC integer (16/32-bit) and floating-point (f16/f32) comparisons. As in the Python emitter, dynamically out-of-range indexed moves return zero or do not write, whereas the interpreter rejects them. Parity tests compare HLSL text with Python and instrument state for WARP comparison with the interpreter. Control flow, wave64, other vector forms, memory and graphics remain to be ported; unsupported instructions are rejected by name. The Rust port also covers VOP3 lane operations and the six integer VOP3P dot products; unsupported modifiers are rejected by name.
 
 **Still Python:**
 
