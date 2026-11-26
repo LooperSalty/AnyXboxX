@@ -242,23 +242,60 @@ pub(crate) fn land(back: &Back) {
     }
 }
 
-fn land_tiled(back: &Back, data: &[u8]) -> bool {
-    let mut tiled = vec![0u8; back.size];
-    #[cfg(test)]
-    tests::note_scratch(back.size);
-    // Bytes of title memory the subresources do not cover stay as they are.
-    crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-        let pitch = footprint.Footprint.RowPitch as usize;
-        // The last row's padding may be outside the mapped byte length.
-        let linear = &data[footprint.Offset as usize..];
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            return false;
+/// Maximum retained capacity of the per-thread scratch buffer used by
+/// [`land_tiled`]; larger readbacks drop their buffer on exit.
+const TILED_SCRATCH_CAP: usize = 4 << 20;
+
+thread_local! {
+    static TILED_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_tiled_scratch<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    struct Guard(Option<Vec<u8>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(buf) = self.0.take()
+                && buf.capacity() <= TILED_SCRATCH_CAP
+            {
+                let _ = TILED_SCRATCH.try_with(|cell| {
+                    if let Ok(mut slot) = cell.try_borrow_mut() {
+                        *slot = buf;
+                    }
+                });
+            }
         }
     }
-    crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
-    true
+    let mut buf = TILED_SCRATCH
+        .try_with(|cell| cell.try_borrow_mut().ok().map(|mut s| std::mem::take(&mut *s)))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if buf.len() < size {
+        buf.resize(size, 0);
+    }
+    let mut guard = Guard(Some(buf));
+    let slice = &mut guard.0.as_mut().unwrap()[..size];
+    f(slice)
+}
+
+fn land_tiled(back: &Back, data: &[u8]) -> bool {
+    #[cfg(test)]
+    tests::note_scratch(back.size);
+    with_tiled_scratch(back.size, |tiled| {
+        // Bytes of title memory the subresources do not cover stay as they are.
+        crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+        for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+            let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+            let pitch = footprint.Footprint.RowPitch as usize;
+            // The last row's padding may be outside the mapped byte length.
+            let linear = &data[footprint.Offset as usize..];
+            if let Err(e) = back.layout.tile(tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+                return false;
+            }
+        }
+        crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+        true
+    })
 }
