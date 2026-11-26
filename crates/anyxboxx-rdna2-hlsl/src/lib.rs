@@ -8,6 +8,7 @@ mod scalar_compare;
 mod scalar_immediate;
 mod scalar_movrel;
 mod scalar_wide;
+mod vector_binary;
 mod vector_unary;
 
 const PRELUDE: &str = concat!(
@@ -31,6 +32,16 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
         match name.as_str() {
             "s_nop" => (),
             "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
+            _ if instruction.family == "VOP2" => {
+                let offset = instruction.offset;
+                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                let literal = (instruction.size > 1)
+                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
+                let line = vector_binary::statement(&name, word, literal)?;
+                lines.push_str("  ");
+                lines.push_str(&line);
+                lines.push('\n');
+            }
             _ if instruction.family == "VOP1" => {
                 let offset = instruction.offset;
                 let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
