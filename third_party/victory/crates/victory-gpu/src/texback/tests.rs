@@ -242,3 +242,20 @@ fn linear_readback_preserves_row_padding() {
     land(&back);
     image.check(7);
 }
+
+#[test]
+fn padded_linear_readback_reuses_capped_cpu_scratch() {
+    let first = with_tiled_scratch(8192, |buf| {
+        buf.fill(0x33);
+        buf.as_ptr() as usize
+    });
+    let second = with_tiled_scratch(4096, |buf| buf.as_ptr() as usize);
+    assert_eq!(first, second, "small tiled readbacks reuse thread-local scratch");
+
+    with_tiled_scratch(TILED_SCRATCH_CAP + 4096, |huge| {
+        huge[0] = 1;
+        huge[TILED_SCRATCH_CAP] = 2;
+    });
+    let cap = TILED_SCRATCH.with(|cell| cell.borrow().capacity());
+    assert!(cap <= TILED_SCRATCH_CAP);
+}
