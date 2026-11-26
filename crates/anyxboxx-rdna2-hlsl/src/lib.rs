@@ -3,6 +3,7 @@
 use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
 
 mod lds;
+mod lds_lanes;
 mod scalar;
 mod scalar_atomic;
 mod scalar_binary;

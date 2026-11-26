@@ -1,6 +1,12 @@
 //! LDS full-word reads and writes for straight-line wave32 programs.
 
 pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
+    if matches!(
+        name,
+        "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32"
+    ) {
+        return Ok(vec![crate::lds_lanes::statement(name, word)?]);
+    }
     if let Some((function, returns)) = atomic(name) {
         let addr = (word >> 32) & 0xff;
         let data = (word >> 40) & 0xff;
