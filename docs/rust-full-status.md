@@ -98,6 +98,8 @@ TLS carrier finding: as a `no_std` cdylib, its TLS block holds exactly the carri
 - `runtime/gpu_runner`: phase 4.
 - `runtime/third_party/libhttpclient-task`: goes with xgameruntime.
 
+**HLSL port in progress:** `crates/anyxboxx-rdna2-hlsl` translates straight-line wave32 programs for selected SOP1/SOP2 32-bit operations, scalar compares, immediate operations and the 64-bit scalar operations supported by `rdna2_hlsl_scalar64.py`. The parity tests compare HLSL text with Python and instrument scalar state for WARP comparison with the interpreter. Control flow, wave64, vector, memory and graphics translation remain to be ported; unsupported instructions are rejected by name.
+
 **Still Python:**
 
 - The Unicorn sandbox and its HLE handlers (dropped in the end state, D2).

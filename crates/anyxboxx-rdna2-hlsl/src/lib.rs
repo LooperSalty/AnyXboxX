@@ -6,6 +6,7 @@ mod scalar;
 mod scalar_binary;
 mod scalar_compare;
 mod scalar_immediate;
+mod scalar_wide;
 
 const PRELUDE: &str = concat!(
     include_str!("prelude0.hlsl"),
@@ -42,7 +43,9 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
                 let literal = (instruction.size > 1)
                     .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
                 lines.push_str("  ");
-                let statement = if instruction.family == "SOP1" {
+                let statement = if scalar_wide::supports(&name, instruction.family) {
+                    scalar_wide::statement(&name, instruction.family, word)?
+                } else if instruction.family == "SOP1" {
                     scalar::statement(&name, word, literal)?
                 } else if instruction.family == "SOP2" {
                     scalar_binary::statement(&name, word, literal)?
@@ -65,8 +68,8 @@ mod tests {
 
     #[test]
     fn rejects_untranslated_instruction_by_name() {
-        let data = 0xbe80_0480u32.to_le_bytes();
-        assert!(translate(&data).unwrap_err().contains("s_mov_b64"));
+        let data = 0xbe80_0c80u32.to_le_bytes();
+        assert!(translate(&data).unwrap_err().contains("s_brev_b64"));
     }
 
     #[test]

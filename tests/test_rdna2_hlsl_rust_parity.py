@@ -28,9 +28,9 @@ def test_text_matches_python(data):
 
 
 def test_untranslated_is_named():
-    result = rust(program(sop1("s_mov_b64", 0, const(1))))
+    result = rust(program(sop1("s_brev_b64", 0, const(1))))
     assert result.returncode != 0
-    assert b"s_mov_b64" in result.stderr
+    assert b"s_brev_b64" in result.stderr
 
 
 def test_warp_matches_interpreter(monkeypatch):
@@ -165,8 +165,8 @@ def test_sop2_32_text_and_warp(name, x, y, monkeypatch):
 
 
 def test_sop2_64_bit_remains_named():
-    result = rust(program(sop2("s_and_b64", 0, 2, 4)))
-    assert result.returncode != 0 and b"s_and_b64" in result.stderr
+    result = rust(program(sop2("s_lshl_b64", 0, 2, 4)))
+    assert result.returncode != 0 and b"s_lshl_b64" in result.stderr
 
 
 @pytest.mark.parametrize("name", ["s_addc_u32", "s_subb_u32", "s_cselect_b32", "s_lshl1_add_u32"])

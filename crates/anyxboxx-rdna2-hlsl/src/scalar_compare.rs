@@ -2,7 +2,7 @@
 use crate::scalar::source;
 use anyxboxx_rdna2_ref::scalar::fields;
 
-fn high(code: u32) -> Result<String, String> {
+pub(crate) fn high(code: u32) -> Result<String, String> {
     match code {
         125 | 128..=192 => Ok("0u".into()),
         0..=127 => Ok(format!("s[{}]", code + 1)),

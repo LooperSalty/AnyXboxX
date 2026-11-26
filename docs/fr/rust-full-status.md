@@ -96,6 +96,8 @@ Constat sur la porteuse TLS : en cdylib `no_std`, son bloc TLS contient exacteme
 - `runtime/gpu_runner` : phase 4.
 - `runtime/third_party/libhttpclient-task` : part avec xgameruntime.
 
+**Port HLSL en cours :** `crates/anyxboxx-rdna2-hlsl` traduit les programmes wave32 sans branchement pour certaines op?rations SOP1/SOP2 32 bits, les comparaisons scalaires, les op?rations ? imm?diat et les op?rations scalaires 64 bits prises en charge par `rdna2_hlsl_scalar64.py`. Les tests de parit? comparent le texte HLSL avec Python et exposent l??tat scalaire pour le comparer ? l?interpr?teur sous WARP. Le contr?le de flux, wave64, les instructions vectorielles, m?moire et graphiques restent ? porter ; les instructions non prises en charge sont refus?es en les nommant.
+
 **Encore en Python :**
 
 - Le bac à sable Unicorn et ses fonctions HLE (abandonnés dans l'état final, D2).
