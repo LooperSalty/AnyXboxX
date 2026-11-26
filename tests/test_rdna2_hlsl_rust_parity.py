@@ -142,6 +142,7 @@ SOP2_32 = (
     "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_bfe_u32",
     "s_bfe_i32", "s_absdiff_i32", "s_mul_hi_u32", "s_mul_hi_i32",
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
+    "s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16",
 )
 
 

@@ -18,7 +18,8 @@ pub fn statement(name: &str, word: u32) -> Result<Option<String>, String> {
             "{{ uint x = {d}, y = {k}; uint r = x + y; scc = ((~(x ^ y) & (x ^ r)) >> 31) != 0; {d} = r; }}"
         ),
         "s_mulk_i32" => format!("{d} = {d} * {k};"),
-        "s_waitcnt_vscnt" | "s_waitcnt_vmcnt" | "s_waitcnt_expcnt" | "s_waitcnt_lgkmcnt" => {
+        "s_version" | "s_waitcnt_vscnt" | "s_waitcnt_vmcnt" | "s_waitcnt_expcnt"
+        | "s_waitcnt_lgkmcnt" => {
             return Ok(None);
         }
         _ => {

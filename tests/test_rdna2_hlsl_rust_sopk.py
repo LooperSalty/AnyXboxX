@@ -11,7 +11,7 @@ from test_rdna2_hlsl_rust_parity import rust
 CMP = tuple(f"s_cmpk_{op}_{kind}" for op in ("eq", "lg", "gt", "ge", "lt", "le")
             for kind in ("i32", "u32"))
 OPS = ("s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", *CMP)
-WAITS = ("s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt")
+WAITS = ("s_version", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt")
 
 
 @pytest.mark.parametrize("name", OPS + WAITS)
