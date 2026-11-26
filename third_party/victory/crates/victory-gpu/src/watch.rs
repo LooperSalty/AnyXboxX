@@ -2018,17 +2018,11 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let kind = r.ExceptionInformation[0];
-        let at = r.ExceptionInformation[1];
-        if (kind == READ || kind == WRITE) && crate::shadow::lazy_on_fault(at, kind == WRITE) {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if kind != WRITE {
+        if kind != READ && kind != WRITE {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
+        let is_write = kind == WRITE;
+        let at = r.ExceptionInformation[1];
         // (Neptune) `VICTORY_GUARD_OPEN_AHEAD=<blocks>` (1): the guarded blocks that follow
         // the one written are opened with it, so that a run of writes through a buffer is
         // one fault and not one for every 64 KiB (each of them takes this lock, and the
@@ -2037,20 +2031,50 @@ fn install() {
         let ahead = *AHEAD.get_or_init(|| {
             std::env::var("VICTORY_GUARD_OPEN_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 64)
         });
-        let block = at / BLOCK * BLOCK;
-        if open(&mut g, at, at + 1) {
-            if ahead > 1 {
-                open(&mut g, block + BLOCK, block + ahead * BLOCK);
+        const MAX_EPOCH_RETRIES: u32 = 32;
+        let mut epoch_retries = 0u32;
+        loop {
+            let epoch_before = crate::shadow::lazy_table_epoch();
+            if crate::shadow::lazy_on_fault(at, is_write) {
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
-            count(0, 1);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            if !is_write {
+                if epoch_retries < MAX_EPOCH_RETRIES
+                    && crate::shadow::lazy_table_epoch() != epoch_before
+                    && committed_protect(at).is_some()
+                {
+                    epoch_retries += 1;
+                    continue;
+                }
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            {
+                // Held across both checks: another thread may have opened the block
+                // since this one faulted, and a copy may have guarded it again since
+                // (then it is ours again, not read-only for some other reason).
+                let mut g = guards();
+                let block = at / BLOCK * BLOCK;
+                if open(&mut g, at, at + 1) {
+                    if ahead > 1 {
+                        open(&mut g, block + BLOCK, block + ahead * BLOCK);
+                    }
+                    count(0, 1);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if writable(at) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            if epoch_retries < MAX_EPOCH_RETRIES
+                && crate::shadow::lazy_table_epoch() != epoch_before
+                && committed_protect(at).is_some()
+            {
+                epoch_retries += 1;
+                continue;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2232,16 +2256,24 @@ pub(crate) fn transition_clean_guards_run_to_noaccess(run_first: usize, run_last
     out
 }
 
-/// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+/// Protection flags if `at` is currently committed memory, else `None`.
+fn committed_protect(at: usize) -> Option<u32> {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    (n != 0 && info.State == MEM_COMMIT).then_some(info.Protect)
+}
+
+/// Whether `at` is committed read-write memory now.
+fn writable(at: usize) -> bool {
+    matches!(
+        committed_protect(at),
+        Some(windows_sys::Win32::System::Memory::PAGE_READWRITE)
+    )
 }
 
 #[cfg(test)]

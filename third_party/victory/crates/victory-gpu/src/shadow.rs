@@ -17,13 +17,15 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 const LAZY_EAGER: u8 = 0;
 const LAZY_DEFERRED: u8 = 1;
 const LAZY_FLUSHING: u8 = 2;
 const LAZY_RESYNC: u8 = 3;
+const LAZY_HOT: u8 = 4;
+const LAZY_INELIGIBLE: u8 = 5;
 
 fn is_lazy_held(state: u8) -> bool {
     state == LAZY_DEFERRED || state == LAZY_FLUSHING
@@ -391,6 +393,13 @@ pub(crate) struct Shadow {
     /// Per-64 KiB page state for opt-in lazy GPU-resident write-back
     /// (`VICTORY_LAZY_COPYBACK=1`). Zero overhead when unused.
     lazy_state: Vec<AtomicU8>,
+    /// Per 64 KiB page consecutive flush strikes within the hot-page window.
+    lazy_strikes: Vec<AtomicU8>,
+    /// Last frame at which each 64 KiB page was flushed/released.
+    lazy_last_flush_frame: Vec<AtomicU32>,
+    /// Frame until which a hot or transient-ineligible page stays skipped
+    /// (`u32::MAX` denotes permanently ineligible).
+    lazy_cool_until: Vec<AtomicU32>,
     /// Number of pages currently in `LAZY_DEFERRED` or `LAZY_FLUSHING`.
     deferred_count: AtomicUsize,
     /// Number of pages currently in `LAZY_RESYNC` (flushed to title memory on
@@ -3859,6 +3868,9 @@ impl Shadow {
             rebar: false,
             place: None,
             lazy_state: (0..pages).map(|_| AtomicU8::new(LAZY_EAGER)).collect(),
+            lazy_strikes: (0..pages).map(|_| AtomicU8::new(0)).collect(),
+            lazy_last_flush_frame: (0..pages).map(|_| AtomicU32::new(0)).collect(),
+            lazy_cool_until: (0..pages).map(|_| AtomicU32::new(0)).collect(),
             deferred_count: AtomicUsize::new(0),
             resync_count: AtomicUsize::new(0),
             last_write_fence: AtomicU64::new(0),
@@ -6457,6 +6469,69 @@ pub(crate) fn lazy_copyback() -> bool {
 static LAZY_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(test)]
+static LAZY_TEST_FRAME: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+struct LazyFrameGuard {
+    prev: u32,
+}
+
+#[cfg(test)]
+impl LazyFrameGuard {
+    fn set(frame: u32) -> Self {
+        let prev = LAZY_TEST_FRAME.swap(frame, Ordering::AcqRel);
+        Self { prev }
+    }
+
+    fn update(frame: u32) {
+        LAZY_TEST_FRAME.store(frame, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for LazyFrameGuard {
+    fn drop(&mut self) {
+        LAZY_TEST_FRAME.store(self.prev, Ordering::Release);
+    }
+}
+
+fn lazy_current_frame() -> u32 {
+    #[cfg(test)]
+    {
+        let f = LAZY_TEST_FRAME.load(Ordering::Acquire);
+        if f > 0 {
+            return f;
+        }
+        if LAZY_TEST_OVERRIDE.load(Ordering::Acquire) != 0 {
+            return 0;
+        }
+    }
+    let f = crate::frame::current();
+    if f == 0 {
+        0
+    } else {
+        f.min((u32::MAX - 1) as u64) as u32
+    }
+}
+
+fn lazy_hot_params() -> (u8, u32) {
+    static PARAMS: OnceLock<(u8, u32)> = OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        let strikes = std::env::var("VICTORY_LAZY_HOT_STRIKES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let window = std::env::var("VICTORY_LAZY_HOT_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(60)
+            .max(1);
+        (strikes, window)
+    })
+}
+
+#[cfg(test)]
 type PostTransitionHook = Box<dyn FnOnce(usize) + Send>;
 
 #[cfg(test)]
@@ -6882,6 +6957,15 @@ pub(crate) fn is_lazy_mapped_view_page(page: usize) -> bool {
     part.0[word].load(Ordering::Acquire) & bit != 0
 }
 
+/// Monotonic mutation counter incremented under `LAZY_TABLE` on every insert,
+/// transition, or removal in `LAZY_TABLE.pages`.
+static LAZY_TABLE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn lazy_table_epoch() -> u64 {
+    LAZY_TABLE_EPOCH.load(Ordering::Acquire)
+}
+
 fn lazy_table_insert_busy(table: &mut LazyTable, page: usize, shadow_id: u64, wait: Arc<FlushWait>) {
     let prev = table.pages.insert(page, LazyEntry::Busy { shadow_id, wait });
     match prev {
@@ -6897,6 +6981,7 @@ fn lazy_table_insert_busy(table: &mut LazyTable, page: usize, shadow_id: u64, wa
         }
         Some(_) => {}
     }
+    LAZY_TABLE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 fn lazy_table_insert_armed(table: &mut LazyTable, page: usize, armed: ArmedPage) {
@@ -6911,6 +6996,7 @@ fn lazy_table_insert_armed(table: &mut LazyTable, page: usize, armed: ArmedPage)
     } else if matches!(prev, Some(LazyEntry::Armed(a)) if a.is_mapped_view) {
         lazy_mapped_view_set(page, false);
     }
+    LAZY_TABLE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 fn lazy_table_remove_page(table: &mut LazyTable, page: usize) -> Option<LazyEntry> {
@@ -6921,6 +7007,7 @@ fn lazy_table_remove_page(table: &mut LazyTable, page: usize) -> Option<LazyEntr
         }
         LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].fetch_sub(1, Ordering::Release);
         LAZY_ARMED_COUNT.fetch_sub(1, Ordering::AcqRel);
+        LAZY_TABLE_EPOCH.fetch_add(1, Ordering::AcqRel);
     }
     prev
 }
@@ -7340,36 +7427,48 @@ fn ensure_lazy_readback() -> bool {
     ok
 }
 
-/// Whether `addr` is currently committed and accessible for a `READ` or `WRITE`.
-/// Used in `lazy_on_fault` only after `LAZY_FLUSH_TOTAL > 0` to distinguish a
-/// benign concurrent stale fault (already flushed by another thread) from a
-/// genuine access violation or a `watch.rs` `PAGE_READONLY` write guard.
-fn is_accessible(addr: usize, is_write: bool) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageAccess {
+    Accessible,
+    NoAccess,
+    Other,
+}
+
+/// Queries the current commit/protection state of `addr` for `READ` vs `WRITE`.
+fn query_page_access(addr: usize, is_write: bool) -> PageAccess {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-        PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
     };
     // SAFETY: plain struct filled by `VirtualQuery`.
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid out pointer.
     let n = unsafe { VirtualQuery(addr as *const _, &mut mbi, size_of_val(&mbi)) };
     if n == 0 || mbi.State != MEM_COMMIT {
-        return false;
+        return PageAccess::Other;
     }
-    if is_write {
+    if mbi.Protect == PAGE_NOACCESS {
+        return PageAccess::NoAccess;
+    }
+    let accessible = if is_write {
         matches!(mbi.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
     } else {
         matches!(
             mbi.Protect,
             PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ
         )
+    };
+    if accessible {
+        PageAccess::Accessible
+    } else {
+        PageAccess::Other
     }
 }
 
-/// Coalesced `VirtualProtect(..., PAGE_READWRITE)` over a contiguous run of
-/// committed `PAGE_NOACCESS` pages `[run_first, run_last)`. Binary-splits on
-/// VAD/uncommitted boundaries so raw `VirtualFree(MEM_DECOMMIT)` never crashes
-/// and a single view/allocation still takes ONE `VirtualProtect` syscall.
+/// Coalesced `VirtualProtect(..., PAGE_READWRITE)` over a uniform contiguous run
+/// of committed `PAGE_NOACCESS` pages `[run_first, run_last)`. Binary-splits on
+/// VAD/uncommitted boundaries; any single page with split 4 KiB protections is
+/// left `false` in `restored` so callers invoke [`unprotect_and_write_page`].
 fn restore_rw_run(run_first: usize, run_last: usize, restored: &mut [bool], base_first: usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect,
@@ -7410,15 +7509,159 @@ fn restore_rw_run(run_first: usize, run_last: usize, restored: &mut [bool], base
     restore_rw_run(mid, run_last, restored, base_first);
 }
 
-/// Restores `PAGE_READWRITE` on `[page_addr, page_addr + PAGE)` only if it is
-/// still a single committed `PAGE_NOACCESS` region (defending against raw
-/// unnotified `VirtualFree` + `VirtualAlloc` reuse), and writes `data` into it.
+/// Copies `[sub_lo, sub_hi)` ranges inside `[0, PAGE)` outside `[excl_lo, excl_hi)`
+/// from `src` to `dst_base`.
 ///
-/// For section-backed `MEM_MAPPED` pages (`section_view = Some((section, off, sec_bytes))`,
-/// used by physical console GPU heaps), writes all 64 KiB through our persistent
-/// writable `inplace::OWN` alias + `Release` fence WHILE `page_addr` is STILL
-/// `PAGE_NOACCESS`, then flips `page_addr` to `PAGE_READWRITE` in one atomic
-/// PTE transition (zero torn-read window, zero per-page `MapViewOfFile`/`UnmapViewOfFile`).
+/// # Safety
+/// `dst_base + sub_lo .. dst_base + sub_hi` must be committed and writable and `src.len() == PAGE`.
+unsafe fn copy_subregion_bytes(
+    dst_base: *mut u8,
+    src: &[u8],
+    sub_lo: usize,
+    sub_hi: usize,
+    excl_lo: usize,
+    excl_hi: usize,
+) {
+    debug_assert_eq!(src.len(), PAGE);
+    if excl_lo >= sub_hi || excl_hi <= sub_lo {
+        // SAFETY: caller guarantees `[sub_lo, sub_hi)` is writable.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(sub_lo), dst_base.add(sub_lo), sub_hi - sub_lo);
+        }
+        return;
+    }
+    if sub_lo < excl_lo {
+        // SAFETY: `[sub_lo, excl_lo)` lies inside `[sub_lo, sub_hi)`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(sub_lo), dst_base.add(sub_lo), excl_lo - sub_lo);
+        }
+    }
+    if excl_hi < sub_hi {
+        // SAFETY: `[excl_hi, sub_hi)` lies inside `[sub_lo, sub_hi)`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(excl_hi), dst_base.add(excl_hi), sub_hi - excl_hi);
+        }
+    }
+}
+
+fn write_section_subregion(
+    section_view: (usize, u64, u64),
+    bytes: &[u8],
+    sub_lo: usize,
+    sub_hi: usize,
+    excl_lo: usize,
+    excl_hi: usize,
+) -> bool {
+    let (section, off, sec_bytes) = section_view;
+    if excl_lo >= sub_hi || excl_hi <= sub_lo {
+        return crate::inplace::write_section_own(
+            section,
+            sec_bytes,
+            off + sub_lo as u64,
+            &bytes[sub_lo..sub_hi],
+        );
+    }
+    let mut ok = true;
+    if sub_lo < excl_lo {
+        ok &= crate::inplace::write_section_own(
+            section,
+            sec_bytes,
+            off + sub_lo as u64,
+            &bytes[sub_lo..excl_lo],
+        );
+    }
+    if ok && excl_hi < sub_hi {
+        ok &= crate::inplace::write_section_own(
+            section,
+            sec_bytes,
+            off + excl_hi as u64,
+            &bytes[excl_hi..sub_hi],
+        );
+    }
+    ok
+}
+
+/// Fallback when OS protections within `[page_addr, page_addr + PAGE)` are split
+/// into smaller VAD sub-regions: restores `PAGE_READWRITE` on every committed
+/// `PAGE_NOACCESS` sub-region and writes allowed bytes outside `[excl_lo, excl_hi)`.
+fn unprotect_split_subregions(
+    page_addr: usize,
+    data: Option<&[u8]>,
+    excl_lo: usize,
+    excl_hi: usize,
+    section_view: Option<(usize, u64, u64)>,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
+    let page_end = page_addr.saturating_add(PAGE);
+    let mut cursor = page_addr;
+    let mut any_unprotected = false;
+    let mut wrote_any = false;
+    while cursor < page_end {
+        // SAFETY: plain struct filled by `VirtualQuery`.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        let n = unsafe { VirtualQuery(cursor as *const _, &mut mbi, size_of_val(&mbi)) };
+        if n == 0 {
+            break;
+        }
+        let sub_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize).min(page_end);
+        if sub_end <= cursor {
+            cursor = cursor.saturating_add(4096);
+            continue;
+        }
+        if mbi.State == MEM_COMMIT && mbi.Protect == PAGE_NOACCESS {
+            let sub_lo = cursor - page_addr;
+            let sub_hi = sub_end - page_addr;
+            let prewritten = if let (Some(bytes), Some(sv)) = (data, section_view)
+                && mbi.Type == MEM_MAPPED
+            {
+                let own = write_section_subregion(
+                    sv,
+                    bytes,
+                    sub_lo,
+                    sub_hi,
+                    excl_lo,
+                    excl_hi,
+                );
+                if own {
+                    std::sync::atomic::fence(Ordering::Release);
+                    wrote_any = true;
+                }
+                own
+            } else {
+                false
+            };
+            let mut old = 0u32;
+            let t0 = std::time::Instant::now();
+            // SAFETY: verified committed `PAGE_NOACCESS` sub-region within `[page_addr, page_end)`.
+            let ok = unsafe { VirtualProtect(cursor as *const _, sub_end - cursor, PAGE_READWRITE, &mut old) != 0 };
+            lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+            if ok {
+                any_unprotected = true;
+                if let Some(bytes) = data
+                    && !prewritten
+                {
+                    // SAFETY: `[cursor, sub_end)` is now committed `PAGE_READWRITE`.
+                    unsafe { copy_subregion_bytes(page_addr as *mut u8, bytes, sub_lo, sub_hi, excl_lo, excl_hi) };
+                    wrote_any = true;
+                }
+            }
+        }
+        cursor = sub_end;
+    }
+    if wrote_any {
+        std::sync::atomic::fence(Ordering::Release);
+    }
+    any_unprotected
+}
+
+/// Restores `PAGE_READWRITE` on `[page_addr, page_addr + PAGE)` only if it is
+/// still committed `PAGE_NOACCESS` (handling both uniform 64 KiB regions and
+/// split 4 KiB VAD sub-regions while defending against unnotified decommits),
+/// and writes `data` into every unprotected sub-region.
 fn unprotect_and_write_page(
     page_addr: usize,
     data: Option<&[u8]>,
@@ -7432,13 +7675,15 @@ fn unprotect_and_write_page(
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid out pointer.
     let n = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
-    if n == 0
-        || mbi.State != MEM_COMMIT
+    if n == 0 {
+        return false;
+    }
+    if mbi.State != MEM_COMMIT
         || (mbi.BaseAddress as usize) > page_addr
         || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) < page_addr.saturating_add(PAGE)
         || mbi.Protect != PAGE_NOACCESS
     {
-        return false;
+        return unprotect_split_subregions(page_addr, data, PAGE, PAGE, section_view);
     }
     if let (Some(bytes), Some((section, off, sec_bytes))) = (data, section_view)
         && mbi.Type == MEM_MAPPED
@@ -7497,13 +7742,15 @@ fn unprotect_and_write_complement(
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid out pointer.
     let n = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
-    if n == 0
-        || mbi.State != MEM_COMMIT
+    if n == 0 {
+        return false;
+    }
+    if mbi.State != MEM_COMMIT
         || (mbi.BaseAddress as usize) > page_addr
         || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) < page_addr.saturating_add(PAGE)
         || mbi.Protect != PAGE_NOACCESS
     {
-        return false;
+        return unprotect_split_subregions(page_addr, Some(gpu_bytes), rel_lo, rel_hi, section_view);
     }
     if let Some((section, off, sec_bytes)) = section_view
         && mbi.Type == MEM_MAPPED
@@ -7587,6 +7834,7 @@ fn flush_armed_page(
                     .flushed_baselines
                     .insert((shadow.id, page_idx), FlushedBaseline::new(buf));
             }
+            shadow.record_lazy_flush_strike(page_idx);
             shadow.lazy_state[page_idx].store(LAZY_RESYNC, Ordering::Release);
             shadow.resync_count.fetch_add(1, Ordering::AcqRel);
         } else {
@@ -7705,20 +7953,29 @@ fn flush_claimed_batch(batch: &[ClaimedFlushPage<'_>], save_baseline: bool) {
         restore_rw_run(run_first, run_last, &mut restored[run_start_idx..idx], run_first);
     }
 
-    // Copy bytes for any restored pages that were not prewritten via `OWN`.
-    if ok {
+    // Copy bytes for uniform restored pages not prewritten via `OWN`, and handle
+    // split-4K / mixed-protection pages via `unprotect_and_write_page`.
+    {
         let mut copied_any = false;
         for (i, c) in batch.iter().enumerate() {
-            if restored[i] && !prewritten[i] {
-                // SAFETY: `restore_rw_run` verified committed `PAGE_READWRITE`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bufs.as_ptr().add(i * PAGE),
-                        (c.page * PAGE) as *mut u8,
-                        PAGE,
-                    );
+            if restored[i] {
+                if ok && !prewritten[i] {
+                    // SAFETY: `restore_rw_run` verified uniform committed `PAGE_READWRITE`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bufs.as_ptr().add(i * PAGE),
+                            (c.page * PAGE) as *mut u8,
+                            PAGE,
+                        );
+                    }
+                    copied_any = true;
                 }
-                copied_any = true;
+            } else {
+                let data = (ok && !prewritten[i]).then_some(&bufs[i * PAGE..(i + 1) * PAGE]);
+                if unprotect_and_write_page(c.page * PAGE, data, c.section_view) {
+                    restored[i] = true;
+                    copied_any = true;
+                }
             }
         }
         if copied_any {
@@ -7738,6 +7995,7 @@ fn flush_claimed_batch(batch: &[ClaimedFlushPage<'_>], save_baseline: bool) {
                         FlushedBaseline::new(bufs[i * PAGE..(i + 1) * PAGE].to_vec()),
                     );
                 }
+                c.shadow.record_lazy_flush_strike(c.page_idx);
                 c.shadow.lazy_state[c.page_idx].store(LAZY_RESYNC, Ordering::Release);
                 c.shadow.resync_count.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -7924,7 +8182,10 @@ pub(crate) fn lazy_read_bypass(
 /// both READ and WRITE access violations before `watch` acquires any lock.
 /// Returns `true` iff the fault was handled and execution may resume.
 pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
-    if LAZY_ARMED_COUNT.load(Ordering::Acquire) == 0 && LAZY_FLUSH_TOTAL.load(Ordering::Acquire) == 0 {
+    if LAZY_ARMED_COUNT.load(Ordering::Acquire) == 0
+        && LAZY_FLUSH_TOTAL.load(Ordering::Acquire) == 0
+        && LAZY_TABLE_EPOCH.load(Ordering::Acquire) == 0
+    {
         return false;
     }
     if IN_LAZY_VEH.with(Cell::get) {
@@ -7941,9 +8202,19 @@ pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
 
     let page = addr / PAGE;
     // Fast lock-free exit when this stripe has no armed pages and the fault is
-    // not a stale post-flush race.
+    // not a stale post-flush or concurrent-rearm race.
+    let stripe_epoch = LAZY_TABLE_EPOCH.load(Ordering::Acquire);
     if LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].load(Ordering::Acquire) == 0 {
-        return LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0 && is_accessible(addr, is_write);
+        match query_page_access(addr, is_write) {
+            PageAccess::Accessible
+                if LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0
+                    || LAZY_TABLE_EPOCH.load(Ordering::Acquire) > 0 =>
+            {
+                return true;
+            }
+            PageAccess::NoAccess if LAZY_TABLE_EPOCH.load(Ordering::Acquire) != stripe_epoch => {}
+            _ => return false,
+        }
     }
     loop {
         let action = {
@@ -7961,9 +8232,9 @@ pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
                     }
                     // `Shadow::drop` is actively executing and will acquire
                     // `LAZY_TABLE` momentarily to transition to `Busy` and flush.
-                    None => Err(true),
+                    None => Err(None),
                 },
-                None => Err(false),
+                None => Err(Some(LAZY_TABLE_EPOCH.load(Ordering::Acquire))),
             }
         };
         match action {
@@ -7977,13 +8248,20 @@ pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
                 }
                 continue;
             }
-            Err(true) => {
+            Err(None) => {
                 std::thread::yield_now();
                 continue;
             }
-            Err(false) => {
-                return LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0 && is_accessible(addr, is_write);
-            }
+            Err(Some(epoch_before)) => match query_page_access(addr, is_write) {
+                PageAccess::Accessible
+                    if LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0
+                        || LAZY_TABLE_EPOCH.load(Ordering::Acquire) > 0 =>
+                {
+                    return true;
+                }
+                PageAccess::NoAccess if LAZY_TABLE_EPOCH.load(Ordering::Acquire) != epoch_before => continue,
+                _ => return false,
+            },
         }
     }
 }
@@ -8232,6 +8510,7 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                             .flushed_baselines
                             .insert((shadow.id, page_idx), FlushedBaseline::new(buf));
                     }
+                    shadow.record_lazy_flush_strike(page_idx);
                     shadow.lazy_state[page_idx].store(LAZY_RESYNC, Ordering::Release);
                     shadow.resync_count.fetch_add(1, Ordering::AcqRel);
                     shadow.deferred_count.fetch_sub(1, Ordering::AcqRel);
@@ -8394,6 +8673,11 @@ pub(crate) fn lazy_release_range(at: usize, len: usize) {
                 }
                 restore_rw_run(run_first, run_last, &mut restored[run_start..idx], run_first);
             }
+            for (i, (page, _, _, _)) in claimed.iter().enumerate() {
+                if !restored[i] {
+                    let _ = unprotect_and_write_page(*page * PAGE, None, None);
+                }
+            }
             {
                 let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
                 for (page, shadow, page_idx, _) in &claimed {
@@ -8437,7 +8721,11 @@ fn rollback_noaccess_pages_coalesced(pages: &[usize]) {
             VirtualProtect((from * PAGE) as *const _, count * PAGE, PAGE_READWRITE, &mut _rev) != 0
         };
         lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
-        if ok || count == 1 {
+        if ok {
+            return;
+        }
+        if count == 1 {
+            let _ = unprotect_and_write_page(from * PAGE, None, None);
             return;
         }
         let mid = from + count / 2;
@@ -8555,8 +8843,76 @@ pub(crate) fn try_defer_pieces_batch_with_after(
 }
 
 impl Shadow {
+    fn lazy_mark_hot(&self, page_idx: usize, cool_until: u32) {
+        if page_idx < self.lazy_cool_until.len() {
+            self.lazy_cool_until[page_idx].fetch_max(cool_until, Ordering::AcqRel);
+            let _ = self.lazy_state[page_idx].compare_exchange(
+                LAZY_EAGER,
+                LAZY_HOT,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn lazy_mark_ineligible(&self, page_idx: usize) {
+        if page_idx < self.lazy_cool_until.len() {
+            self.lazy_cool_until[page_idx].store(u32::MAX, Ordering::Release);
+            let _ = self.lazy_state[page_idx].compare_exchange(
+                LAZY_EAGER,
+                LAZY_INELIGIBLE,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn record_lazy_flush_strike(&self, page_idx: usize) {
+        let frame = lazy_current_frame();
+        if frame == 0 || page_idx >= self.lazy_strikes.len() {
+            return;
+        }
+        let (threshold, window) = lazy_hot_params();
+        let prev_flush = self.lazy_last_flush_frame[page_idx].swap(frame, Ordering::Relaxed);
+        let prev_cool = self.lazy_cool_until[page_idx].load(Ordering::Relaxed);
+        let ref_frame = if prev_cool == u32::MAX {
+            prev_flush
+        } else {
+            prev_flush.max(prev_cool)
+        };
+        let prev_strikes = self.lazy_strikes[page_idx].load(Ordering::Relaxed);
+        let strikes = if prev_flush > 0 && frame.saturating_sub(ref_frame) <= window {
+            prev_strikes.saturating_add(1)
+        } else {
+            1
+        };
+        self.lazy_strikes[page_idx].store(strikes, Ordering::Relaxed);
+        if strikes >= threshold {
+            let cool_until = match strikes - threshold {
+                0 => frame.saturating_add(300).min(u32::MAX - 1),
+                1 => frame.saturating_add(1800).min(u32::MAX - 1),
+                _ => u32::MAX,
+            };
+            self.lazy_cool_until[page_idx].store(cool_until, Ordering::Release);
+        } else if prev_cool != u32::MAX && prev_cool <= frame {
+            self.lazy_cool_until[page_idx].store(0, Ordering::Release);
+        }
+    }
+
+    fn lazy_post_resync_state(&self, page_idx: usize, cur_frame: u32) -> u8 {
+        let cool = self.lazy_cool_until[page_idx].load(Ordering::Acquire);
+        if cool == u32::MAX {
+            LAZY_INELIGIBLE
+        } else if cur_frame > 0 && cool > cur_frame {
+            LAZY_HOT
+        } else {
+            LAZY_EAGER
+        }
+    }
+
     /// Coalesced batch arming for a shadow's GPU-written pieces `offsets` (`(lo, hi)`):
-    /// - O(1) lock-free fast path for already-`LAZY_DEFERRED` pieces.
+    /// - O(1) lock-free fast path for already-`LAZY_DEFERRED`, `LAZY_HOT` cooled,
+    ///   and permanently `LAZY_INELIGIBLE` pieces.
     /// - Amortizes `copied`, `card.dirty`/`card.sent`, `VIEWS`, `JOURNAL`,
     ///   `GUARDS`, and `LAZY_TABLE` locks from O(N) to O(1).
     /// - Zero `VirtualQuery` on `MEM_MAPPED` view pages and cached region-level
@@ -8569,8 +8925,8 @@ impl Shadow {
         fetched_after: Option<u64>,
     ) -> Vec<bool> {
         use windows_sys::Win32::System::Memory::{
-            GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
-            VirtualQuery,
+            GetWriteWatch, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION,
+            PAGE_READWRITE, VirtualQuery,
         };
 
         let mut out = vec![false; offsets.len()];
@@ -8586,7 +8942,9 @@ impl Shadow {
         let len = self.len as usize;
         let base = start / PAGE;
         let watched_ok = self.watched.load(Ordering::Relaxed) == 1;
+        let cur_frame = lazy_current_frame();
 
+        #[derive(Clone, Copy)]
         struct Cand {
             out_idx: usize,
             lo: usize,
@@ -8614,16 +8972,31 @@ impl Shadow {
                 steady_hits += 1;
                 continue;
             }
-            if state == LAZY_EAGER && watched_ok {
-                cands.push(Cand {
-                    out_idx: i,
-                    lo,
-                    page,
-                    page_idx: idx,
-                    copied_at: 0,
-                    section_view: None,
-                });
+            if state == LAZY_INELIGIBLE || !watched_ok {
+                continue;
             }
+            if state == LAZY_HOT {
+                let cool = self.lazy_cool_until[idx].load(Ordering::Acquire);
+                if cool == u32::MAX || cur_frame < cool {
+                    continue;
+                }
+                if self.lazy_state[idx]
+                    .compare_exchange(LAZY_HOT, LAZY_EAGER, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+            } else if state != LAZY_EAGER {
+                continue;
+            }
+            cands.push(Cand {
+                out_idx: i,
+                lo,
+                page,
+                page_idx: idx,
+                copied_at: 0,
+                section_view: None,
+            });
         }
         if steady_hits > 0 {
             LAZY_STATS[1].fetch_add(steady_hits, Ordering::Relaxed);
@@ -8708,7 +9081,11 @@ impl Shadow {
         {
             if is_clean_guarded {
                 match vinfo {
-                    crate::inplace::PageViewInfo::Aliased => {}
+                    crate::inplace::PageViewInfo::Aliased => {
+                        if cur_frame > 0 {
+                            self.lazy_mark_hot(c.page_idx, cur_frame.saturating_add(120).min(u32::MAX - 1));
+                        }
+                    }
                     crate::inplace::PageViewInfo::Single(s, o, len) => {
                         c.section_view = Some((s, o, len));
                         mapped_cands.push(c);
@@ -8718,8 +9095,16 @@ impl Shadow {
                         mapped_cands.push(c);
                     }
                 }
-            } else if vinfo == crate::inplace::PageViewInfo::Unknown {
-                private_cands.push(c);
+            } else {
+                match vinfo {
+                    crate::inplace::PageViewInfo::Unknown => private_cands.push(c),
+                    crate::inplace::PageViewInfo::Aliased => {
+                        if cur_frame > 0 {
+                            self.lazy_mark_hot(c.page_idx, cur_frame.saturating_add(120).min(u32::MAX - 1));
+                        }
+                    }
+                    crate::inplace::PageViewInfo::Single(..) => {}
+                }
             }
         }
 
@@ -8751,13 +9136,15 @@ impl Shadow {
         // ---- Path A: `MEM_MAPPED` single-view clean `watch`-guarded runs ----
         if !mapped_cands.is_empty() {
             let mut reserved: Vec<(Cand, Arc<FlushWait>)> = Vec::with_capacity(mapped_cands.len());
+            let mut pinned_rejects: Vec<usize> = Vec::new();
             {
                 let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
                 for c in mapped_cands {
-                    if table.pinned.contains(&c.page)
-                        || table.is_remapping(c.page)
-                        || table.pages.contains_key(&c.page)
-                    {
+                    if table.pinned.contains(&c.page) {
+                        pinned_rejects.push(c.page_idx);
+                        continue;
+                    }
+                    if table.is_remapping(c.page) || table.pages.contains_key(&c.page) {
                         continue;
                     }
                     let wait = Arc::new(FlushWait::new());
@@ -8768,6 +9155,9 @@ impl Shadow {
                     }
                     reserved.push((c, wait));
                 }
+            }
+            for page_idx in pinned_rejects {
+                self.lazy_mark_ineligible(page_idx);
             }
             if !reserved.is_empty() {
                 let mut transitioned_set: BTreeSet<usize> = BTreeSet::new();
@@ -8849,6 +9239,9 @@ impl Shadow {
                             newly_armed += 1;
                             committed_waits.push(wait);
                         } else {
+                            if table.pinned.contains(&c.page) {
+                                self.lazy_mark_ineligible(c.page_idx);
+                            }
                             if transitioned_set.contains(&c.page) {
                                 to_rollback_vp.push(c.page);
                             }
@@ -8901,22 +9294,29 @@ impl Shadow {
                         m
                     }
                 };
-                state == MEM_COMMIT
-                    && ty == MEM_PRIVATE
-                    && prot == PAGE_READWRITE
-                    && page_addr >= base_a
-                    && page_addr + PAGE <= end_a
+                if state != MEM_COMMIT || page_addr < base_a || page_addr + PAGE > end_a {
+                    return false;
+                }
+                if ty != MEM_PRIVATE {
+                    if ty != MEM_MAPPED {
+                        self.lazy_mark_ineligible(c.page_idx);
+                    }
+                    return false;
+                }
+                prot == PAGE_READWRITE
             });
 
             if !private_cands.is_empty() {
                 let mut reserved: Vec<(Cand, Arc<FlushWait>)> = Vec::with_capacity(private_cands.len());
+                let mut pinned_rejects: Vec<usize> = Vec::new();
                 {
                     let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
                     for c in private_cands {
-                        if table.pinned.contains(&c.page)
-                            || table.is_remapping(c.page)
-                            || table.pages.contains_key(&c.page)
-                        {
+                        if table.pinned.contains(&c.page) {
+                            pinned_rejects.push(c.page_idx);
+                            continue;
+                        }
+                        if table.is_remapping(c.page) || table.pages.contains_key(&c.page) {
                             continue;
                         }
                         let wait = Arc::new(FlushWait::new());
@@ -8928,10 +9328,14 @@ impl Shadow {
                         reserved.push((c, wait));
                     }
                 }
+                for page_idx in pinned_rejects {
+                    self.lazy_mark_ineligible(page_idx);
+                }
 
                 if !reserved.is_empty() {
                     let mut protected_set: BTreeSet<usize> = BTreeSet::new();
                     let mut ww_clean_set: BTreeSet<usize> = BTreeSet::new();
+                    let mut ww_failed_set: BTreeSet<usize> = BTreeSet::new();
                     let mut touched_buf: Vec<usize> = Vec::new();
                     let mut i = 0;
                     while i < reserved.len() {
@@ -8977,6 +9381,30 @@ impl Shadow {
                                 ) == 0
                             };
                             if !ww_ok {
+                                if sub_pages == 1 {
+                                    ww_failed_set.insert(sub_first);
+                                } else {
+                                    for p in sub_first..sub_last {
+                                        let mut p_cnt = PAGE / 4096;
+                                        let mut p_gran = 0u32;
+                                        // SAFETY: single-page non-resetting `GetWriteWatch`.
+                                        let p_ok = unsafe {
+                                            GetWriteWatch(
+                                                0,
+                                                (p * PAGE) as *const _,
+                                                PAGE,
+                                                touched_buf.as_mut_ptr().cast(),
+                                                &mut p_cnt,
+                                                &mut p_gran,
+                                            ) == 0
+                                        };
+                                        if !p_ok {
+                                            ww_failed_set.insert(p);
+                                        } else if p_cnt == 0 {
+                                            ww_clean_set.insert(p);
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                             if count == 0 {
@@ -9049,6 +9477,9 @@ impl Shadow {
                                 newly_armed += 1;
                                 committed_waits.push(wait);
                             } else {
+                                if ww_failed_set.contains(&c.page) || table.pinned.contains(&c.page) {
+                                    self.lazy_mark_ineligible(c.page_idx);
+                                }
                                 if protected_set.contains(&c.page) {
                                     to_rollback_vp.push(c.page);
                                 }
@@ -9182,11 +9613,11 @@ impl Shadow {
         }
     }
 
-    /// Transitions `LAZY_RESYNC` pages in `[from, to)` back to `LAZY_EAGER`
-    /// (skipping any page overlapping `skip_busy`) and clears their `copied`
-    /// entry so [`Shadow::update_free`] copies fresh title memory (including
-    /// any CPU writes made after VEH flush) into staging and schedules VRAM
-    /// upload (`card_changed`).
+    /// Transitions `LAZY_RESYNC` pages in `[from, to)` back to `LAZY_EAGER` /
+    /// `LAZY_HOT` / `LAZY_INELIGIBLE` (skipping any page overlapping `skip_busy`)
+    /// and clears their `copied` entry so [`Shadow::update_free`] copies fresh
+    /// title memory (including any CPU writes made after VEH flush) into staging
+    /// and schedules VRAM upload (`card_changed`).
     fn lazy_prepare_update(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) {
         if self.resync_count.load(Ordering::Acquire) == 0 || from >= to {
             return;
@@ -9194,6 +9625,7 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let first = from / PAGE;
         let last = to.div_ceil(PAGE);
+        let cur_frame = lazy_current_frame();
         let mut resynced = Vec::new();
         for page in first..last {
             let page_lo = page * PAGE;
@@ -9202,13 +9634,15 @@ impl Shadow {
                 continue;
             }
             let idx = page - base;
-            if idx < self.lazy_state.len()
-                && self.lazy_state[idx]
-                    .compare_exchange(LAZY_RESYNC, LAZY_EAGER, Ordering::AcqRel, Ordering::Acquire)
+            if idx < self.lazy_state.len() && self.lazy_state[idx].load(Ordering::Acquire) == LAZY_RESYNC {
+                let next_state = self.lazy_post_resync_state(idx, cur_frame);
+                if self.lazy_state[idx]
+                    .compare_exchange(LAZY_RESYNC, next_state, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-            {
-                self.resync_count.fetch_sub(1, Ordering::AcqRel);
-                resynced.push(idx);
+                {
+                    self.resync_count.fetch_sub(1, Ordering::AcqRel);
+                    resynced.push(idx);
+                }
             }
         }
         if resynced.is_empty() {
@@ -9239,6 +9673,7 @@ impl Shadow {
         let base = start / PAGE;
         let first = from / PAGE;
         let last = to.div_ceil(PAGE);
+        let cur_frame = lazy_current_frame();
         let mut pages = Vec::new();
         for page in first..last {
             let page_lo = page * PAGE;
@@ -9247,13 +9682,15 @@ impl Shadow {
                 continue;
             }
             let idx = page - base;
-            if idx < self.lazy_state.len()
-                && self.lazy_state[idx]
-                    .compare_exchange(LAZY_RESYNC, LAZY_EAGER, Ordering::AcqRel, Ordering::Acquire)
+            if idx < self.lazy_state.len() && self.lazy_state[idx].load(Ordering::Acquire) == LAZY_RESYNC {
+                let next_state = self.lazy_post_resync_state(idx, cur_frame);
+                if self.lazy_state[idx]
+                    .compare_exchange(LAZY_RESYNC, next_state, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-            {
-                self.resync_count.fetch_sub(1, Ordering::AcqRel);
-                pages.push((page, idx));
+                {
+                    self.resync_count.fetch_sub(1, Ordering::AcqRel);
+                    pages.push((page, idx));
+                }
             }
         }
         if pages.is_empty() {

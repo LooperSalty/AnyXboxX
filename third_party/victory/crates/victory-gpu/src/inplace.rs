@@ -452,7 +452,7 @@ pub(crate) fn single_view_pages_batch(addrs: &[usize]) -> Vec<PageViewInfo> {
             out.push(PageViewInfo::Aliased);
             continue;
         }
-        let Some(sec_bytes) = v.sections.iter().find(|s| s.0 == section).map(|s| s.1) else {
+        let Some(&(sec_bytes, _)) = v.sections.get(&section) else {
             out.push(PageViewInfo::Unknown);
             continue;
         };
@@ -486,8 +486,8 @@ pub(crate) fn write_section_own(
     }
     let host = {
         let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-        match aliases.iter().find(|a| a.0 == section) {
-            Some(&( _, base, size)) => (base != 0 && end <= size).then_some(base),
+        match aliases.get(&section).copied() {
+            Some((base, size)) => (base != 0 && end <= size).then_some(base),
             None => {
                 // SAFETY: live section handle passed by runtime (remapping flushes
                 // deferred pages before closing). Mapped whole for read/write.
@@ -501,7 +501,7 @@ pub(crate) fn write_section_own(
                     )
                 }
                 .Value as usize;
-                aliases.push((section, base, section_bytes));
+                aliases.insert(section, (base, section_bytes));
                 (base != 0).then_some(base)
             }
         }

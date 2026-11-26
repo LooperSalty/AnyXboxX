@@ -2803,3 +2803,380 @@ fn lazy_copyback_mapped_view_steady_state_refresh_lockfree() {
     assert!(!has_lazy_mapped_view_pages());
     assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
 }
+
+/// Regression test 1 (`0xc0000005` VEH escape on concurrent re-arm / guard
+/// transition): hammers `watch` `PAGE_READONLY -> PAGE_NOACCESS` transitions
+/// and repeated `try_defer_piece` / `try_defer_piece_relay` re-arming while
+/// concurrent reader/writer threads access trailing offsets `0xf804` and
+/// `0xfc04`. Must never escape the VEH handler or tear data.
+#[test]
+fn lazy_copyback_veh_rearm_and_guard_transition_race_never_escapes() {
+    let _guard = LazyTestGuard::enable();
+    let Some(h) = host() else {
+        return;
+    };
+    if !h.card_ready() {
+        return;
+    }
+    let Some(pipe) = GpuAddPipeline::new(h) else {
+        return;
+    };
+    let list = h.new_list().expect("new_list");
+
+    const M_SEED_F804: u32 = 0x4000_0000 ^ (0xf804 / 4) as u32;
+    const M_SEED_FC04: u32 = 0x4000_0000 ^ (0xfc04 / 4) as u32;
+    const P_SEED_F804: u32 = 0x5000_0000 ^ (0xf804 / 4) as u32;
+    const P_SEED_FC04: u32 = 0x5000_0000 ^ (0xfc04 / 4) as u32;
+
+    let mblock = MappedSectionBlock::new(PAGE);
+    // SAFETY: seed mapped page.
+    unsafe { std::ptr::write_bytes(mblock.ptr, 0x11, PAGE) };
+    let mshadow = make_test_shadow(h, mblock.addr() as u64, PAGE as u64, false).expect("mshadow");
+    pipe.dispatch_on(h, &list, &mshadow, 0, PAGE, 0x4000_0000, 1);
+
+    let pblock = VirtualBlock::new(PAGE, true);
+    // SAFETY: seed private write-watch page.
+    unsafe { std::ptr::write_bytes(pblock.ptr, 0x22, PAGE) };
+    let pshadow = make_test_shadow(h, pblock.addr() as u64, PAGE as u64, false).expect("pshadow");
+    pipe.dispatch_on(h, &list, &pshadow, 0, PAGE, 0x5000_0000, 1);
+
+    // Complete initial Flush #1 on `pblock` before spawning the concurrent
+    // accessor so `+0xf804` physical backing is initialized before re-arming.
+    // SAFETY: triggers VEH demand flush on both blocks.
+    unsafe {
+        assert_eq!(std::ptr::read_volatile((mblock.addr() + 0xf804) as *const u32), M_SEED_F804);
+        assert_eq!(std::ptr::read_volatile((pblock.addr() + 0xf804) as *const u32), P_SEED_F804);
+    }
+    let _ = mshadow.update(mblock.addr(), PAGE);
+    let _ = pshadow.update(pblock.addr(), PAGE);
+    assert!(mshadow.try_defer_piece(0, PAGE));
+    assert!(pshadow.try_defer_piece(0, PAGE));
+
+    let flushes_before = LAZY_FLUSH_TOTAL.load(Ordering::Acquire);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_r = stop.clone();
+    let accessor_iters = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accessor_iters_w = accessor_iters.clone();
+    let m_addr = mblock.addr();
+    let p_addr = pblock.addr();
+
+    let accessor = std::thread::spawn(move || {
+        let mut i = 0u32;
+        while !stop_r.load(Ordering::Relaxed) {
+            i = i.wrapping_add(1);
+            for &(base, seed_f8, seed_fc) in &[
+                (m_addr, M_SEED_F804, M_SEED_FC04),
+                (p_addr, P_SEED_F804, P_SEED_FC04),
+            ] {
+                // SAFETY: committed test pages; VEH/guard handler resolves all faults.
+                unsafe {
+                    let p1 = (base + 0xf804) as *const u32;
+                    let p2 = (base + 0xfc04) as *mut u32;
+                    assert_eq!(std::ptr::read_volatile(p1), seed_f8);
+                    if i.is_multiple_of(2) {
+                        std::ptr::write_volatile(p2, 0xDEAD_0000 | (i & 0xFFFF));
+                    }
+                    let v2 = std::ptr::read_volatile(p2);
+                    assert!(
+                        v2 == seed_fc || (v2 & 0xFFFF_0000) == 0xDEAD_0000,
+                        "torn read at +0xfc04: {v2:#x}"
+                    );
+                }
+            }
+            accessor_iters_w.fetch_add(1, Ordering::Relaxed);
+            if i.is_multiple_of(4) {
+                std::thread::yield_now();
+            }
+        }
+    });
+
+    let mut m_rearms = 0u32;
+    let mut p_rearms = 0u32;
+    for iter in 0u32..2000 {
+        let m_was_def = mshadow.lazy_state[0].load(Ordering::Acquire) == LAZY_DEFERRED;
+        let _ = mshadow.update(mblock.addr(), PAGE);
+        let m_ok = if iter.is_multiple_of(2) {
+            mshadow.try_defer_piece(0, PAGE)
+        } else {
+            mshadow.try_defer_piece_relay(0, PAGE, iter as u64)
+        };
+        if m_ok && !m_was_def && mshadow.lazy_state[0].load(Ordering::Acquire) == LAZY_DEFERRED {
+            m_rearms += 1;
+        }
+
+        let p_was_def = pshadow.lazy_state[0].load(Ordering::Acquire) == LAZY_DEFERRED;
+        let _ = pshadow.update(pblock.addr(), PAGE);
+        let p_ok = if iter.is_multiple_of(2) {
+            pshadow.try_defer_piece(0, PAGE)
+        } else {
+            pshadow.try_defer_piece_relay(0, PAGE, iter as u64)
+        };
+        if p_ok && !p_was_def && pshadow.lazy_state[0].load(Ordering::Acquire) == LAZY_DEFERRED {
+            p_rearms += 1;
+        }
+
+        let _ = crate::watch::writes(mblock.addr(), mblock.addr() + PAGE, true);
+        if iter.is_multiple_of(4) {
+            std::thread::yield_now();
+        }
+        if iter >= 250
+            && m_rearms >= 2
+            && p_rearms >= 2
+            && LAZY_FLUSH_TOTAL.load(Ordering::Acquire) >= flushes_before + 4
+            && accessor_iters.load(Ordering::Acquire) >= 32
+        {
+            break;
+        }
+    }
+
+    stop.store(true, Ordering::Release);
+    accessor.join().expect("accessor thread must complete without unhandled AV");
+    assert!(m_rearms >= 2, "expected repeated mapped re-arms, got {m_rearms}");
+    assert!(p_rearms >= 2, "expected repeated private re-arms, got {p_rearms}");
+    assert!(accessor_iters.load(Ordering::Acquire) >= 32);
+    assert!(LAZY_FLUSH_TOTAL.load(Ordering::Acquire) >= flushes_before + 4);
+
+    drop(pshadow);
+    drop(mshadow);
+    assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+}
+
+/// Regression test 2: splitting VAD protections inside an armed 64 KiB page
+/// across single-page VEH fault (`MEM_PRIVATE`), coalesced `lazy_flush_range`
+/// (`MEM_MAPPED`), `lazy_release_range`, and `lazy_release_written_range`.
+#[test]
+fn lazy_copyback_split_subpage_unprotect_restores_all_4k_subpages() {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let _guard = LazyTestGuard::enable();
+    let Some(h) = host() else {
+        return;
+    };
+    if !h.card_ready() {
+        return;
+    }
+    let Some(pipe) = GpuAddPipeline::new(h) else {
+        return;
+    };
+    let list = h.new_list().expect("new_list");
+
+    // 2A: `MEM_PRIVATE` single-page VEH fault after splitting `[0..4096)` `PAGE_READWRITE`.
+    let block = VirtualBlock::new(PAGE, true);
+    // SAFETY: seed physical page before first dispatch.
+    unsafe { std::ptr::write_bytes(block.ptr, 0x3C, PAGE) };
+    let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+    pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x6161_0000, 1);
+    assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
+    assert_eq!(page_protect(block.addr()), PAGE_NOACCESS);
+
+    let mut old = 0u32;
+    // SAFETY: splitting protection on first 4 KiB subpage of our test allocation.
+    assert_ne!(
+        unsafe { VirtualProtect(block.ptr.cast(), 4096, PAGE_READWRITE, &mut old) },
+        0
+    );
+    assert_eq!(page_protect(block.addr()), PAGE_READWRITE);
+    assert_eq!(page_protect(block.addr() + 0xf804), PAGE_NOACCESS);
+
+    // SAFETY: fault is handled by VEH + `unprotect_split_subregions`.
+    unsafe {
+        let v1 = std::ptr::read_volatile((block.addr() + 0xf804) as *const u32);
+        assert_eq!(v1, 0x6161_0000 ^ (0xf804 / 4) as u32);
+        let p2 = (block.addr() + 0xfc04) as *mut u32;
+        assert_eq!(std::ptr::read_volatile(p2), 0x6161_0000 ^ (0xfc04 / 4) as u32);
+        std::ptr::write_volatile(p2, 0xCAFE_BEEF);
+        assert_eq!(std::ptr::read_volatile(p2), 0xCAFE_BEEF);
+    }
+    assert_eq!(page_protect(block.addr() + 0xf804), PAGE_READWRITE);
+    assert_eq!(page_protect(block.addr() + 0xfc04), PAGE_READWRITE);
+    drop(shadow);
+
+    // 2B: `MEM_MAPPED` split-4K via `lazy_flush_range` (`flush_claimed_batch` ->
+    // `write_section_subregion`), with `[0..4096)` set `PAGE_READONLY` so any
+    // blind full-page copy would AV immediately.
+    let mblock = MappedSectionBlock::new(PAGE);
+    // SAFETY: seed physical section page.
+    unsafe { std::ptr::write_bytes(mblock.ptr, 0x4D, PAGE) };
+    let mshadow = make_test_shadow(h, mblock.addr() as u64, PAGE as u64, true).expect("mshadow");
+    pipe.dispatch_on(h, &list, &mshadow, 0, PAGE, 0x7272_0000, 1);
+    assert_eq!(mshadow.deferred_count.load(Ordering::Acquire), 1);
+    // SAFETY: split first 4 KiB to `PAGE_READONLY`.
+    assert_ne!(
+        unsafe { VirtualProtect(mblock.ptr.cast(), 4096, PAGE_READONLY, &mut old) },
+        0
+    );
+    lazy_flush_range(mblock.addr(), PAGE);
+    assert_eq!(mshadow.deferred_count.load(Ordering::Acquire), 0);
+    assert_eq!(page_protect(mblock.addr()), PAGE_READONLY);
+    assert_eq!(page_protect(mblock.addr() + 0xf804), PAGE_READWRITE);
+    // SAFETY: trailing subpage is now `PAGE_READWRITE` with GPU bytes.
+    assert_eq!(
+        unsafe { std::ptr::read_volatile((mblock.addr() + 0xf804) as *const u32) },
+        0x7272_0000 ^ (0xf804 / 4) as u32
+    );
+    drop(mshadow);
+
+    // 2C(i): `lazy_release_range` on split-4K page (`[0..4096)` = `PAGE_READONLY`).
+    let rblock = VirtualBlock::new(PAGE, true);
+    // SAFETY: seed physical page.
+    unsafe { std::ptr::write_bytes(rblock.ptr, 0x5E, PAGE) };
+    let rshadow = make_test_shadow(h, rblock.addr() as u64, PAGE as u64, true).expect("rshadow");
+    pipe.dispatch_on(h, &list, &rshadow, 0, PAGE, 0x8181_0000, 1);
+    // SAFETY: split first 4 KiB to `PAGE_READONLY`.
+    assert_ne!(
+        unsafe { VirtualProtect(rblock.ptr.cast(), 4096, PAGE_READONLY, &mut old) },
+        0
+    );
+    lazy_release_range(rblock.addr(), PAGE);
+    assert_eq!(rshadow.deferred_count.load(Ordering::Acquire), 0);
+    assert_eq!(page_protect(rblock.addr()), PAGE_READONLY);
+    assert_eq!(page_protect(rblock.addr() + 0xf804), PAGE_READWRITE);
+    drop(rshadow);
+
+    // 2C(ii): `lazy_release_written_range` preserves `[+0x2000..+0x4000)` while
+    // restoring and populating the split outer `PAGE_NOACCESS` subpages.
+    let wblock = VirtualBlock::new(PAGE, true);
+    // SAFETY: seed physical page.
+    unsafe { std::ptr::write_bytes(wblock.ptr, 0x6F, PAGE) };
+    let wshadow = make_test_shadow(h, wblock.addr() as u64, PAGE as u64, true).expect("wshadow");
+    pipe.dispatch_on(h, &list, &wshadow, 0, PAGE, 0x8383_0000, 1);
+    // SAFETY: open `[+0x2000..+0x4000)` to `PAGE_READWRITE` and stamp sentinel.
+    assert_ne!(
+        unsafe { VirtualProtect((wblock.addr() + 0x2000) as *const _, 0x2000, PAGE_READWRITE, &mut old) },
+        0
+    );
+    // SAFETY: `[+0x2000..+0x4000)` is `PAGE_READWRITE`.
+    unsafe { std::ptr::write_volatile((wblock.addr() + 0x2004) as *mut u32, 0xBEEF_CAFE) };
+    lazy_release_written_range(wblock.addr() + 0x2000, 0x2000);
+    assert_eq!(wshadow.deferred_count.load(Ordering::Acquire), 0);
+    assert_eq!(page_protect(wblock.addr() + 4), PAGE_READWRITE);
+    assert_eq!(page_protect(wblock.addr() + 0xf804), PAGE_READWRITE);
+    // SAFETY: all subpages are now `PAGE_READWRITE`.
+    unsafe {
+        assert_eq!(std::ptr::read_volatile((wblock.addr() + 4) as *const u32), 0x8383_0000 ^ 1);
+        assert_eq!(std::ptr::read_volatile((wblock.addr() + 0x2004) as *const u32), 0xBEEF_CAFE);
+        assert_eq!(
+            std::ptr::read_volatile((wblock.addr() + 0xf804) as *const u32),
+            0x8383_0000 ^ (0xf804 / 4) as u32
+        );
+    }
+    drop(wshadow);
+
+    assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+}
+
+/// Regression test 3 (v2 hot-page thrash cooldown & O(1) fast-reject cache):
+/// verifies strike escalation (2 flushes in 60 frames -> 300 frames -> 1800
+/// frames -> permanent `LAZY_INELIGIBLE`), preservation of `LAZY_RESYNC`
+/// coherence through every flush, immediate `LAZY_INELIGIBLE` caching for
+/// non-write-watch private allocations, and that Frame-1 virgin
+/// `MEM_WRITE_WATCH` pages (`count > 0`) remain `LAZY_EAGER` for Frame 2.
+#[test]
+fn lazy_copyback_v2_hot_page_cooldown_and_ineligible_fast_reject() {
+    let _guard = LazyTestGuard::enable();
+    let Some(h) = host() else {
+        return;
+    };
+    if !h.card_ready() {
+        return;
+    }
+    let Some(pipe) = GpuAddPipeline::new(h) else {
+        return;
+    };
+    let list = h.new_list().expect("new_list");
+
+    let _frame_guard = LazyFrameGuard::set(100);
+    let block = VirtualBlock::new(PAGE, true);
+    // SAFETY: seed physical page.
+    unsafe { std::ptr::write_bytes(block.ptr, 0x10, PAGE) };
+    let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+
+    // Flush 1 at frame 100 (`strikes = 1` -> returns to `LAZY_EAGER`).
+    pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x1000_0000, 1);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_DEFERRED);
+    // SAFETY: VEH flush preserves exact GPU data and sets `LAZY_RESYNC`.
+    assert_eq!(unsafe { *block.ptr.cast::<u32>() }, 0x1000_0000);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_RESYNC);
+
+    // Flush 2 at frame 110 (`strikes = 2`, within 60-frame window -> cooled until 410).
+    LazyFrameGuard::update(110);
+    pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x2000_0000, 1);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_DEFERRED);
+    assert_eq!(unsafe { *block.ptr.cast::<u32>() }, 0x2000_0000);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_RESYNC);
+
+    // SAFETY: page was flushed to `PAGE_READWRITE`.
+    unsafe { *block.ptr.add(4).cast::<u32>() = 0x1122_3344 };
+    let _ = shadow.update(block.addr(), PAGE);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_HOT);
+    assert_eq!(shadow.resync_count.load(Ordering::Acquire), 0);
+    assert!(
+        !shadow.try_defer_piece(0, PAGE),
+        "LAZY_HOT page must reject re-arm during 300-frame cooldown"
+    );
+    // SAFETY: verify CPU write synced into shadow staging/copy after `LAZY_RESYNC`.
+    unsafe { assert_eq!(*shadow.data.add(4).cast::<u32>(), 0x1122_3344) };
+
+    LazyFrameGuard::update(409);
+    assert!(!shadow.try_defer_piece(0, PAGE), "still cooled at frame 409 < 410");
+
+    // Flush 3 at frame 415 (>= 410 expiry -> re-arms, then 3rd strike cools 1800 until 2215).
+    LazyFrameGuard::update(415);
+    pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x3000_0000, 1);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_DEFERRED);
+    assert_eq!(unsafe { *block.ptr.cast::<u32>() }, 0x3000_0000);
+    let _ = shadow.update(block.addr(), PAGE);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_HOT);
+    assert!(!shadow.try_defer_piece(0, PAGE));
+
+    // Flush 4 at frame 2220 (>= 2215 -> re-arms, then 4th strike marks permanent `LAZY_INELIGIBLE`).
+    LazyFrameGuard::update(2220);
+    pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x4000_0000, 1);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_DEFERRED);
+    assert_eq!(unsafe { *block.ptr.cast::<u32>() }, 0x4000_0000);
+    let _ = shadow.update(block.addr(), PAGE);
+    assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_INELIGIBLE);
+    LazyFrameGuard::update(1_000_000);
+    assert!(
+        !shadow.try_defer_piece(0, PAGE),
+        "permanently LAZY_INELIGIBLE page must fast-reject even far in future"
+    );
+    drop(shadow);
+
+    // Part B: Plain non-MEM_WRITE_WATCH private page is immediately cached `LAZY_INELIGIBLE`.
+    LazyFrameGuard::update(10);
+    let plain_block = VirtualBlock::new(PAGE, false);
+    // SAFETY: seed non-write-watch private allocation.
+    unsafe { std::ptr::write_bytes(plain_block.ptr, 0x55, PAGE) };
+    let plain_shadow =
+        make_test_shadow(h, plain_block.addr() as u64, PAGE as u64, true).expect("plain_shadow");
+    plain_shadow.watched.store(1, Ordering::Relaxed);
+    plain_shadow
+        .copied
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set(0, 1);
+    assert!(!plain_shadow.try_defer_piece(0, PAGE));
+    assert_eq!(plain_shadow.lazy_state[0].load(Ordering::Acquire), LAZY_INELIGIBLE);
+    assert!(!plain_shadow.try_defer_piece(0, PAGE));
+    drop(plain_shadow);
+
+    // Part C: Virgin demand-zero `MEM_WRITE_WATCH` page (`GetWriteWatch` reports
+    // untouched 4 KiB subpages with `count > 0`) rejects Frame-1 arming while
+    // remaining `LAZY_EAGER` so Frame 2 arms once committed/reset.
+    LazyFrameGuard::update(1);
+    let virgin_block = VirtualBlock::new(PAGE, true);
+    let virgin_shadow =
+        make_test_shadow(h, virgin_block.addr() as u64, PAGE as u64, false).expect("virgin_shadow");
+    let _ = virgin_shadow.update(virgin_block.addr(), PAGE);
+    assert!(!virgin_shadow.try_defer_piece(0, PAGE));
+    assert_eq!(virgin_shadow.lazy_state[0].load(Ordering::Acquire), LAZY_EAGER);
+    LazyFrameGuard::update(2);
+    // SAFETY: commit all 64 KiB private subpages before resetting write-watch.
+    unsafe { std::ptr::write_bytes(virgin_block.ptr, 0x77, PAGE) };
+    let _ = virgin_shadow.update(virgin_block.addr(), PAGE);
+    assert!(virgin_shadow.try_defer_piece(0, PAGE));
+    assert_eq!(virgin_shadow.lazy_state[0].load(Ordering::Acquire), LAZY_DEFERRED);
+    drop(virgin_shadow);
+
+    assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+}
