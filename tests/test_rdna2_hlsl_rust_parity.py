@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from emu import rdna2_exec, rdna2_gpu, rdna2_hlsl
-from test_rdna2_exec import LITERAL, const, program, sop1, sop2, sopp
+from test_rdna2_exec import LITERAL, const, program, sop1, sop2, sopc, sopp
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target" / "release" / ("anyxboxx-rdna2-hlsl.exe" if os.name == "nt" else "anyxboxx-rdna2-hlsl")
@@ -186,3 +186,87 @@ def test_sop2_literals_and_alias_with_clear_scc(name, literal_first, monkeypatch
                         "g_memory.Store(4, scc ? 1u : 0u); }\n  return;\n")
     import struct
     assert rdna2_gpu.run(hlsl, bytes(8)) == struct.pack("<II", wave.s[0], int(wave.scc))
+
+
+SOPC_32 = tuple(f"s_cmp_{op}_{kind}" for op in ("eq", "lg", "gt", "ge", "lt", "le")
+                for kind in ("i32", "u32")) + ("s_bitcmp0_b32", "s_bitcmp1_b32")
+
+
+@pytest.mark.parametrize("name", SOPC_32)
+@pytest.mark.parametrize("x,y", [(0, 0), (0x80000000, 0xffffffff), (0x12345678, 35)])
+def test_sopc_32_text_and_warp(name, x, y, monkeypatch):
+    if not rdna2_gpu.available():
+        pytest.skip("dxc or GPU runner is unavailable")
+    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
+    data = program(sop1("s_mov_b32", 0, LITERAL), x, sop1("s_mov_b32", 1, LITERAL), y,
+                   sopc(name, 0, 1))
+    result = rust(data)
+    assert result.returncode == 0, result.stderr.decode()
+    hlsl = result.stdout.decode("utf-8")
+    assert hlsl == rdna2_hlsl.translate(data)
+    wave = rdna2_exec.run(data)
+    hlsl = hlsl.replace("  return;\n",
+                        "  if (lane == 0) g_memory.Store(0, scc ? 1u : 0u);\n  return;\n")
+    import struct
+    assert rdna2_gpu.run(hlsl, bytes(4)) == struct.pack("<I", int(wave.scc))
+
+
+@pytest.mark.parametrize("name", ["s_cmp_eq_u64", "s_cmp_lg_u64"])
+@pytest.mark.parametrize("a,b,c,d", [(0, 0, 0, 0), (4, 0xffffffff, 4, 0xffffffff),
+                                       (4, 1, 4, 2), (4, 1, 5, 1)])
+def test_sopc_64_text_and_warp(name, a, b, c, d, monkeypatch):
+    if not rdna2_gpu.available():
+        pytest.skip("dxc or GPU runner is unavailable")
+    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
+    data = program(sop1("s_mov_b32", 0, LITERAL), a, sop1("s_mov_b32", 1, LITERAL), b,
+                   sop1("s_mov_b32", 2, LITERAL), c, sop1("s_mov_b32", 3, LITERAL), d,
+                   sopc(name, 0, 2))
+    result = rust(data)
+    assert result.returncode == 0, result.stderr.decode()
+    hlsl = result.stdout.decode("utf-8")
+    assert hlsl == rdna2_hlsl.translate(data)
+    wave = rdna2_exec.run(data)
+    hlsl = hlsl.replace("  return;\n",
+                        "  if (lane == 0) g_memory.Store(0, scc ? 1u : 0u);\n  return;\n")
+    import struct
+    assert rdna2_gpu.run(hlsl, bytes(4)) == struct.pack("<I", int(wave.scc))
+
+
+def test_sopc_rejects_unsupported_instruction_and_64_bit_literal():
+    for data, name in [(program(sopc("s_bitcmp0_b64", 0, 1)), b"s_bitcmp0_b64"),
+                       (program(sopc("s_cmp_eq_u64", LITERAL, 0), 0), b"s_cmp_eq_u64")]:
+        result = rust(data)
+        assert result.returncode != 0 and name in result.stderr
+
+
+@pytest.mark.parametrize("source", [125, 128, 192, 193, 208])
+def test_sopc_64_inline_operands(source, monkeypatch):
+    if not rdna2_gpu.available():
+        pytest.skip("dxc or GPU runner is unavailable")
+    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
+    data = program(sopc("s_cmp_eq_u64", source, source))
+    result = rust(data)
+    assert result.returncode == 0, result.stderr.decode()
+    hlsl = result.stdout.decode("utf-8")
+    assert hlsl == rdna2_hlsl.translate(data)
+    wave = rdna2_exec.run(data)
+    hlsl = hlsl.replace("  return;\n", "  if (lane == 0) g_memory.Store(0, scc ? 1u : 0u);\n  return;\n")
+    import struct
+    assert rdna2_gpu.run(hlsl, bytes(4)) == struct.pack("<I", int(wave.scc))
+
+
+@pytest.mark.parametrize("literal_first", [False, True])
+def test_sopc_32_literal(literal_first, monkeypatch):
+    if not rdna2_gpu.available():
+        pytest.skip("dxc or GPU runner is unavailable")
+    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
+    a, b = (LITERAL, const(1)) if literal_first else (const(1), LITERAL)
+    data = program(sopc("s_cmp_lt_i32", a, b), 0xffffffff)
+    result = rust(data)
+    assert result.returncode == 0, result.stderr.decode()
+    hlsl = result.stdout.decode("utf-8")
+    assert hlsl == rdna2_hlsl.translate(data)
+    wave = rdna2_exec.run(data)
+    hlsl = hlsl.replace("  return;\n", "  if (lane == 0) g_memory.Store(0, scc ? 1u : 0u);\n  return;\n")
+    import struct
+    assert rdna2_gpu.run(hlsl, bytes(4)) == struct.pack("<I", int(wave.scc))

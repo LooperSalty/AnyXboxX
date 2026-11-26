@@ -4,6 +4,7 @@ use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
 
 mod scalar;
 mod scalar_binary;
+mod scalar_compare;
 
 const PRELUDE: &str = concat!(
     include_str!("prelude0.hlsl"),
@@ -25,7 +26,7 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
         match name.as_str() {
             "s_nop" => (),
             "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
-            _ if matches!(instruction.family, "SOP1" | "SOP2") => {
+            _ if matches!(instruction.family, "SOP1" | "SOP2" | "SOPC") => {
                 let offset = instruction.offset;
                 let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                 let literal = (instruction.size > 1)
@@ -33,8 +34,10 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
                 lines.push_str("  ");
                 let statement = if instruction.family == "SOP1" {
                     scalar::statement(&name, word, literal)?
-                } else {
+                } else if instruction.family == "SOP2" {
                     scalar_binary::statement(&name, word, literal)?
+                } else {
+                    scalar_compare::statement(&name, word, literal)?
                 };
                 lines.push_str(&statement);
                 lines.push('\n');
