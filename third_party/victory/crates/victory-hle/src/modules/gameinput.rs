@@ -115,8 +115,12 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
-    /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
+    /// Whether the automatic A tap is active in this poll.
+    fn auto_a(&self) -> bool {
+        false
+    }
+    /// Keys held down, including synthetic Enter while the tap is active.
+    fn keys(&mut self, auto_a: bool) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -432,12 +436,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, auto_a) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let auto_a = source.auto_a();
+            let keys = source.keys(auto_a);
+            (pads, keys, auto_a)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, auto_a);
         self.deliver(events);
     }
 
@@ -480,12 +486,18 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        auto_a: bool,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
+        // The first connected pad receives the tap when the stand-in is disconnected.
+        let first_pad = pads.iter_mut().flatten().next();
+        let any_pad = first_pad.is_some();
+        if auto_a && let Some(pad) = first_pad {
+            pad.buttons |= A;
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
@@ -553,7 +565,7 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: bool) -> Vec<KeyState> {
             Vec::new()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
@@ -1192,7 +1204,17 @@ mod host {
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn auto_a(&self) -> bool {
+            // (Neptune) `VICTORY_AUTO_A=<seconds>`: a quarter-second tap every four
+            // seconds during startup, regardless of window focus.
+            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
+                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            let run = super::START.elapsed();
+            run.as_secs() < *AUTO_A && run.as_millis() % 4000 < 250
+        }
+
+        fn keys(&mut self, auto_a: bool) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
@@ -1207,15 +1229,7 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            // (Neptune) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
-            // (the stand-in pad's A) is down for a quarter of a second in every four,
-            // whether or not the window has focus: a launch gets through the title's
-            // "press A" screens without the focus being taken from what the user does.
-            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
-                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-            });
-            let run = super::START.elapsed();
-            if run.as_secs() < *AUTO_A && run.as_millis() % 4000 < 250 && !down.contains(&0x0D) {
+            if auto_a && !down.contains(&0x0D) {
                 down.push(0x0D);
             }
             down.into_iter()
@@ -1449,6 +1463,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        auto_a: bool,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1458,7 +1473,10 @@ mod tests {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn auto_a(&self) -> bool {
+            self.0.lock().unwrap().auto_a
+        }
+        fn keys(&mut self, _: bool) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1650,6 +1668,46 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn auto_a_taps_the_first_connected_pad() {
+        let (hub, host) = fake();
+        let physical = PadState {
+            buttons: B,
+            left_x: 0.5,
+            right_trigger: 0.75,
+            ..Default::default()
+        };
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(physical);
+            host.pads[3] = Some(PadState::default());
+            host.auto_a = true;
+            // The automatic tap appears as Enter in the keyboard sample.
+            host.keys = vec![key(0x0D)];
+        }
+        let sample = |device| {
+            let reading = current(hub, GAMEPAD_KIND, device).unwrap();
+            let state = pad(reading);
+            release(reading);
+            state
+        };
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            sample(1),
+            PadState {
+                buttons: A | B,
+                ..physical
+            }
+        );
+        assert_eq!(sample(3), PadState::default());
+
+        // A held Enter key is still only a keyboard input while a real pad is connected.
+        host.lock().unwrap().auto_a = false;
+        hub.poll();
+        assert_eq!(sample(1), physical);
     }
 
     #[test]

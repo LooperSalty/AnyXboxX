@@ -76,7 +76,8 @@ pub struct RunArgs {
     /// KEY=VALUE VICTORY_* variables set after the tuned set and --quality, for A/B runs. Repeatable.
     #[arg(long = "override", alias = "Override", value_parser = parse_override)]
     pub overrides: Vec<(String, String)>,
-    /// Taps A through the start screens for 150 s (VICTORY_AUTO_A=150).
+    /// Taps A through the start screens for 150 s (VICTORY_AUTO_A=150) on the first connected
+    /// XInput pad, or on the keyboard's stand-in pad if no controller is connected.
     #[arg(long, alias = "AutoA")]
     pub auto_a: bool,
     /// Writes frametime.csv into the cache folder, one row a second (VICTORY_FRAMETIME_DUMP=1).

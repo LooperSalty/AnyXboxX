@@ -201,6 +201,7 @@ def test_override_wins_over_quality_and_the_tuned_set(tmp_path, fake_tool, binar
 
 def test_auto_a_and_frametime_dump_are_set_when_asked(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--auto-a", "--frametime-dump"])
+    assert calls[0] == BUILD, done.stderr
     logged = calls[1].split(" | ", 1)[1].split(";")
     assert "VICTORY_AUTO_A=150" in logged and "VICTORY_FRAMETIME_DUMP=1" in logged, done.stderr
 
