@@ -105,7 +105,7 @@ fn float_condition(op: &str, a: &str, b: &str) -> Option<String> {
     })
 }
 
-fn half_operand(code: u32, expression: &str) -> String {
+pub(crate) fn half_operand(code: u32, expression: &str) -> String {
     const INLINE: [u32; 9] = [
         0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x4400, 0xc400, 0x3118,
     ];

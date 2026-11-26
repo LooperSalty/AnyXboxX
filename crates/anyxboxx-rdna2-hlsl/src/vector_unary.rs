@@ -1,5 +1,6 @@
 //! VOP1 wave32 moves, integer operations, and conversions.
 use crate::scalar::source;
+use crate::vector_compare::half_operand;
 
 const ACTIVE: &str = "((s[126] >> lane) & 1u) != 0";
 
@@ -21,6 +22,28 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
     }
     if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
         return Ok(None);
+    }
+    let half = half_operand(code, &a);
+    let half_expr = match name {
+        "v_cvt_f16_f32" => Some(format!("F32ToF16({a})")),
+        "v_cvt_f32_f16" => Some(format!("F16ToF32({half})")),
+        "v_floor_f16" => Some(format!(
+            "F32ToF16(asuint(floor(asfloat(F16ToF32({half})))))"
+        )),
+        "v_ceil_f16" => Some(format!("F32ToF16(asuint(ceil(asfloat(F16ToF32({half})))))")),
+        "v_trunc_f16" => Some(format!(
+            "F32ToF16(asuint(trunc(asfloat(F16ToF32({half})))))"
+        )),
+        "v_rndne_f16" => Some(format!("F16Rndne({half})")),
+        _ => None,
+    };
+    if let Some(expr) = half_expr {
+        let result = if name == "v_cvt_f32_f16" {
+            expr
+        } else {
+            format!("(v[{d}] & 0xFFFF0000u) | {expr}")
+        };
+        return Ok(Some(format!("if ({ACTIVE}) v[{d}] = {result};")));
     }
     let expr = match name {
         "v_mov_b32" => a.clone(),
