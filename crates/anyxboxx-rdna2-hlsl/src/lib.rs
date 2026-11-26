@@ -2,13 +2,15 @@
 
 use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
 
+mod scalar;
+
 const PRELUDE: &str = concat!(
     include_str!("prelude0.hlsl"),
     include_str!("prelude1.hlsl"),
     include_str!("prelude2.hlsl"),
 );
 
-/// Translate a straight-line wave32 program. Only s_nop and s_endpgm are implemented.
+/// Translate a straight-line wave32 program, rejecting unsupported instructions.
 pub fn translate(data: &[u8]) -> Result<String, String> {
     if !data.len().is_multiple_of(4) {
         return Err("truncated instruction".into());
@@ -22,6 +24,15 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
         match name.as_str() {
             "s_nop" => (),
             "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
+            _ if instruction.family == "SOP1" => {
+                let offset = instruction.offset;
+                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                let literal = (instruction.size > 1)
+                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
+                lines.push_str("  ");
+                lines.push_str(&scalar::statement(&name, word, literal)?);
+                lines.push('\n');
+            }
             _ => return Err(format!("untranslated instruction: {name}")),
         }
     }
@@ -35,8 +46,8 @@ mod tests {
 
     #[test]
     fn rejects_untranslated_instruction_by_name() {
-        let data = 0xbe80_0380u32.to_le_bytes();
-        assert!(translate(&data).unwrap_err().contains("s_mov_b32"));
+        let data = 0xbe80_0480u32.to_le_bytes();
+        assert!(translate(&data).unwrap_err().contains("s_mov_b64"));
     }
 
     #[test]
