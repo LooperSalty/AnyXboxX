@@ -78,6 +78,25 @@ def test_runtime_ships_the_rust_xgameruntime():
     assert rust.read_bytes() == shipped.read_bytes()
 
 
+def test_cpp_oracle_refuses_chunk_uninstall(tmp_path):
+    oracle = RUNTIME_DIR / "xgameruntime_cpp.dll"
+    if not runtime_built() or not oracle.is_file():
+        if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
+            pytest.fail(f"runtime or C++ oracle absent: {oracle}")
+        pytest.skip("runtime or C++ oracle not built")
+    folder = tmp_path / "runtime"
+    shutil.copytree(RUNTIME_DIR, folder)
+    shutil.copyfile(oracle, folder / "xgameruntime.dll")
+    env = {**os.environ, "ANYXBOXX_RUNTIME": str(folder), "ANYXBOXX_REQUIRE_RUNTIME": "1"}
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests/test_runtime_package.py::test_uninstall_chunks_is_explicitly_unimplemented"],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "1 passed" in done.stdout
+
+
 @pytest.mark.parametrize("name", sorted(PORTED))
 def test_rust_dll_exports_what_the_cpp_dll_exports(name):
     rust = RUST_RELEASE / PORTED[name][0]
