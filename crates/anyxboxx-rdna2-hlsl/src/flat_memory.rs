@@ -19,6 +19,7 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
     let addtid = family == "GLOBAL" && width == "dword_addtid";
     let count = match width {
         "dword" | "dword_addtid" => 1,
+        "ubyte" | "sbyte" if !store => 1,
         "dwordx2" => 2,
         "dwordx3" => 3,
         "dwordx4" => 4,
@@ -66,10 +67,22 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
             "AllMemoryBarrierWithGroupSync();".into(),
         ])
     } else {
-        let loads = (0..count)
-            .map(|i| format!("v[{}] = g_memory.Load(({address}) + {}u);", vdst + i, 4 * i))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let loads = if matches!(width, "ubyte" | "sbyte") {
+            let value = format!(
+                "((g_memory.Load(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & 0xFFu)"
+            );
+            let value = if width == "sbyte" {
+                format!("asuint((asint({value}) << 24) >> 24)")
+            } else {
+                value
+            };
+            format!("v[{vdst}] = {value};")
+        } else {
+            (0..count)
+                .map(|i| format!("v[{}] = g_memory.Load(({address}) + {}u);", vdst + i, 4 * i))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let zeros = (0..count)
             .map(|i| format!("v[{}] = 0u;", vdst + i))
             .collect::<Vec<_>>()
