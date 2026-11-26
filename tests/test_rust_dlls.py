@@ -78,7 +78,7 @@ def test_runtime_ships_the_rust_xgameruntime():
     assert rust.read_bytes() == shipped.read_bytes()
 
 
-def test_cpp_oracle_refuses_chunk_uninstall(tmp_path):
+def test_cpp_oracle_passes_shared_runtime_tests(tmp_path):
     oracle = RUNTIME_DIR / "xgameruntime_cpp.dll"
     if not runtime_built() or not oracle.is_file():
         if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
@@ -89,12 +89,16 @@ def test_cpp_oracle_refuses_chunk_uninstall(tmp_path):
     shutil.copyfile(oracle, folder / "xgameruntime.dll")
     env = {**os.environ, "ANYXBOXX_RUNTIME": str(folder), "ANYXBOXX_REQUIRE_RUNTIME": "1"}
     done = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "tests/test_runtime_package.py::test_uninstall_chunks_is_explicitly_unimplemented"],
+        [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+         "-k", "not unregister_suppresses_a_queued_waiter", "tests/test_runtime_cpp.py",
+         "tests/test_runtime_package.py", "tests/test_runtime_task_waiter.py"],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
     )
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "1 passed" in done.stdout
+    passed = re.search(r"(\d+) passed", done.stdout)
+    skipped = [line for line in done.stdout.splitlines() if line.startswith("SKIPPED")]
+    unexpected = [line for line in skipped if not any(reason in line for reason in ALLOWED_SKIPS)]
+    assert passed and int(passed.group(1)) >= 30 and not unexpected, done.stdout
 
 
 @pytest.mark.parametrize("name", sorted(PORTED))
