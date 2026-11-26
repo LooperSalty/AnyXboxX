@@ -6,6 +6,7 @@ mod scalar;
 mod scalar_binary;
 mod scalar_compare;
 mod scalar_immediate;
+mod scalar_memory;
 mod scalar_movrel;
 mod scalar_wide;
 mod vector_binary;
@@ -36,6 +37,18 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
         match name.as_str() {
             "s_nop" => (),
             "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
+            _ if instruction.family == "SMEM" => {
+                let offset = instruction.offset;
+                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
+                    return Err(format!("truncated instruction: {name}"));
+                }
+                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                for line in scalar_memory::statements(&name, word)? {
+                    lines.push_str("  ");
+                    lines.push_str(&line);
+                    lines.push('\n');
+                }
+            }
             _ if instruction.family == "VOP3P" => {
                 let offset = instruction.offset;
                 if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
