@@ -17,6 +17,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+mod generated_loops;
 mod generated_swizzles;
 
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
