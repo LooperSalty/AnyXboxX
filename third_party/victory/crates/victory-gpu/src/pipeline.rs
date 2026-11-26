@@ -250,7 +250,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
+    // (`ACCC`: native code another compiler made, with `VICTORY_WAVE32_NVIDIA=1`)
+    let programs = match c
+        .part(FourCC::DXIL)
+        .or_else(|| c.part(FourCC::ACCC).filter(|_| victory_shader::emit::nvidia::enabled()))
+    {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
@@ -318,6 +322,7 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         return false;
     };
     c.part(FourCC::DXIL)
+        .or_else(|| c.part(FourCC::ACCC).filter(|_| victory_shader::emit::nvidia::enabled()))
         .and_then(|part| victory_shader::native_programs(part.data).ok())
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
@@ -491,7 +496,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -511,23 +516,33 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
+#[cfg(windows)]
+fn match_skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
+pub(crate) fn skipped_shader_in(shaders: &[Arc<Shader>]) -> Option<&str> {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        parse_skip_hashes(&value)
+    });
+    match_skipped_shader(shaders, hashes)
+}
+
+#[cfg(windows)]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    skipped_shader_in(&p.shaders)
+}
+
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -540,16 +555,15 @@ pub(crate) fn note_drop(this: This) {
         "no pipeline set".to_owned()
     } else {
         let p = pipeline(this);
-        #[cfg(feature = "diagnostics")]
-        let skipped = skipped_shader(p).map(|hash| format!("skipped shader {hash}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let skipped: Option<String> = None;
-        skipped.or_else(|| make::missing(&p.host)).unwrap_or_else(|| {
-            // (Neptune) Its host pipeline is there: the draw was left out for another
-            // reason (its views or buffers could not be made ready, or a filter of ours).
-            let shaders: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
-            format!("pipeline made, draw not run [{}]", shaders.join(", "))
-        })
+        skipped_shader(p)
+            .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| make::missing(&p.host))
+            .unwrap_or_else(|| {
+                // (Neptune) Its host pipeline is there: the draw was left out for another
+                // reason (its views or buffers could not be made ready, or a filter of ours).
+                let shaders: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+                format!("pipeline made, draw not run [{}]", shaders.join(", "))
+            })
     };
     note_why(why);
 }
@@ -815,7 +829,7 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -823,6 +837,34 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn match_skipped_shader_finds_matching_stage_hash() {
+        let vs = super::shader("vertex", b"vertex-skip-test");
+        let ps = super::shader("pixel", b"pixel-skip-test");
+        let shaders = [vs.clone(), ps.clone()];
+
+        assert_eq!(super::match_skipped_shader(&shaders, &[]), None);
+        assert_eq!(
+            super::match_skipped_shader(&shaders, &["0000000000000000".to_owned()]),
+            None
+        );
+        assert_eq!(
+            super::match_skipped_shader(&shaders, &[ps.hash.clone()]),
+            Some(ps.hash.as_str())
+        );
+        assert_eq!(
+            super::match_skipped_shader(&shaders, &[vs.hash.clone(), ps.hash.clone()]),
+            Some(vs.hash.as_str())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_skipped_is_false_for_null_pipeline() {
+        assert!(!super::is_skipped(std::ptr::null_mut()));
     }
 
     use super::*;

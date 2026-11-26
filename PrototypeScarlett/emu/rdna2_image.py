@@ -1,12 +1,23 @@
 """Images RDNA 2 (MIMG) : champs de l'instruction, descripteurs T# (image) et S# (échantillonneur).
 
 Positions des champs et constantes :
-- Descripteurs T# (`SQ_IMG_RSRC_WORD*`, dont `BASE_LEVEL`/`LAST_LEVEL` bits 12..19 de WORD3) et
-  S# (`SQ_IMG_SAMP_WORD*`, constantes `SQ_TEX_CLAMP_*`, `SQ_TEX_XY_FILTER_*`,
-  `SQ_TEX_DEPTH_COMPARE_*`, `SQ_TEX_BORDER_COLOR_*`) : décodage de Leonida,
-  runtime/src/gfx10_descriptors.h (GPL-3.0, d'après Mesa src/amd/registers/gfx10-rsrc.json, MIT).
+- T# (`SQ_IMG_RSRC_WORD*`) : AMD RDNA 2 ISA (novembre 2020), section 8.2.6, table 45 (p. 75) :
+  adresse 39:0, format 60:52, width-1 77:62, height-1 93:78, dst_sel_x..w 107:96 (0 = 0, 1 = 1,
+  4..7 = R, G, B, A), base level 111:108, last level 115:112 (bits 12..19 de WORD3), type 127:124
+  (9 = 2d).
+- S# (`SQ_IMG_SAMP_WORD*`) : même ISA, section 8.2.7, table 46 (p. 76-77) : clamp x et y 2:0 et 5:3
+  (`SQ_TEX_CLAMP_*`, 0 à 7), depth compare func 14:12 (`SQ_TEX_DEPTH_COMPARE_*`, 0 à 7), force
+  unnormalized 15, xy mag et min filter 85:84 et 87:86 (0 = point, 1 = bilinear), border color type
+  127:126. La table 46 nomme les types de bordure sans leurs valeurs ; 0 = noir transparent, 1 = noir
+  opaque, 2 = blanc opaque viennent de l'énumération `SQ_TEX_BORDER_COLOR` de Mesa
+  (src/amd/registers/gfx6.json, MIT, lu dans le code).
+- Noms des champs et des constantes : Mesa src/amd/registers/gfx10-rsrc.json et gfx6.json (MIT) ; chaque
+  position et valeur ci-dessus est celle de l'ISA et de Mesa (lus et comparés au code).
 - Encodage MIMG gfx10 : LLVM SIInstrFormats.td (MIMGe_gfx10, Apache 2.0).
-- Noms des formats : data/gfx10_formats.json (Leonida).
+- Codes des formats : ISA, section 8.2.8, table 47 (p. 78-79). Noms : data/gfx10_formats.json,
+  l'énumération `GFX10_FORMAT` de Mesa src/amd/registers/gfx10-rsrc.json (MIT, commit 1a24f43d97b3,
+  dernier changement du fichier) écrite une entrée par ligne, `"valeur": "nom"`, dans l'ordre de Mesa ;
+  les 105 codes de la table 47 y portent le même nom.
 - Ordre des registres d'adresse MIMG (`[offset], [z_ref], s, t, [lod]`) et décalages signés sur
   6 bits (`off_x = bits[5:0]`, `off_y = bits[13:8]`) : AMD RDNA 2 ISA, Table 8.9.
 - Sens de comparaison profondeur (`z_ref <op> texel`) : AMD RDNA 2 ISA / D3D12 `SampleCmp`.
@@ -16,12 +27,12 @@ Positions des champs et constantes :
 
 Opérations prises en charge (le reste est refusé en le nommant) : image 2D linéaire à un seul
 niveau mip (BASE_LEVEL = LAST_LEVEL = 0, lignes de width × taille du texel), formats
-8_UNORM, 8_8_UNORM, 8_8_8_8_UNORM, 32_FLOAT, 32_32_FLOAT et 32_32_32_32_FLOAT ; lecture/écriture
-directe (image_load[_mip], image_store[_mip], image_get_resinfo) ; échantillonnage
-(image_sample[_lz|_l][_o], image_sample_c[_lz|_l][_o], image_gather4[_lz|_l][_o]) au plus proche
-ou bilinéaire, adressage wrap, mirror, clamp-to-edge, mirror-once-to-edge, clamp-to-border et
-mirror-once-to-border (couleurs de bordure standard). L'interpréteur et le HLSL font le même
-calcul, au bit près.
+8_UNORM, 8_8_UNORM, 8_8_8_8_UNORM, 32_UINT, 32_SINT, 32_FLOAT, 32_32_UINT, 32_32_SINT,
+32_32_FLOAT et 32_32_32_32_FLOAT ; lecture/écriture directe (image_load[_mip], image_store[_mip],
+image_get_resinfo) ; atomiques 2D (image_atomic_*) ; échantillonnage (image_sample[_lz|_l][_o],
+image_sample_c[_lz|_l][_o], image_gather4[_lz|_l][_o]) au plus proche ou bilinéaire, adressage
+wrap, mirror, clamp-to-edge, mirror-once-to-edge, clamp-to-border et mirror-once-to-border
+(couleurs de bordure standard). L'interpréteur et le HLSL font le même calcul, au bit près.
 """
 import json
 import struct
@@ -32,18 +43,28 @@ FORMAT_NAMES = {int(code): name for code, name in
                 json.loads((Path(__file__).parent / "data" / "gfx10_formats.json").read_text(encoding="utf-8")).items()}
 FORMAT_8_UNORM = 1
 FORMAT_8_8_UNORM = 14
+FORMAT_32_UINT = 20
+FORMAT_32_SINT = 21
 FORMAT_32_FLOAT = 22
 FORMAT_8_8_8_8_UNORM = 56
+FORMAT_32_32_UINT = 62
+FORMAT_32_32_SINT = 63
 FORMAT_32_32_FLOAT = 64
 FORMAT_32_32_32_32_FLOAT = 77
 TEXEL_BYTES = {
     FORMAT_8_UNORM: 1,
     FORMAT_8_8_UNORM: 2,
+    FORMAT_32_UINT: 4,
+    FORMAT_32_SINT: 4,
     FORMAT_32_FLOAT: 4,
     FORMAT_8_8_8_8_UNORM: 4,
+    FORMAT_32_32_UINT: 8,
+    FORMAT_32_32_SINT: 8,
     FORMAT_32_32_FLOAT: 8,
     FORMAT_32_32_32_32_FLOAT: 16,
 }
+ATOMIC_FORMATS_32 = frozenset({FORMAT_32_UINT, FORMAT_32_SINT, FORMAT_32_FLOAT})
+ATOMIC_FORMATS_64 = frozenset({FORMAT_32_32_UINT, FORMAT_32_32_SINT, FORMAT_32_32_FLOAT})
 TYPE_2D = 9
 DIM_2D = 1
 CLAMP_WRAP = 0
@@ -77,8 +98,15 @@ GATHER_OPS = frozenset({
     "image_gather4", "image_gather4_lz", "image_gather4_l",
     "image_gather4_o", "image_gather4_lz_o", "image_gather4_l_o",
 })
+ATOMIC_OPS = frozenset({
+    "image_atomic_swap", "image_atomic_cmpswap", "image_atomic_add", "image_atomic_sub",
+    "image_atomic_smin", "image_atomic_umin", "image_atomic_smax", "image_atomic_umax",
+    "image_atomic_and", "image_atomic_or", "image_atomic_xor", "image_atomic_inc",
+    "image_atomic_dec", "image_atomic_fcmpswap", "image_atomic_fmin", "image_atomic_fmax",
+})
+ATOMIC_CMPSWAP_OPS = frozenset({"image_atomic_cmpswap", "image_atomic_fcmpswap"})
 SAMPLER_OPS = SAMPLE_OPS | COMPARE_OPS | GATHER_OPS
-SUPPORTED_OPS = DIRECT_OPS | SAMPLER_OPS
+SUPPORTED_OPS = DIRECT_OPS | SAMPLER_OPS | ATOMIC_OPS
 
 
 class ImageError(ValueError):
@@ -90,9 +118,24 @@ def instruction_fields(word):
     nsa = (word >> 1) & 0x3
     addresses = [(word >> 32) & 0xFF] + [(word >> (64 + 8 * k)) & 0xFF for k in range(4 * nsa)]
     return {"nsa": nsa, "dim": (word >> 3) & 0x7, "dmask": (word >> 8) & 0xF, "unorm": (word >> 12) & 1,
-            "r128": (word >> 15) & 1, "tfe": (word >> 16) & 1, "lwe": (word >> 17) & 1,
+            "glc": (word >> 13) & 1, "r128": (word >> 15) & 1, "tfe": (word >> 16) & 1, "lwe": (word >> 17) & 1,
             "vaddr": addresses, "vdata": (word >> 40) & 0xFF, "srsrc": ((word >> 48) & 0x1F) * 4,
             "ssamp": ((word >> 53) & 0x1F) * 4, "a16": (word >> 62) & 1, "d16": (word >> 63) & 1}
+
+
+def atomic_width(name, dmask):
+    """Largeur en bits (32 ou 64) d'un image_atomic_* d'après dmask ; ImageError sinon."""
+    if name in ATOMIC_CMPSWAP_OPS:
+        if dmask == 0x3:
+            return 32
+        if dmask == 0xF:
+            return 64
+        raise ImageError(f"{name} : dmask 0x{dmask:x} non pris en charge (0x3 ou 0xf attendus)")
+    if dmask == 0x1:
+        return 32
+    if dmask == 0x3:
+        return 64
+    raise ImageError(f"{name} : dmask 0x{dmask:x} non pris en charge (0x1 ou 0x3 attendus)")
 
 
 def check_instruction(name, fields):
@@ -105,6 +148,8 @@ def check_instruction(name, fields):
             raise ImageError(f"{name} : option {flag} non prise en charge")
     if name in GATHER_OPS and bin(fields["dmask"]).count("1") != 1:
         raise ImageError(f"{name} : dmask 0x{fields['dmask']:x} non pris en charge (un seul canal)")
+    if name in ATOMIC_OPS:
+        atomic_width(name, fields["dmask"])
 
 
 def has_offset(name):
@@ -121,7 +166,7 @@ def address_count(name):
         return 1
     if name in ("image_load_mip", "image_store_mip"):
         return 3
-    if name in DIRECT_OPS:
+    if name in DIRECT_OPS or name in ATOMIC_OPS:
         return 2
     return 2 + int(has_offset(name)) + int(name in COMPARE_OPS) + int(has_lod(name))
 

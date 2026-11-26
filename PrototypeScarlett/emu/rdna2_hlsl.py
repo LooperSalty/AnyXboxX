@@ -1,23 +1,25 @@
 """Recompilateur RDNA 2 → HLSL (shader de calcul, puis DXIL avec dxc).
 
 Un programme RDNA 2 (un wave32) devient un shader de calcul HLSL d'un groupe de 32 threads.
-Le contrôle de flux réductible est structuré en boucles `[loop] while` et gardes `if (pc == ...)`
-via `third_party/leonida/cfg_structure.py` (Leonida, GPL-3.0), avec repli sur `while` + `switch (pc)`
-pour les graphes irréductibles. La mémoire du programme est le buffer brut u0 (adresses 32 bits
+Un programme sans branchement s'écrit en ligne droite ; sinon, le contrôle de flux est rendu par une
+boucle `while (pc != END_PC)` et une garde `if (pc == ...)` par bloc de base, car les branchements RDNA 2
+sont scalaires donc uniformes pour tout le groupe. Pas de `switch (pc)` : sur WARP, un `switch` dans
+cette boucle fait planter le lanceur (0xC0000005) quand un bloc contient une barrière de groupe (Ballot64
+du wave64), mesuré avec tests/test_rdna2_hlsl_wave64.py ; la chaîne de gardes passe partout. La mémoire du programme est le buffer brut u0 (adresses 32 bits
 basses). Chaque instruction traduite est vérifiée contre l'interpréteur de référence
 (emu/rdna2_exec*) ; une instruction non couverte lève Untranslatable en la nommant.
 """
-from pathlib import Path
 import struct
-import sys
 
-from emu import (rdna2, rdna2_exec_cmp16, rdna2_exec_div, rdna2_exec_wide, rdna2_hlsl_cmpf16, rdna2_hlsl_div,
-                 rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_f16, rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_int16,
-                 rdna2_hlsl_movrel, rdna2_hlsl_pc, rdna2_hlsl_sad, rdna2_hlsl_scalar64, rdna2_hlsl_wide)
+from emu import (rdna2, rdna2_exec_cmp16, rdna2_exec_div, rdna2_exec_pkf16, rdna2_exec_wide, rdna2_hlsl_cmpf16,
+                 rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_f16, rdna2_hlsl_format, rdna2_hlsl_image,
+                 rdna2_hlsl_int16, rdna2_hlsl_movrel, rdna2_hlsl_pc, rdna2_hlsl_pkf16, rdna2_hlsl_sad,
+                 rdna2_hlsl_scalar64, rdna2_hlsl_wide)
+from emu import rdna2_hlsl_gather
 from emu.rdna2_exec_cmpf16 import COMPAREF16
 from emu.rdna2_exec_ops import signed
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS, VECTOR_NO_OPERATION
-from emu.rdna2_exec_vop3 import MAD64, Fields, float_inputs, float_result
+from emu.rdna2_exec_vop3 import LITERAL_VOP2, MAD64, Fields, float_inputs, float_result
 from emu.rdna2_hlsl_clamp import CARRY, carry_write, integer_template, refuse_integer_clamp
 from emu.rdna2_hlsl_memory import memory_statements
 from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, SCALAR, VECTOR, Untranslatable, source_high,
@@ -169,6 +171,8 @@ def modified(code, index, fields, literal, is_float):
 
 
 def _vop3(name, opcode, fields, literal, active=ACTIVE):
+    if name in rdna2_exec_pkf16.PK_FMAC:
+        return rdna2_hlsl_pkf16.pk_fmac_vop3(name, fields, literal, active)
     if name in rdna2_hlsl_f16.TEMPLATES:
         return rdna2_hlsl_f16.vop3(name, fields, literal, active)
     if name in COMPAREF16:
@@ -210,6 +214,8 @@ def _vop3(name, opcode, fields, literal, active=ACTIVE):
         raise Untranslatable(f"non traduite en HLSL : {name} (VOP3)")
     if name in SIXTEEN_BIT_RESULTS and (fields.op_sel or fields.clamp):
         raise Untranslatable(f"non traduite en HLSL : {name} avec op_sel/clamp (VOP3, résultat 16 bits)")
+    if name in LITERAL_VOP2 and literal is None:
+        raise Untranslatable(f"non traduite en HLSL : {name} en VOP3 sans littéral")
     template = VECTOR[name] if is_float else integer_template(name, fields.clamp, VECTOR[name])
     expression = template.format(a=a, b=b, c=c, d=f"v[{fields.vdst}]", k=hexa(literal or 0))
     if is_float and (fields.clamp or fields.omod):
@@ -246,6 +252,8 @@ def statements(data, instruction, finish="return;", special=None, active=ACTIVE)
     if family in ("VOP1", "VOP2", "VOPC"):
         fields = _fields(family, first)
         lit = _literal(data, instruction, 1)
+        if name in rdna2_exec_pkf16.PK_FMAC and family == "VOP2":
+            return rdna2_hlsl_pkf16.pk_fmac_vop2(name, fields, lit, active)
         if name in rdna2_hlsl_f16.TEMPLATES:        # avant is_ext : les formes SDWA/DPP du f16 sont refusées par rdna2_hlsl_f16
             return rdna2_hlsl_f16.vector(name, fields, lit, active)
         if name in COMPAREF16:                      # before is_ext: SDWA/DPP refused by rdna2_hlsl_cmpf16
@@ -258,9 +266,14 @@ def statements(data, instruction, finish="return;", special=None, active=ACTIVE)
     if family == "VOP3P":
         if name in rdna2_hlsl_int16.TRANSLATED:
             return rdna2_hlsl_int16.packed(name, pair, _literal(data, instruction, 2), active)
+        if name in rdna2_exec_pkf16.VOP3P:
+            return rdna2_hlsl_pkf16.vop3p(name, pair, _literal(data, instruction, 2), active)
         return rdna2_hlsl_dot.statements(name, pair, _literal(data, instruction, 2), active)
     if family in MEMORY_FAMILIES:
         return memory_statements(family, name, pair, active)
+    if rdna2_hlsl_gather.supports(family, name):
+        end = instruction.offset + instruction.size * rdna2.DWORD
+        return rdna2_hlsl_gather.statements(name, int.from_bytes(data[instruction.offset:end], "little"), active)
     if family == "MIMG":
         end = instruction.offset + instruction.size * rdna2.DWORD
         return rdna2_hlsl_image.statements(name, int.from_bytes(data[instruction.offset:end], "little"), active)
@@ -289,72 +302,17 @@ def translate(data, sgprs=None, wave_size=32):
         return rdna2_hlsl_wave64.translate(data, sgprs)
     helpers = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
                          rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS, rdna2_hlsl_sad.HELPERS,
-                         rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS, rdna2_hlsl_int16.HELPERS))
+                         rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS, rdna2_hlsl_int16.HELPERS,
+                         rdna2_hlsl_pkf16.HELPERS,
+                         rdna2_hlsl_gather.HELPERS))
     prelude = PRELUDE.replace("[numthreads", helpers + "\n[numthreads", 1)
     return "\n".join([prelude.rstrip("\n"), *body(data, sgprs), "}", ""])
 
 
-def _cfg_structure():
-    leonida = Path(__file__).resolve().parents[2] / "third_party" / "leonida"
-    if str(leonida) not in sys.path:
-        sys.path.insert(0, str(leonida))
-    import cfg_structure
-    return cfg_structure
-
-
-def _build_blocks(data, instructions, leaders, finish, special, branches, translate_one):
-    block_of = {offset: idx for idx, offset in enumerate(leaders)}
-    stmts = [[] for _ in leaders]
-    succ = {idx: [] for idx in range(len(leaders))}
-    cur = 0
-    for index, instruction in enumerate(instructions):
-        if instruction.offset in block_of:
-            cur = block_of[instruction.offset]
-        name = rdna2.mnemonic(instruction.family, instruction.opcode)
-        following = instructions[index + 1].offset if index + 1 < len(instructions) else None
-        if name in BRANCHES:
-            target = branch_target(data, instruction)
-            if target not in block_of or target % rdna2.DWORD:
-                raise Untranslatable(f"cible de branchement invalide : {target}")
-            tb = block_of[target]
-            if name == "s_branch":
-                stmts[cur].append(f"pc = {tb}u;")
-                succ[cur] = [tb]
-            elif following in block_of:
-                fb = block_of[following]
-                stmts[cur].append(f"if ({branches[name]}) pc = {tb}u; else pc = {fb}u;")
-                succ[cur] = [tb] if tb == fb else [tb, fb]
-            else:
-                stmts[cur].append(f"if ({branches[name]}) pc = {tb}u; else {{ {finish} }}")
-                succ[cur] = [tb]
-            continue
-        stmts[cur].extend(translate_one(data, instruction, finish, special))
-        if name == "s_endpgm":
-            succ[cur] = []
-        elif following in block_of:
-            fb = block_of[following]
-            stmts[cur].append(f"pc = {fb}u;")
-            succ[cur] = [fb]
-    return stmts, succ
-
-
-def _emit_tree(items, stmts, lines, indent):
-    for item in items:
-        kind = item[0]
-        if kind == "block":
-            lines.extend(f"{indent}{line}" for line in stmts[item[1]])
-        elif kind == "guard":
-            lines.append(f"{indent}if (pc == {item[1]}u) {{")
-            _emit_tree(item[2], stmts, lines, indent + "  ")
-            lines.append(f"{indent}}}")
-        elif kind == "loop":
-            lines.append(f"{indent}[loop] while (pc == {item[1]}u) {{")
-            _emit_tree(item[2], stmts, lines, indent + "  ")
-            lines.append(f"{indent}}}")
-
-
 def body(data, sgprs=None, finish="return;", special=None, branches=BRANCHES, translate_one=None):
-    """Lignes du corps : SGPR initiaux puis contrôle de flux structuré (repli sur switch si irréductible).
+    """Lignes du corps : SGPR initiaux, puis les instructions en ligne droite si le programme n'a qu'un
+    bloc de base, sinon une boucle `while` et une garde `if (pc == ...)` par bloc de base : chaque bloc
+    se termine par `continue` vers le suivant, par un branchement ou par `finish`.
 
     `branches` (conditions HLSL des branchements) et `translate_one` (traduction d'une instruction,
     `statements` par défaut) permettent au wave64 de remplacer ce qui dépend de la taille du wave."""
@@ -362,28 +320,31 @@ def body(data, sgprs=None, finish="return;", special=None, branches=BRANCHES, tr
     instructions = [i for i in rdna2.decode(data) if i.family != "tronquée"]
     leaders = _leaders(data, instructions)
     lines = [f"  s[{number}] = {hexa(value)};" for number, value in sorted((sgprs or {}).items())]
-    stmts, succ = _build_blocks(data, instructions, leaders, finish, special, branches, translate_one)
-    tree = _cfg_structure().structure(succ)
-    if tree is not None:
-        if len(stmts) > 1:
-            lines.append("  uint pc = 0u;")
-        _emit_tree(tree, stmts, lines, "  ")
+    names = [rdna2.mnemonic(instruction.family, instruction.opcode) for instruction in instructions]
+    if leaders == [0] and not any(name in branches for name in names):
+        for instruction in instructions:
+            lines += [f"  {line}" for line in translate_one(data, instruction, finish, special)]
         return lines
-
-    lines += ["  uint pc = 0;", "  [loop] while (pc != END_PC) {", "    switch (pc) {"]
-    for index, instruction in enumerate(instructions):
+    # Cible permise : le début d'une instruction, ou la fin du programme (qui le termine).
+    end = instructions[-1].offset + instructions[-1].size * rdna2.DWORD if instructions else 0
+    targets = {instruction.offset for instruction in instructions} | {end}
+    lines += ["  uint pc = 0;", "  [loop] while (pc != END_PC) {"]
+    for index, (instruction, name) in enumerate(zip(instructions, names)):
         if instruction.offset in leaders:
-            lines.append(f"    case {instruction.offset}u:")
-        name = rdna2.mnemonic(instruction.family, instruction.opcode)
-        if name in BRANCHES:
+            if index:
+                lines.append("    }")
+            lines.append(f"    if (pc == {instruction.offset}u) {{")
+        if name in branches:
             target = branch_target(data, instruction)
-            lines.append(f"      if ({branches[name]}) {{ pc = {target}u; break; }}")
+            if target not in targets:
+                raise Untranslatable(f"cible de branchement invalide : {target}")
+            lines.append(f"      if ({branches[name]}) {{ pc = {target}u; continue; }}")
         else:
             lines += [f"      {line}" for line in translate_one(data, instruction, finish, special)]
         following = instructions[index + 1].offset if index + 1 < len(instructions) else None
-        if following in leaders and name not in ("s_endpgm",):
-            lines.append(f"      pc = {following}u; break;")
-    return lines + ["    default:", f"      {finish}", "    }", "  }"]
+        if following in leaders and name != "s_endpgm":
+            lines.append(f"      pc = {following}u; continue;")
+    return lines + ["    }", f"    {finish}", "  }"]
 
 
 def coverage_names():
@@ -392,7 +353,7 @@ def coverage_names():
             | set(rdna2_hlsl_scalar64.SCALAR64)
             | rdna2_hlsl_wide.TRANSLATED | rdna2_hlsl_div.TRANSLATED | rdna2_hlsl_movrel.TRANSLATED
             | rdna2_hlsl_dot.TRANSLATED | rdna2_hlsl_sad.TRANSLATED | rdna2_hlsl_pc.TRANSLATED
-            | rdna2_hlsl_int16.TRANSLATED
+            | rdna2_hlsl_int16.TRANSLATED | rdna2_hlsl_pkf16.TRANSLATED
             | set(rdna2_hlsl_f16.TEMPLATES)
             | {"s_endpgm", "v_readlane_b32", "v_writelane_b32", "v_readfirstlane_b32"})
 

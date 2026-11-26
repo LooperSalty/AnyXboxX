@@ -40,11 +40,11 @@ They examined the same package that AnyXboxX studies and reach the same conclusi
 
 ## Checking their decoder
 
-Their RDNA 2 disassembler (`tombox-xshader`), called from AnyXboxX's Rust bridge (`rust/anyxboxx-rdna2`), was checked against the 29,522 unique encodings of LLVM's tests by `tools/compare_tombox.py`: no wrong length, 24,831 identical encodings (84%), 4,586 opcodes missing from their table and 105 different names. Details and examples: [tombox-decoder.md](tombox-decoder.md). AnyXboxX's table, generated from LLVM, covers these missing opcodes; it can be offered to them.
+Their RDNA 2 disassembler (`tombox-xshader`), called from AnyXboxX's Rust bridge (`crates/anyxboxx-rdna2`), was checked against the 29,522 unique encodings of LLVM's tests by `tools/compare_tombox.py`: no wrong length, 24,831 identical encodings (84%), 4,586 opcodes missing from their table and 105 different names. Details and examples: [tombox-decoder.md](tombox-decoder.md). AnyXboxX's table, generated from LLVM, covers these missing opcodes; it can be offered to them.
 
 ## Their XMA2: their verified decoder
 
-Their `xma` crate (LGPL-2.1-or-later) is a Rust port of FFmpeg's WMA Pro / XMA decoder (`libavcodec/wmaprodec.c`). Their test `wmapro_fate_beethoven_matches_reference`, run locally with the public sample `wmapro/Beethovens_9th-1_small.wma` from FFmpeg's FATE suite and a reference PCM produced by `ffmpeg`, gives a maximum difference of 1 at 16 bits and a signal-to-noise ratio of 101.5 dB. AnyXboxX uses it in `rust/anyxboxx-audio` (`anyxboxx_xma <input.xma> <output.wav>`) for single-stream RIFF XMA2 files; no public XMA2 file has yet been used to verify the whole chain.
+Their `xma` crate (LGPL-2.1-or-later) is a Rust port of FFmpeg's WMA Pro / XMA decoder (`libavcodec/wmaprodec.c`). Their test `wmapro_fate_beethoven_matches_reference`, run locally with the public sample `wmapro/Beethovens_9th-1_small.wma` from FFmpeg's FATE suite and a reference PCM produced by `ffmpeg`, gives a maximum difference of 1 at 16 bits and a signal-to-noise ratio of 101.5 dB. AnyXboxX uses it in `crates/anyxboxx-audio` (`anyxboxx_xma <input.xma> <output.wav>`) for single-stream RIFF XMA2 files; no public XMA2 file has yet been used to verify the whole chain.
 
 ## Device slot table of d3d12_xs (first boot, W5)
 
@@ -71,7 +71,7 @@ Frozen by `tests/test_d3d12_device_slots.py`.
 | 86 | not established | not assigned | none |
 | 127 | CreateCommittedResource3 (shape) | out of range: TomBox's device table has 90 slots | none |
 
-AnyXboxX serves no device slot: `runtime/d3d12_xs/d3d12_xs.def` exports `D3D12ConfigureVirtualMemoryX` and the
+AnyXboxX serves no device slot: `crates/anyxboxx-d3d12-xs` exports `D3D12ConfigureVirtualMemoryX` and the
 root-signature forwarders, not `D3D12XboxCreateDevice`. The gap is the whole device proxy, not a few slots, so no
 simple correction exists. The list slots 9, 131 and 132 belong to the command-list table, which TomBox sizes at
 110 (its `vt` array has 128 entries); 131 and 132 are outside it.

@@ -35,9 +35,9 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -273,11 +273,11 @@ struct Views {
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -289,17 +289,29 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // (Neptune) A view of our own of a section this handle named before is of that one.
     {
         let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = aliases.iter().position(|a| a.0 == section) {
-            let (_, host, _) = aliases.swap_remove(at);
-            if host != 0 {
-                // SAFETY: a view this module mapped.
-                unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
-            }
+        if let Some((host, _)) = aliases.remove(&section)
+            && host != 0
+        {
+            // SAFETY: a view this module mapped.
+            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
         }
     }
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    views().sections.insert(section, (bytes, committed));
+}
+
+/// The runtime closed `section` (its last page and view are gone): our own
+/// view of it, if any, goes too, before Windows can give the handle's
+/// number to another section. With `VICTORY_SECTION_MB` there are
+/// thousands of sections, so they are not left for a number to come round.
+pub fn title_memory_section_closed(section: usize) {
+    views().sections.remove(&section);
+    if let Some(host) = ALIASES.lock().unwrap_or_else(|e| e.into_inner()).remove(&section).map(|a| a.0)
+        && host != 0
+    {
+        // SAFETY: a view this module mapped. A copy still writing through it
+        // (`crate::host::write_alias`) faults, ends there and falls back.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -366,7 +378,7 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
 
 /// (Neptune) Views of our own of the title's sections, whole and writable, by the section's
 /// handle: the address (0: it could not be mapped) and the section's bytes.
-static ALIASES: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+static ALIASES: LazyLock<Mutex<HashMap<usize, (usize, u64)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// (Neptune) Where the bytes of title view memory `[at, at + len)` are in a view of our own of
 /// the same section: the same physical pages at an address the guards know nothing of.
@@ -377,15 +389,15 @@ pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
     let (within, bytes, section, offset, size) = {
         let v = views();
         let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
-        let size = v.sections.iter().find(|s| s.0 == section).map(|s| s.1)?;
+        let size = v.sections.get(&section).map(|s| s.0)?;
         (at.checked_sub(base)?, bytes, section, offset, size)
     };
     if len == 0 || within.checked_add(len)? > bytes || offset + (within + len) as u64 > size {
         return None;
     }
     let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-    let host = match aliases.iter().find(|a| a.0 == section) {
-        Some(a) => a.1,
+    let host = match aliases.get(&section) {
+        Some(a) => a.0,
         None => {
             // SAFETY: a section handle the runtime gave; the whole section, to read and write.
             let host = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
@@ -395,7 +407,7 @@ pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
                 mapped = host != 0,
                 "a view of our own of a title section, for what shaders wrote to go into title memory through (VICTORY_QUIET_BACK=1)"
             );
-            aliases.push((section, host, size));
+            aliases.insert(section, (host, size));
             host
         }
     };
@@ -1038,9 +1050,13 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    let mut groups = BTreeMap::new();
+    for &section in v.sections.values() {
+        *groups.entry(section).or_insert(0usize) += 1;
+    }
+    for ((bytes, committed), count) in groups {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, {count} section(s) of {} MB, {}",
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));

@@ -9,7 +9,7 @@ import math
 
 from emu import (rdna2_exec_cmp16, rdna2_exec_cmp64, rdna2_exec_cmpf16, rdna2_exec_div, rdna2_exec_f16,
                  rdna2_exec_int16,
-                 rdna2_exec_movrel, rdna2_exec_sad, rdna2_exec_wide)
+                 rdna2_exec_movrel, rdna2_exec_pkf16, rdna2_exec_sad, rdna2_exec_wide)
 from emu.rdna2_exec_ops import (MASK32, SIXTEEN_BIT_RESULTS, VECTOR, VECTOR_COMPARE, VECTOR_NO_OPERATION,
                                 _float_op, _fma, _legacy_fma, _mul_add, bits_float, float_bits, ldexp, signed)
 
@@ -166,6 +166,7 @@ CARRY = {
 # than ignored: not implemented here, and no LLVM test or measurement pins it (asked in akimfomin/PortBridge#84).
 INTEGER_CLAMP = "with clamp on an integer result: not implemented"
 SATURATED_U32 = frozenset({"v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32"})
+LITERAL_VOP2 = frozenset({"v_madmk_f32", "v_madak_f32", "v_fmamk_f32", "v_fmaak_f32"})
 CARRY_SATURATION = {name: MASK32 if "_add" in name else 0 for name in CARRY}
 LANE_OPERATIONS = frozenset({"v_readlane_b32", "v_writelane_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32",
                              "v_readfirstlane_b32"})
@@ -173,7 +174,8 @@ EXECUTABLE = frozenset(set(VECTOR) - {"v_readfirstlane_b32"} | set(VECTOR_COMPAR
                        | LANE_OPERATIONS | set(rdna2_exec_cmp64.COMPARE64) | MAD64 | VECTOR_NO_OPERATION
                        | set(rdna2_exec_wide.OPERATIONS) | set(rdna2_exec_div.OPERATIONS)
                        | rdna2_exec_movrel.VECTOR | set(rdna2_exec_sad.OPERATIONS)
-                       | set(rdna2_exec_f16.OPERATIONS) | set(rdna2_exec_cmpf16.COMPAREF16) | rdna2_exec_int16.VOP3)
+                       | set(rdna2_exec_f16.OPERATIONS) | set(rdna2_exec_cmpf16.COMPAREF16) | rdna2_exec_int16.VOP3
+                       | rdna2_exec_pkf16.PK_FMAC)
 
 
 class Fields:
@@ -216,6 +218,8 @@ def execute(wave, name, opcode, word, literal):
     fields = Fields(word)
     if name in VECTOR_NO_OPERATION:
         return None
+    if name in rdna2_exec_pkf16.PK_FMAC:
+        return rdna2_exec_pkf16.execute_pk_fmac_vop3(wave, name, fields, literal)
     if name in rdna2_exec_f16.OPERATIONS:
         return rdna2_exec_f16.execute_vop3(wave, name, fields, literal)
     if name in rdna2_exec_int16.VOP3:
@@ -253,6 +257,9 @@ def execute(wave, name, opcode, word, literal):
     if fields.clamp and not is_float and name not in SATURATED_U32:
         from emu.rdna2_exec import Untranslated
         raise Untranslated(f"{name} {INTEGER_CLAMP}")
+    if name in LITERAL_VOP2 and literal is None:
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"{name} en VOP3 sans littéral")
     destination = wave.v[fields.vdst]
     for lane in wave.active():
         a, b, c = _inputs(wave, fields, lane, literal, float_inputs(name))

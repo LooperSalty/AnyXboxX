@@ -51,7 +51,9 @@ pub(crate) struct Pending {
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
+    if super::skipped_shader_in(shaders).is_some() {
+        Some("skipped via VICTORY_SKIP_PIPELINES")
+    } else if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
@@ -748,5 +750,23 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn left_out_pipeline_is_never_queued_or_made() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("skipped via VICTORY_SKIP_PIPELINES");
+        let p = Arc::new(p);
+
+        early(&p);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(ready(&p).is_none());
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(!now(&p));
+        assert!(p.made.get().is_none());
+        assert_eq!(
+            missing(&p).as_deref(),
+            Some("skipped via VICTORY_SKIP_PIPELINES")
+        );
     }
 }

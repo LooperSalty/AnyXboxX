@@ -43,12 +43,12 @@ fn program(skip: u32) -> NativeProgram {
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
 /// root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
-fn native(body: &[u32]) -> NativeProgram {
+pub(super) fn native(body: &[u32]) -> NativeProgram {
     native_of(body, true, 64)
 }
 
 /// The same for a console of 32-lane waves when `wave64` is not set, with `threads` threads.
-fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     native_with(body, wave64, threads, 0)
 }
 
@@ -107,7 +107,7 @@ fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Re
 }
 
 /// [`lowered`] for a host whose waves have at most `host_wave` lanes.
-fn lowered_on(
+pub(super) fn lowered_on(
     native: &NativeProgram,
     p: &ir::Program,
     wide: &HashSet<usize>,
@@ -1061,6 +1061,47 @@ fn paired_lanes_or_a_wave_inside_a_lane_branch() {
         }
     }
     eprintln!("ran on the hardware device: the OR of both halves in every case");
+}
+
+/// [`super::wave::WAVE_OR_V7_TO_S7`] as AMD's compiler expands it (the console upscaler
+/// library's passes): lane 0's half read inside the section, the whole wave's OR read from lane
+/// 63 once EXEC is back. Thread t holds the bit `1 << (t >> 1)`, every thread takes part and
+/// stores the OR, all of them set.
+#[test]
+fn paired_lanes_read_a_wave_or_from_lane_63_after_the_restore() {
+    let words = [
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+        0xD501_0001,
+        0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+        0x3802_02E9,
+        0xDE54_C101, // v_or_b32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x3802_02E9,
+        0x9360_1201, // v_or_b32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x3802_02E9,
+        0x0009_2401, // v_or_b32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x3802_02FA,
+        0xFF09_4001, // v_or_b32 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x3802_0302, // v_or_b32 v1, v2, v1
+        0xD760_0007,
+        0x0001_0101, // v_readlane_b32 s7, v1, 0
+        0x3802_0207, // v_or_b32 v1, s7, v1: lanes 32-63 hold the whole wave's OR
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xD760_0007,
+        0x0001_7F01, // v_readlane_b32 s7, v1, 63
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let shader = paired(&native(&words));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = on_the_card(&shader, [0, 0]) else { return };
+    assert_eq!(got, u32::MAX, "the OR of both halves");
+    eprintln!("ran on the hardware device: the OR of both halves");
 }
 
 /// One console wave of 64 threads, thread t holding the bit `1 << (t >> 1)`: the threads below

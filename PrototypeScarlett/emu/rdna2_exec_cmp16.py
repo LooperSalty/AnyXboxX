@@ -14,13 +14,13 @@ Sources:
   half-precision value. LLVM 20.1.8, SIInstrInfo::isInlineConstant (OPERAND_REG_*_INT16): "in the case
   of 16-bit integer operations, the 'floating point' values appear to not work. It seems read the low
   16-bits of 32-bit immediates" (bugzilla 46302), although its disassembler prints the f16 value.
-  Measured on gfx1036 for other 16-bit integer sources: v_cvt_f16_u16_sdwa d, 1.0 src0_sel:WORD_1
-  converts 0x3F80, and an inline float in S2 of v_mad_i32_i16 adds its float32 pattern (1.0 adds
-  0x3F80): ubiquitarianism/leonida docs/design.md, commit 9f9a7c5f30f8559c52675780cf84004571b8d6e5,
-  rows "SDWA select on an f16 inline constant" (line 331) and "v_mad_u32_u16 / v_mad_i32_i16 op_sel on
-  S2 and D" (line 359). The compares themselves are not measured: requested as PortBridge issue #83
+  LLVM 20.1.8 says it again for the (packed) 16-bit instructions in Utils/AMDGPUBaseInfo.cpp,
+  getInlineEncodingV216: float encodings are produced "for UI16 instructions: corresponding
+  single-precision float value", and test/CodeGen/AMDGPU/add.v2i16.ll (GFX10) encodes the v2i16
+  constant <0, 16256> as the inline constant 1.0 (0x3F800000: low half 0, high half 0x3F80). Not
+  measured on RDNA 2 hardware: assumed, requested as PortBridge issue #83
   (https://github.com/akimfomin/PortBridge/issues/83). In SDWA, the float32 pattern then goes through
-  src_sel like a register, as measured for v_cvt_f16_u16_sdwa.
+  src_sel like a register (assumed, from the same rule; same request).
 - Same document, section 6.2.5 "OPSEL Field Restrictions" (p. 44): OPSEL is "not for VOP1, VOP2 or VOPC
   instructions using the VOP3 encoding (these should use SDWA instead)": a VOP3 compare with op_sel set
   is refused by name instead of guessing which half the hardware reads.

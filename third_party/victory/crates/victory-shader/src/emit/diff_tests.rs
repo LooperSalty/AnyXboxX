@@ -1216,12 +1216,27 @@ fn translated_compute_matches_pc() {
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let typed_table: Vec<u32> = views
+            .iter()
+            .map(|v| match v {
+                View::Buffer { stride: Stride::Format(f, _), .. } => match f.0 as u32 {
+                    3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => super::SLOT_TYPED_UINT,
+                    4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => super::SLOT_TYPED_SINT,
+                    _ => 0,
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv && slot == super::SLOT_TYPED {
+                typed_table.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

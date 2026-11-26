@@ -511,13 +511,31 @@ impl Xma {
     }
 }
 
+/// Decode steps one pump may take while a block is still short of samples.
+const DECODE_STEPS_PER_PUMP: usize = 8;
+
+/// Whether `buffered` samples make a block to publish: a complete one, or
+/// what is left of an input that has ended (padded with silence).
+fn ready_to_publish(buffered: usize, ended: bool) -> bool {
+    buffered > 0 && (buffered >= SAMPLES_PER_BLOCK || ended)
+}
+
 fn pump(context: Context, voice: &mut Voice) {
     let size = context.field(0, 22, 5);
     if size == 0 {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        // A decode can add no samples (a skipped frame, an input boundary):
+        // take a few steps, then publish only complete blocks, or the final
+        // padded tail of the input. A short block padded with silence was an
+        // audible glitch.
+        for _ in 0..DECODE_STEPS_PER_PUMP {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        if !ready_to_publish(voice.pcm.len(), voice.ended) {
             return;
         }
         let write = context.field(0, 27, 5);
@@ -543,12 +561,20 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title can refill either input while the context stays enabled.
+        // Its previous tail was flushed once; the ring waits for a valid buffer.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -1118,6 +1144,16 @@ mod tests {
         let dropped = message.dropped;
         assert_eq!(dropped, 2);
         (m.release)(acp);
+    }
+
+    #[test]
+    fn a_short_block_waits_for_more_samples_unless_the_input_ended() {
+        assert!(!ready_to_publish(0, false));
+        assert!(!ready_to_publish(0, true));
+        assert!(!ready_to_publish(SAMPLES_PER_BLOCK - 1, false));
+        assert!(ready_to_publish(SAMPLES_PER_BLOCK - 1, true));
+        assert!(ready_to_publish(SAMPLES_PER_BLOCK, false));
+        assert!(ready_to_publish(SAMPLES_PER_BLOCK * 2, false));
     }
 
     #[test]

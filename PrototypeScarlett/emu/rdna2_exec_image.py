@@ -9,7 +9,7 @@ exactement le même calcul, au bit près.
 """
 import math
 
-from emu import rdna2_image as images
+from emu import rdna2_exec_atomic as atomic, rdna2_image as images
 from emu.rdna2_exec_ops import MASK32, bits_float, float_bits
 
 FAMILIES = frozenset({"MIMG"})
@@ -100,8 +100,13 @@ def texel(memory, image, x, y):
     if fmt == images.FORMAT_32_32_FLOAT:
         r, g = memory.read_words(address, 2)
         return [r, g, 0, images.ONE_BITS]
+    if fmt in (images.FORMAT_32_32_UINT, images.FORMAT_32_32_SINT):
+        r, g = memory.read_words(address, 2)
+        return [r, g, 0, 1]
     if fmt == images.FORMAT_32_FLOAT:
         return [memory.read_words(address, 1)[0], 0, 0, images.ONE_BITS]
+    if fmt in (images.FORMAT_32_UINT, images.FORMAT_32_SINT):
+        return [memory.read_words(address, 1)[0], 0, 0, 1]
     if fmt == images.FORMAT_8_8_8_8_UNORM:
         word = memory.read_words(address, 1)[0]
         return [images.UNORM8[(word >> (8 * channel)) & 0xFF] for channel in range(4)]
@@ -194,12 +199,12 @@ def _store_texel(memory, image, x, y, dmask, values):
             if dmask >> channel & 1:
                 memory.write_words(address + channel * images.DWORD, [packed[channel]])
         return
-    if fmt == images.FORMAT_32_32_FLOAT:
+    if fmt in (images.FORMAT_32_32_FLOAT, images.FORMAT_32_32_UINT, images.FORMAT_32_32_SINT):
         for channel in range(2):
             if dmask >> channel & 1:
                 memory.write_words(address + channel * images.DWORD, [packed[channel]])
         return
-    if fmt == images.FORMAT_32_FLOAT:
+    if fmt in (images.FORMAT_32_FLOAT, images.FORMAT_32_UINT, images.FORMAT_32_SINT):
         if dmask & 1:
             memory.write_words(address, [packed[0]])
         return
@@ -288,6 +293,43 @@ def _write_masked(wave, vdata, lane, dmask, result):
             written += 1
 
 
+def _atomic(wave, name, image, addrs, fields):
+    from emu.rdna2_exec import Untranslated
+
+    width = images.atomic_width(name, fields["dmask"])
+    allowed = images.ATOMIC_FORMATS_32 if width == 32 else images.ATOMIC_FORMATS_64
+    fmt = image["format"]
+    if fmt not in allowed:
+        raise Untranslated(
+            f"{name} ({width} bits) : format {images.FORMAT_NAMES.get(fmt, fmt)} non pris en charge"
+        )
+    op = atomic.operation(name.removeprefix("image_atomic_"), width)
+    is_cmpswap = name in images.ATOMIC_CMPSWAP_OPS
+    vdata, glc = fields["vdata"], fields["glc"]
+    words_per_val, texel_bytes = width // 32, width // 8
+    for lane in wave.active():
+        x, y = wave.v[addrs[0]][lane], wave.v[addrs[1]][lane]
+        if x >= image["width"] or y >= image["height"]:
+            if glc:
+                for i in range(words_per_val):
+                    wave.v[vdata + i][lane] = 0
+            continue
+        address = image["address"] + (y * image["width"] + x) * texel_bytes
+        old = int.from_bytes(wave.memory.read(address, texel_bytes), "little")
+        if width == 32:
+            data0 = wave.v[vdata][lane]
+            data1 = wave.v[vdata + 1][lane] if is_cmpswap else 0
+        else:
+            data0 = wave.v[vdata][lane] | (wave.v[vdata + 1][lane] << 32)
+            data1 = (wave.v[vdata + 2][lane] | (wave.v[vdata + 3][lane] << 32)) if is_cmpswap else 0
+        new = op(old, data0, data1)
+        wave.memory.write(address, new.to_bytes(texel_bytes, "little"))
+        if glc:
+            wave.v[vdata][lane] = old & MASK32
+            if width == 64:
+                wave.v[vdata + 1][lane] = (old >> 32) & MASK32
+
+
 def execute(wave, name, word):
     """Exécute une instruction MIMG ; `word` : l'instruction entière."""
     from emu.rdna2_exec import Untranslated
@@ -301,6 +343,9 @@ def execute(wave, name, word):
         raise Untranslated(str(error)) from None
     addrs = images.address_registers(name, fields)
     dmask, vdata = fields["dmask"], fields["vdata"]
+    if name in images.ATOMIC_OPS:
+        _atomic(wave, name, image, addrs, fields)
+        return
     if name in ("image_load", "image_load_mip"):
         for lane in wave.active():
             x, y = wave.v[addrs[0]][lane], wave.v[addrs[1]][lane]

@@ -20,7 +20,7 @@ The `main` branch is protected. **Nobody can push to it directly.** To propose a
 
 A pull request is merged only after the maintainer's review and approval, and once the CI checks pass:
 
-- `lint` (Linux, ~1 min): ruff and consistency of the READMEs in the 9 languages;
+- `lint` (Linux, ~1 min): ruff and consistency of the English and French READMEs;
 - `pytest` (Windows): build of the C++ runtime and the Rust code, then the whole suite. It also checks the test count stated in the READMEs: the hundred below, followed by "+" (806 tests → "800+"). Only change it if your PR crosses a hundred.
 - `politique VIctory` (Linux): VIctory's asset policy (`cargo xtask policy`) on `third_party/victory`.
 
@@ -45,7 +45,7 @@ For a large change, open an issue first to discuss it.
 
 The implementation relies on public sources: AMD's RDNA 2 ISA documentation, Microsoft Learn (GDK, Win32, D3D12), LLVM's tests, and open-source code under a compatible licence, credited in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-You may use your own copy of the game's executable and build: launch it (native, VIctory through `tools/lancer_victory.ps1`, AnyXboxX), measure, debug, analyse it statically and dynamically, and use what you learn to steer your PRs. Measurements and findings drawn from running it (summarised logs, counts, technical identifiers such as shader hashes or pass names, test results) may be cited in PRs and in the docs, with how they were obtained (measured, read statically, assumed). The limit: no file, code or asset of the game or the console in the repository. Three things drawn from the game are allowed, as in VIctory's policy (VIctory's `docs/asset-policy.md`): byte-pattern signatures (short patterns written by us, with masks) that locate functions or data in the executable, the per-build offsets of the functions we hook (under names we choose), and the build identity (hash of the executable, CodeView GUID/age).
+You may use your own copy of the game's executable and build: launch it (native, VIctory through `anyxboxx run`, AnyXboxX), measure, debug, analyse it statically and dynamically, and use what you learn to steer your PRs. Measurements and findings drawn from running it (summarised logs, counts, technical identifiers such as shader hashes or pass names, test results) may be cited in PRs and in the docs, with how they were obtained (measured, read statically, assumed). The limit: no file, code or asset of the game or the console in the repository. Three things drawn from the game are allowed, as in VIctory's policy (VIctory's `docs/asset-policy.md`): byte-pattern signatures (short patterns written by us, with masks) that locate functions or data in the executable, the per-build offsets of the functions we hook (under names we choose), and the build identity (hash of the executable, CodeView GUID/age).
 
 ## Taking code from another repository
 

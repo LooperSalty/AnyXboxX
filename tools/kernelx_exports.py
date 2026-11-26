@@ -3,10 +3,10 @@
 Les binaires console importent kernelx.dll là où un programme PC importe
 kernel32.dll : pour toutes les fonctions communes, le kernelx.dll d'AnyXboxX
 redirige vers celle de Windows. Les fonctions propres à la console sont écrites
-à part (runtime/kernelx/kernelx.cpp), au fur et à mesure que les rapports
+à part (crates/anyxboxx-kernelx/src/lib.rs), au fur et à mesure que les rapports
 (`scarlett.py --lancer … --md`) les révèlent.
 
-    python tools/kernelx_exports.py [--out runtime/kernelx/kernelx_forwarders.inc]
+    python tools/kernelx_exports.py [--out crates/anyxboxx-kernelx/kernelx_forwarders.inc]
 """
 import argparse
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 import pefile
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-DEFAULT_OUT = REPOSITORY / "runtime" / "kernelx" / "kernelx_forwarders.inc"
+DEFAULT_OUT = REPOSITORY / "crates" / "anyxboxx-kernelx" / "kernelx_forwarders.inc"
 SOURCES = ("kernel32", "kernelbase")   # kernel32 d'abord : c'est l'interface publique
 DIRECTORY_EXPORT = 0
 

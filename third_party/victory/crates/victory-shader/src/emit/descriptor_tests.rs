@@ -230,3 +230,29 @@ fn a_sampler_each_arm_of_a_uniform_branch_sets_samples_as_that_arm_says() {
         }
     }
 }
+
+#[test]
+fn typed_d16_buffer_load_and_store_use_slot_typed_and_validate() {
+    // Typed d16 buffer loads/stores (as in compute_graph_ops) and typed 32-bit
+    // format loads (as in ped_standard_head_cs) query SLOT_TYPED (not SLOT_STRIDES)
+    // and emit both integer and float typed-buffer paths, passing DXIL validation.
+    let shader = translate(&native_of(
+        &[
+            0xE20C_2000,
+            0x8002_0200, // buffer_load_format_d16_xyzw v[2:3], v0, s[8:11], 0 idxen
+            0xE200_2000,
+            0x8002_0400, // buffer_load_format_d16_x v4, v0, s[8:11], 0 idxen
+            0xE000_2000,
+            0x8002_0500, // buffer_load_format_x v5, v0, s[8:11], 0 idxen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0802, // v_add_nc_u32 v2, v2, v4
+            0x4A06_0A03, // v_add_nc_u32 v3, v3, v5
+            0xE21C_2000,
+            0x8004_0200, // buffer_store_format_d16_xyzw v[2:3], v0, s[16:19], 0 idxen
+        ],
+        4,
+        4,
+    ));
+    assert!(shader.root_srvs.contains(&super::SLOT_TYPED));
+    assert!(!shader.root_srvs.contains(&super::SLOT_STRIDES));
+}

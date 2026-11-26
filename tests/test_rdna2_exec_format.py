@@ -157,7 +157,7 @@ def test_integer_stores_saturate_to_the_field():
     (typed("buffer_load_format_x"), word3(36, 4), "10_11_11_FLOAT"),              # flottant 11/10 bits
     (typed("buffer_load_format_x"), word3(0, 4), "INVALID"),
     (typed("buffer_load_format_xy"), word3(22, 4 | 5 << 3), "DST_SEL 5"),        # Y absent de 32_FLOAT
-    (typed("buffer_store_format_xy"), word3(64, XYZW), "DST_SEL"),               # XYZW : écrit x et w (Leonida)
+    (typed("buffer_store_format_xy"), word3(64, XYZW), "DST_SEL"),               # DST_SEL_Z = Z : non documenté, refusé
     (typed("tbuffer_load_format_xyzw", fmt=64), word3(22), "4 composantes"),
     (typed("buffer_load_format_x", lds=1), word3(22, 4), "lds"),
     (typed("buffer_load_format_x", tfe=1), word3(22, 4), "tfe"),
