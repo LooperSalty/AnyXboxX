@@ -36,7 +36,7 @@ def test_vop3_clamp_rejected_by_name():
     assert result.returncode != 0 and b"v_add3_u32" in result.stderr
 
 
-@pytest.mark.parametrize("name", ["v_fma_f32", "v_fma_legacy_f32", "v_mad_f32"])
+@pytest.mark.parametrize("name", ["v_fma_f32", "v_fma_legacy_f32", "v_mad_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32"])
 @pytest.mark.parametrize("abs_,neg,omod,clamp", [(0, 0, 0, 0), (5, 3, 2, 1)])
 def test_vop3_float_modifiers(name, abs_, neg, omod, clamp, monkeypatch):
     data = program(vop1("v_mov_b32", 1, LITERAL), 0x3f400000,

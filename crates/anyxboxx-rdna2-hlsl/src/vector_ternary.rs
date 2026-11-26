@@ -4,7 +4,10 @@ use anyxboxx_rdna2_ref::vop3::Fields;
 
 pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, String> {
     let f = Fields::new(word);
-    let is_float = matches!(name, "v_fma_f32" | "v_mad_f32" | "v_fma_legacy_f32");
+    let is_float = matches!(
+        name,
+        "v_fma_f32" | "v_mad_f32" | "v_fma_legacy_f32" | "v_min3_f32" | "v_max3_f32" | "v_med3_f32"
+    );
     if !is_float
         && (!matches!(
             name,
@@ -56,6 +59,11 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
     };
     let (a, b, c) = (modify(a?, 0), modify(b?, 1), modify(c?, 2));
     let mut expression = match name {
+        "v_min3_f32" => format!("asuint(min(min(asfloat({a}), asfloat({b})), asfloat({c})))"),
+        "v_max3_f32" => format!("asuint(max(max(asfloat({a}), asfloat({b})), asfloat({c})))"),
+        "v_med3_f32" => format!(
+            "asuint(max(min(asfloat({a}), asfloat({b})), min(max(asfloat({a}), asfloat({b})), asfloat({c}))))"
+        ),
         "v_fma_f32" => format!("FmaF32({a}, {b}, {c})"),
         "v_fma_legacy_f32" => format!("FmaLegacyF32({a}, {b}, {c})"),
         "v_mad_f32" => format!("asuint(mad(asfloat({a}), asfloat({b}), asfloat({c})))"),
