@@ -2429,8 +2429,8 @@ impl Deferred {
     fn readback_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.backs
             .iter()
-            .map(|&(_, at, layout)| {
-                let start = at + layout.title_start;
+            .map(|(_, at, layout)| {
+                let start = *at + layout.title_start;
                 (start, start + layout.title_span())
             })
             .chain(self.texture_backs.iter().map(crate::texback::Back::range))
@@ -4008,7 +4008,20 @@ mod late_tests {
             upload_bytes.write_bytes(0x5a, 512);
             producer.list.CopyBufferRegion(&readback, 0, &upload, 0, 512);
         }
-        producer.defer_read_back(readback, title.as_mut_ptr(), [16, 2, 32]);
+        producer.defer_read_back(
+            readback,
+            title.as_mut_ptr(),
+            crate::resource::ReadbackRows {
+                row_bytes: 16,
+                rows: 2,
+                depth: 1,
+                slice_rows: 2,
+                host_pitch: 256,
+                title_pitch: 32,
+                host_start: 0,
+                title_start: 0,
+            },
+        );
         producer.close();
 
         let (submitted, sent) = host.submit(&[&producer], &[], true).ahead.unwrap();
