@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VICTORY = ROOT / "third_party" / "victory"
 SETTINGS = ROOT / "crates" / "anyxboxx" / "src" / "run" / "settings.rs"
-GOLDEN = ROOT / "tests" / "fixtures" / "lancer_victory_neptune.ps1"
-# The tuned set of main's script (Neptune base), read from its golden copy.
+GOLDEN = ROOT / "tests" / "fixtures" / "lancer_victory_vicetay.ps1"
+# The tuned set of the launcher script (Vice-Tay base, -Machine 4070), read from its golden copy.
 TUNED = tuple(re.findall(r"(VICTORY_[A-Z0-9_]+)\s*=\s*'",
                          GOLDEN.read_text(encoding="utf-8").split("$tuned = [ordered]@{")[1].split("\n    }")[0]))
 # Absent from VIctory's code at the pinned commit: setting them changes nothing.
@@ -54,11 +54,14 @@ def test_the_tuned_settings_are_the_measured_ones():
     assert set(re.findall(r'"(VICTORY_[A-Z0-9_]+)"', table)) == set(TUNED)
 
 
-def test_dred_and_xg_are_never_tuned():
-    # DRED and the XG library are opt-in (--dred, --xg-dll). The relay is part of main's golden set
+def test_full_dred_and_xg_are_never_tuned():
+    # Full DRED and the XG library are opt-in (--dred, --xg-dll). The tuned set only has Vice-Tay's
+    # light DRED (lists without markers, part of the measured set). The relay is part of the golden set
     # (VICTORY_RELAY=2), not a switch of ours.
     table = _tuned_table()
-    assert "DRED" not in table and "XG" not in table
+    pairs = re.findall(r'\("(VICTORY_[A-Z0-9_]+)", "([^"]*)"\)', table)
+    assert [v for k, v in pairs if "DRED" in k] == ["light"]
+    assert "XG" not in table
     assert ("VICTORY_RELAY", "2") in re.findall(r'\("(VICTORY_[A-Z0-9_]+)", "([^"]*)"\)', table)
 
 
