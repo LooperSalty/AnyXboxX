@@ -12,6 +12,13 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
             | "v_lshl_or_b32"
             | "v_and_or_b32"
             | "v_or3_b32"
+            | "v_bfe_u32"
+            | "v_bfe_i32"
+            | "v_bfi_b32"
+            | "v_bfm_b32"
+            | "v_alignbit_b32"
+            | "v_alignbyte_b32"
+            | "v_perm_b32"
     ) || f.clamp
     {
         return Err(format!("untranslated instruction: {name}"));
@@ -32,6 +39,13 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         "v_lshl_or_b32" => format!("(({a} << ({b} & 31u)) | {c})"),
         "v_and_or_b32" => format!("(({a} & {b}) | {c})"),
         "v_or3_b32" => format!("({a} | {b} | {c})"),
+        "v_bfe_u32" => format!("(({a} >> ({b} & 31u)) & ((1u << ({c} & 31u)) - 1u))"),
+        "v_bfe_i32" => format!("BfeI32({a}, {b}, {c})"),
+        "v_bfi_b32" => format!("(({a} & {b}) | (~{a} & {c}))"),
+        "v_bfm_b32" => format!("(((1u << ({a} & 31u)) - 1u) << ({b} & 31u))"),
+        "v_alignbit_b32" => format!("AlignBit({a}, {b}, {c})"),
+        "v_alignbyte_b32" => format!("AlignBit({a}, {b}, ({c} & 3u) * 8u)"),
+        "v_perm_b32" => format!("PermB32({a}, {b}, {c})"),
         _ => unreachable!(),
     };
     Ok(format!(
