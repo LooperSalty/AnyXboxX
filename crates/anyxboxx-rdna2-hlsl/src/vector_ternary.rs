@@ -4,6 +4,40 @@ use anyxboxx_rdna2_ref::vop3::Fields;
 
 pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, String> {
     let f = Fields::new(word);
+    if matches!(
+        name,
+        "v_readlane_b32" | "v_readfirstlane_b32" | "v_writelane_b32"
+    ) {
+        if (name == "v_writelane_b32" && f.sources[0] >= 256)
+            || (name != "v_readfirstlane_b32" && f.sources[1] >= 256)
+        {
+            return Err(format!(
+                "untranslated instruction: {name}: scalar operand required"
+            ));
+        }
+        let operand = |code| {
+            if code >= 256 {
+                Ok(format!("v[{}]", code - 256))
+            } else {
+                source(code, literal).map_err(|e| format!("{name}: {e}"))
+            }
+        };
+        let a = operand(f.sources[0])?;
+        let b = operand(f.sources[1])?;
+        let _ = operand(f.sources[2])?;
+        let target = if f.vdst == 125 {
+            "s_null".into()
+        } else {
+            format!("s[{}]", f.vdst)
+        };
+        return Ok(match name {
+            "v_readlane_b32" => format!("{target} = ReadLane(lane, {a}, {b});"),
+            "v_readfirstlane_b32" => {
+                format!("{target} = ReadLane(lane, {a}, firstbitlow(s[126] == 0u ? 1u : s[126]));")
+            }
+            _ => format!("if (lane == ({b} & 31u)) v[{}] = {a};", f.vdst),
+        });
+    }
     let is_float = matches!(
         name,
         "v_fma_f32" | "v_mad_f32" | "v_fma_legacy_f32" | "v_min3_f32" | "v_max3_f32" | "v_med3_f32"

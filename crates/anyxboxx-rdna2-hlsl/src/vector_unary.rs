@@ -21,7 +21,7 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
     }
     if name == "v_readfirstlane_b32" {
         return Ok(Some(format!(
-            "s[{d}] = ReadLane(lane, {a}, firstbitlow(s[126]));"
+            "s[{d}] = ReadLane(lane, {a}, firstbitlow(s[126] == 0u ? 1u : s[126]));"
         )));
     }
     if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
