@@ -215,9 +215,10 @@ mod tests {
             value(&env, "VICTORY_GAME_DIR"),
             Some(dir.path().display().to_string())
         );
-        assert!(
-            value(&env, "VICTORY_D3D12_DRED").is_none(),
-            "no DRED by default"
+        assert_eq!(
+            value(&env, "VICTORY_D3D12_DRED").as_deref(),
+            Some("light"),
+            "DRED=light is part of the tuned set"
         );
     }
 
@@ -249,12 +250,12 @@ mod tests {
     fn overridden_keys_lists_only_changed_profile_values() {
         let windows = profile("windows-nvidia");
         let overrides = parse_overrides(
-            "VICTORY_RELAY_OWN_QUEUE=0\nVICTORY_RELAY_OWN_QUEUE=1\nVICTORY_WINDOW_TAILS=1\nVKD3D_CONFIG=x",
+            "VICTORY_RELAY_COPY=0\nVICTORY_RELAY_COPY=1\nVICTORY_THIN=1\nVKD3D_CONFIG=x",
         )
         .expect("valid");
         assert_eq!(
             overridden_keys(&windows, &overrides),
-            vec!["VICTORY_RELAY_OWN_QUEUE"]
+            vec!["VICTORY_RELAY_COPY"]
         );
     }
 
