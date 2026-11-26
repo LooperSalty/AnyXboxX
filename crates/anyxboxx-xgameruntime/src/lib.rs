@@ -43,6 +43,9 @@ mod tables;
 mod user;
 mod user_async;
 
+#[cfg(test)]
+mod parity_tests;
+
 use std::ffi::{c_char, c_void};
 
 use guid::Guid;
