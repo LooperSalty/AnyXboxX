@@ -22,6 +22,19 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
     } else {
         return Err(format!("untranslated instruction: {name}"));
     };
+    if suffix == "f16" {
+        let ah = half_operand(code, &a);
+        let bh = format!("({b} & 0xFFFFu)");
+        let condition = if op == "class" {
+            format!("((({bh}) >> ClassF16({ah})) & 1u) != 0u")
+        } else {
+            float_condition(op, &format!("F16ToF32({ah})"), &format!("F16ToF32({bh})"))
+                .ok_or_else(|| format!("untranslated instruction: {name}"))?
+        };
+        return Ok(format!(
+            "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {target} = Ballot(lane, t); }}"
+        ));
+    }
     if suffix == "f32" {
         let condition = float_condition(op, &a, &b)
             .ok_or_else(|| format!("untranslated instruction: {name}"))?;
@@ -90,4 +103,15 @@ fn float_condition(op: &str, a: &str, b: &str) -> Option<String> {
         "ne" | "neq" => format!("{x} != {y}"),
         _ => return None,
     })
+}
+
+fn half_operand(code: u32, expression: &str) -> String {
+    const INLINE: [u32; 9] = [
+        0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x4400, 0xc400, 0x3118,
+    ];
+    if (240..=248).contains(&code) {
+        format!("0x{:X}u", INLINE[(code - 240) as usize])
+    } else {
+        format!("({expression} & 0xFFFFu)")
+    }
 }

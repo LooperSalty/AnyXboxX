@@ -102,7 +102,7 @@ Constat sur la porteuse TLS : en cdylib `no_std`, son bloc TLS contient exacteme
 - `runtime/gpu_runner` : phase 4.
 - `runtime/third_party/libhttpclient-task` : part avec xgameruntime.
 
-**Port HLSL en cours :** `crates/anyxboxx-rdna2-hlsl` traduit les programmes wave32 sans branchement pour certaines op?rations SOP1/SOP2 32 bits, les comparaisons scalaires, les op?rations ? imm?diat, les mouvements scalaires index?s et les op?rations scalaires 64 bits prises en charge par `rdna2_hlsl_scalar64.py`. Comme dans le compilateur Python, les mouvements index?s dynamiquement hors limites lisent z?ro ou n??crivent rien, tandis que l?interpr?teur les refuse. Les tests de parit? comparent le texte HLSL avec Python et exposent l??tat scalaire pour le comparer ? l?interpr?teur sous WARP. Le contr?le de flux, wave64, les instructions vectorielles, m?moire et graphiques restent ? porter ; les instructions non prises en charge sont refus?es en les nommant.
+**Port HLSL en cours :** `crates/anyxboxx-rdna2-hlsl` traduit les programmes wave32 sans branchement pour certaines opérations scalaires, VOP1 et VOP2, ainsi que les comparaisons VOPC entières (16/32 bits) et flottantes (f16/f32). Comme dans le compilateur Python, les mouvements indexés dynamiquement hors limites lisent zéro ou n’écrivent rien, tandis que l’interpréteur les refuse. Les tests de parité comparent le texte HLSL avec Python et exposent l’état pour le comparer à l’interpréteur sous WARP. Le contrôle de flux, wave64, les autres formes vectorielles, les instructions mémoire et graphiques restent à porter ; les instructions non prises en charge sont refusées en les nommant.
 
 **Encore en Python :**
 
