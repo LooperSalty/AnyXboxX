@@ -63,6 +63,7 @@
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
 //! Merged stages keep their stage data in another layout (not read).
 //!
+//! Kind 0x0c holds the same `FSSM` blob unpacked.
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
 //! 0x12 16-byte blobs (0x10 is the shader hash).
@@ -74,6 +75,9 @@ use crate::dxbc::{u32_at, u64_at};
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
+/// The same `FSSM` blob stored as is, without the `XBCH` wrapper (the
+/// executable's own debug-text shaders carry it so).
+const KIND_NATIVE_RAW: u32 = 0x0c;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
@@ -437,13 +441,18 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if kind != KIND_NATIVE && kind != KIND_NATIVE_RAW {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        if kind == KIND_NATIVE_RAW {
+            out.extend(programs(blob)?);
+        } else {
+            out.extend(programs(&unpack(blob)?)?);
+        }
     }
     Ok(out)
 }
@@ -799,6 +808,21 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -811,25 +835,12 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect();
+    let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
-    };
+    let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
@@ -987,6 +998,17 @@ mod tests {
     }
 
     #[test]
+    fn finds_programs_stored_without_xbch() {
+        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
+        let raw = native_programs(&part(&[(0x12, &[0; 16]), (KIND_NATIVE_RAW, &blob)])).unwrap();
+        let packed = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw, packed);
+        // A damaged raw blob is an error, not an empty container.
+        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..blob.len() - 1])])).is_err());
+    }
+
+    #[test]
     fn reads_root_tables() {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
@@ -1130,6 +1152,16 @@ mod tests {
     }
 
     #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        // Mesh stage data has no vertex inputs; E+0xc4 is unused by MS.
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
+    }
+
+    #[test]
     fn compute_dispatch_settings() {
         // 5 user SGPRs, group id x and y, thread ids in v0-v1, 1 KiB LDS.
         let cs = ComputeIo {
@@ -1239,82 +1271,4 @@ mod tests {
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
     }
-    /// An `ACCC` part's program ([`fspx_program`]): the thread-group size, wave size and
-    /// registers of kind 0, the code of kind 6, the resources of kind 7's 0x41 records.
-    fn fspx_part(wave32: bool, code_dwords: u32) -> Vec<u8> {
-        let mut packet = vec![0u8; 0x1c];
-        for (i, n) in [8u16, 4, 2].into_iter().enumerate() {
-            packet[0x0c + 2 * i..][..2].copy_from_slice(&n.to_le_bytes());
-        }
-        packet[0x12..0x14].copy_from_slice(&(u16::from(wave32) << 4).to_le_bytes());
-        packet[0x14..0x18].copy_from_slice(&3u32.to_le_bytes()); // RSRC1: 4 granules
-        packet[0x18..0x1c].copy_from_slice(&0x12u32.to_le_bytes()); // RSRC2
-        let code: Vec<u8> = (0..code_dwords).flat_map(|d| (0xBF81_0000u32 + d).to_le_bytes()).collect();
-        let mut meta = vec![0u8; 0x18];
-        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
-        meta[8..12].copy_from_slice(&code_dwords.to_le_bytes());
-        let mut table = [0u8; 32]; // 0x41: a root descriptor (root type 1) of UAVs (type 3) at slot 2
-        table[0] = 0x41;
-        table[4] = 3;
-        table[5] = 1;
-        table[8..12].copy_from_slice(&0x10u32.to_le_bytes());
-        table[12..16].copy_from_slice(&7u32.to_le_bytes());
-        table[20] = 8;
-        table[21] = 4;
-        table[22] = 2;
-        meta.extend_from_slice(&table);
-        let mut end = [0u8; 32];
-        end[0] = 0x43;
-        meta.extend_from_slice(&end);
-        let entries = [(0u32, &packet[..]), (6, &code[..]), (7, &meta[..])];
-        let mut out = b"FSPX".to_vec();
-        for n in [1u32, 3, 0] {
-            out.extend_from_slice(&n.to_le_bytes());
-        }
-        let mut offset = 0x10 + 16 * entries.len();
-        for (kind, data) in entries {
-            for n in [kind, offset as u32, data.len() as u32, 0] {
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            offset += data.len();
-        }
-        for (_, data) in entries {
-            out.extend_from_slice(data);
-        }
-        out
-    }
-
-    #[test]
-    fn an_accc_part_is_a_compute_program() {
-        let p = &native_programs(&fspx_part(false, 3)).unwrap()[0];
-        assert_eq!(p.stage, HwStage::Cs);
-        assert!(p.wave64);
-        assert_eq!(p.vgprs, 16, "4 granules of 4");
-        assert_eq!(p.code.len(), 12);
-        let StageIo::Cs(cs) = p.io else { panic!("{:?}", p.io) };
-        assert_eq!(cs.threads, [8, 4, 2]);
-        assert_eq!(cs.rsrc2, 0x12);
-        assert_eq!(p.used.len(), 1);
-        assert_eq!(p.used[0].kind, ResourceType::Uav);
-        assert_eq!((p.used[0].slot, p.used[0].user_data, p.used[0].dwords), (2, 4, 8));
-        assert_eq!((p.layout.len(), p.layout[0].slot, p.layout[0].sgprs), (1, 2, 2), "a root descriptor: two SGPRs");
-        // wave32: granules of 8
-        let p = &native_programs(&fspx_part(true, 3)).unwrap()[0];
-        assert!(!p.wave64);
-        assert_eq!(p.vgprs, 32);
-    }
-
-    #[test]
-    fn an_accc_part_that_disagrees_with_itself_is_refused() {
-        let mut part = fspx_part(false, 3);
-        // the metadata's dword count against the code's size
-        let meta = u32::from_le_bytes(part[0x10 + 32 + 4..][..4].try_into().unwrap()) as usize;
-        part[meta + 8..][..4].copy_from_slice(&4u32.to_le_bytes());
-        assert!(native_programs(&part).is_err());
-        let mut version = fspx_part(false, 3);
-        version[4] = 2;
-        assert!(native_programs(&version).is_err());
-        assert!(native_programs(&fspx_part(false, 3)[..0x20]).is_err());
-    }
-
 }

@@ -27,11 +27,7 @@ fn value(env: &[(String, OsString)], name: &str) -> Option<OsString> {
 }
 
 /// Always set, before the tuned set: the script sets these two first.
-const HEAD: [&str; 3] = [
-    "VICTORY_GAME_DIR",
-    "VICTORY_DISCORD",
-    "VICTORY_OCEAN_READBACK",
-];
+const HEAD: [&str; 2] = ["VICTORY_GAME_DIR", "VICTORY_DISCORD"];
 
 #[test]
 fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
@@ -47,21 +43,19 @@ fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
             .all(|(k, v)| value(&env, k) == Some(OsString::from(v)))
     );
     assert_eq!(value(&env, "VICTORY_DISCORD"), Some(OsString::from("0")));
-    assert_eq!(
-        value(&env, "VICTORY_OCEAN_READBACK"),
-        Some(OsString::from("1"))
-    );
+    assert_eq!(value(&env, "VICTORY_OCEAN_READBACK"), None);
     let env = settings::base(&parse(&["--game-dir", "G", "--no-tuned-settings"]));
     assert_eq!(names(&env), HEAD);
 }
 
 #[test]
-fn the_tuned_set_is_neptune_s_measured_set() {
-    // Golden copy: tests/fixtures/lancer_victory_neptune.ps1 (checked in tests/test_anyxboxx_run.py).
-    assert_eq!(TUNED.len(), 46);
-    assert!(TUNED.contains(&("VICTORY_HEAP_PASS_DIRTY", "1")));
-    assert!(TUNED.contains(&("VICTORY_CARD_WINDOWS_MB", "1536")));
+fn the_tuned_set_is_vice_tay_s_4070_set() {
+    // Golden copy: tests/fixtures/lancer_victory_vicetay.ps1 (checked in tests/test_anyxboxx_run.py).
+    assert_eq!(TUNED.len(), 26);
+    assert!(TUNED.contains(&("VICTORY_CARD_WINDOWS_MB", "1024")));
+    assert!(TUNED.contains(&("VICTORY_CARD_BUFFERS_MB", "1536")));
     assert!(TUNED.contains(&("VICTORY_RELAY", "2")));
+    assert!(TUNED.contains(&("VICTORY_D3D12_DRED", "light")));
 }
 
 #[test]
@@ -105,12 +99,32 @@ fn overrides_must_be_victory_variables_in_key_value_form() {
 }
 
 #[test]
-fn the_relay_and_dred_are_never_in_the_tuned_table() {
-    // Relay is set by Neptune's tuned set itself (VICTORY_RELAY=2); DRED and XG stay opt-in.
+fn the_tuned_table_has_dred_light_and_no_xg() {
+    // DRED=light is part of the measured set; the full mode and XG stay opt-in.
     assert!(
         TUNED
             .iter()
-            .all(|(k, _)| !k.contains("DRED") && !k.contains("XG"))
+            .all(|(k, v)| (!k.contains("DRED") || *v == "light") && !k.contains("XG"))
+    );
+}
+
+#[test]
+fn dred_asked_for_wins_over_the_tuned_light_value() {
+    let env = settings::base(&parse(&["--game-dir", "G", "--dred"]));
+    assert_eq!(value(&env, "VICTORY_D3D12_DRED"), Some(OsString::from("1")));
+    let tuned_at = env
+        .iter()
+        .position(|(k, _)| k == "VICTORY_D3D12_DRED")
+        .unwrap();
+    let dred_at = env
+        .iter()
+        .rposition(|(k, _)| k == "VICTORY_D3D12_DRED")
+        .unwrap();
+    assert!(tuned_at < dred_at);
+    let env = settings::base(&parse(&["--game-dir", "G"]));
+    assert_eq!(
+        value(&env, "VICTORY_D3D12_DRED"),
+        Some(OsString::from("light"))
     );
 }
 
