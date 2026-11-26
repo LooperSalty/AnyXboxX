@@ -14,6 +14,10 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
     let b = format!("v[{}]", (word >> 9) & 0xff);
     let d = (word >> 17) & 0xff;
     let expression = match name {
+        "v_mul_legacy_f32" => format!("MulLegacyF32({a}, {b})"),
+        "v_fmac_f32" => format!("FmaF32({a}, {b}, v[{d}])"),
+        "v_fmac_legacy_f32" => format!("FmaLegacyF32({a}, {b}, v[{d}])"),
+        "v_mac_f32" => format!("asuint(mad(asfloat({a}), asfloat({b}), asfloat(v[{d}])))"),
         "v_cndmask_b32" => format!("(((s[106] >> lane) & 1u) != 0 ? {b} : {a})"),
         "v_add_nc_u32" => format!("({a} + {b})"),
         "v_sub_nc_u32" => format!("({a} - {b})"),
