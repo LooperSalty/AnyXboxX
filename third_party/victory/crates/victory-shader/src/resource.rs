@@ -138,6 +138,10 @@ pub struct RootIndexedView {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
+    /// Scalar values saved to a constant VGPR lane and restored within one block, even if
+    /// that VGPR is also used in ordinary vector operations. Filled only with
+    /// `VICTORY_WAVE32_NVIDIA=1` ([`crate::emit::nvidia`]); empty otherwise.
+    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
@@ -227,6 +231,11 @@ pub fn track(
         t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            if crate::emit::nvidia::enabled()
+                && let Some(value) = t.restored(inst, Some(b))
+            {
+                out.restored_lanes.insert(site, value);
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -514,7 +523,7 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| self.restored(inst, None)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -1169,6 +1178,9 @@ impl<'a> Tracer<'a> {
             return Ok(Source::Constant(consts));
         }
         if let Some(source) = self.loaded(words) {
+            return Ok(source);
+        }
+        if let Some(source) = self.made_raw(words) {
             return Ok(source);
         }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
@@ -2088,6 +2100,50 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// A loaded buffer descriptor the code made raw. AMD's compiler (the
+    /// console upscaler library's passes, [`crate::accc`]) clears the stride
+    /// of dword 1 (`s_and_b32 .., 0xc000ffff`), multiplies dword 2's record
+    /// count by the stride it had, at least 1 (`s_bfe_u32 .., 0xe0010`,
+    /// `s_max_u32 .., 1`, `s_mul_i32`), and sets dword 3's out-of-bounds
+    /// mode to bytes (`s_and_b32 .., 0xcfffffff`, `s_or_b32 ..,
+    /// 0x30000000`): the same memory and bounds, by bytes, as the view the
+    /// host binds for the descriptor loaded, which it reads by bytes too.
+    // shortcut: an access that indexed such a descriptor by records (`idxen`,
+    // stride 0 on the console) would get the view's stride on the host; the
+    // upscaler's accesses use offsets.
+    fn made_raw(&self, words: &[Term]) -> Option<Source> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        let operand = |v: Value, name: &str, mask: u32| -> Option<Term> {
+            match self.sop2(v, &[name])?.1 {
+                [x, Term::Const(m)] | [Term::Const(m), x] if m == mask => Some(x),
+                _ => None,
+            }
+        };
+        let x1 = operand(w1, "s_and_b32", 0xc000_ffff)?;
+        let Term::Value(o3) = operand(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let x3 = operand(o3, "s_and_b32", 0xcfff_ffff)?;
+        let (_, [a, b]) = self.sop2(w2, &["s_mul_i32"])?;
+        let stride = |t: Term| {
+            let Term::Value(m) = t else { return false };
+            let Some(Term::Value(f)) = operand(m, "s_max_u32", 1) else {
+                return false;
+            };
+            operand(f, "s_bfe_u32", 0x000e_0010) == Some(x1)
+        };
+        let x2 = if stride(b) {
+            a
+        } else if stride(a) {
+            b
+        } else {
+            return None;
+        };
+        self.loaded(&[w0, x1, x2, x3])
+    }
+
     /// A descriptor the code keeps per lane: every dword of `words` is the
     /// first lane (`v_readfirstlane_b32`) of a VGPR that `v_mov_b32` filled
     /// from SGPRs. The console compiler does this to a descriptor loaded on
@@ -2245,41 +2301,73 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
+}
+
+/// A lane read or write with no modifier: the whole dword, as it is.
+fn plain_lane(v: &crate::gfx10::Valu) -> bool {
+    v.abs == 0
+        && v.neg == 0
+        && v.opsel == 0
+        && !v.clamp
+        && v.omod == 0
+        && v.sdwa.is_none()
+        && v.dpp.is_none()
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    ///
+    /// With `block` (`VICTORY_WAVE32_NVIDIA=1`): only a save in that same block, found
+    /// through plain lane writes of lanes the wave has, whatever else the VGPR is used for.
+    fn restored(&self, inst: &Inst, block: Option<usize>) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        if inst.name() != "v_readlane_b32" || block.is_some() && !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane)?;
+        if block.is_some() && lane >= self.lanes_in_wave() {
+            return None;
+        }
+        self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
     }
 
+    /// The lanes of a console wave of this program.
+    fn lanes_in_wave(&self) -> u32 {
+        if self.p.wave64 { 64 } else { 32 }
+    }
+
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
     /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        block: Option<usize>,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Moved>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            if block.is_some() {
+                return Err(());
+            }
             if seen.contains(&v) {
                 return Ok(None);
             }
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, block, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -2288,18 +2376,26 @@ impl Tracer<'_> {
             }
             return Ok(found);
         }
-        let inst = self.def(v).ok_or(())?;
+        let site = self.defs[v.0 as usize].ok_or(())?;
+        if block.is_some_and(|b| site.0 != b) {
+            return Err(());
+        }
+        let inst = self.inst(site);
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" {
+        if inst.name() != "v_writelane_b32" || block.is_some() && !plain_lane(w) {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        let written = lane_of(*at).ok_or(())?;
+        if block.is_some() && written >= self.lanes_in_wave() {
+            return Err(());
+        }
+        if written != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
@@ -2807,6 +2903,61 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    #[test]
+    fn a_buffer_descriptor_made_raw_is_the_descriptor_loaded() {
+        // AMD's compiler (the console upscaler library) turns a structured
+        // buffer's descriptor into a raw one before reading it by bytes.
+        let r = track_words(
+            &[
+                0xBE8C_0309, // s_mov_b32 s12, s9
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF408_0006,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x9384_FF01,
+                0x000E_0010, // s_bfe_u32 s4, s1, 0xe0010 (the stride)
+                0x8484_8104, // s_max_u32 s4, s4, 1
+                0x8703_FF03,
+                0xCFFF_FFFF, // s_and_b32 s3, s3, 0xcfffffff
+                0x9302_0402, // s_mul_i32 s2, s2, s4
+                0x8803_FF03,
+                0x3000_0000, // s_or_b32 s3, s3, 0x30000000
+                0x8701_FF01,
+                0xC000_FFFF, // s_and_b32 s1, s1, 0xc000ffff
+                0xE030_1000,
+                0x8000_0100, // buffer_load_dword v1, v0, s[0:3], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let Source::Loaded { first: 0, .. } = r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors[0].source);
+        };
+        // A stride kept, or a count not multiplied by it, is another descriptor.
+        let code: Vec<u8> = [
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0006,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8703_FF03,
+            0xCFFF_FFFF, // s_and_b32 s3, s3, 0xcfffffff
+            0x8803_FF03,
+            0x3000_0000, // s_or_b32 s3, s3, 0x30000000
+            0x8701_FF01,
+            0xC000_FFFF, // s_and_b32 s1, s1, 0xc000ffff
+            0xE030_1000,
+            0x8000_0100, // buffer_load_dword v1, v0, s[0:3], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Cs, lanes(&p).as_ref()).is_err());
     }
 
     #[test]
@@ -3859,4 +4010,37 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
     }
+    /// A VGPR with ordinary vector uses still holds a spilled SGPR between its save and its
+    /// restore in one block (an upscaler program parks a descriptor that way): the restore
+    /// is found with `VICTORY_WAVE32_NVIDIA=1` only.
+    #[test]
+    fn a_lane_restored_in_the_block_of_its_save_is_found_only_with_the_switch() {
+        let before = [
+            0x7E00_0281u32, // v_mov_b32 v0, 1
+            0x7E02_0300,    // v_mov_b32 v1, v0
+        ];
+        let park = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+        ];
+        let load = [
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let words = [&before[..], &park, &load].concat();
+        let layout = [param(Table, 9, 1)];
+        let off = crate::emit::nvidia::with(false, || track_words(&words, &layout, HwStage::Ps));
+        assert!(off.restored_lanes.is_empty());
+        let on = crate::emit::nvidia::with(true, || track_words(&words, &layout, HwStage::Ps));
+        // one entry: the read of lane 3, giving the saved SGPR
+        assert_eq!(on.restored_lanes.len(), 1, "{:?}", on.restored_lanes);
+        assert!(matches!(on.restored_lanes.values().next(), Some(Moved::Value(_))));
+        // The tracing of the loads is the one it was
+        assert_eq!(on.scalar, off.scalar);
+    }
+
 }

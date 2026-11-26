@@ -1,0 +1,23 @@
+# RDNA 2 coverage per encoding family, measured by the Python oracle: encodings written with
+# their operands (emu/rdna2_coverage.by_family) and executed (emu/rdna2_exec.executable).
+# Regenerate: python tests/test_rust_traduction_parity.py
+# family disassembled executed total
+DS 154 113 154
+EXP 1 1 1
+FLAT 46 46 46
+GLOBAL 49 49 49
+MIMG 99 57 99
+MTBUF 14 14 14
+MUBUF 61 61 61
+SCRATCH 14 14 14
+SMEM 68 59 68
+SOP1 65 64 65
+SOP2 51 51 51
+SOPC 18 18 18
+SOPK 27 22 27
+SOPP 37 22 37
+VOP1 81 75 81
+VOP2 48 48 48
+VOP3 438 411 438
+VOP3P 29 29 29
+VOPC 190 190 190

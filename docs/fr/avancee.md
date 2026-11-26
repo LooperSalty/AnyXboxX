@@ -4,6 +4,21 @@
 
 Mesures du 21 novembre 2026. Pour les reproduire : `python PrototypeScarlett/scarlett.py --banc <dossier>`.
 
+## Mesures du jeu (VIctory, build Xbox Series 1.0.2.1)
+
+Ce sont les essais qui figuraient autrefois dans l'encadré du README. Les chiffres sont ceux rapportés par le mainteneur à partir des journaux de VIctory, sauf mention « observé » (jugement du mainteneur sur l'image) ou « lu dans le journal » (notre analyse). Chacun vaut pour l'épingle indiquée, qui n'est plus la base actuelle.
+
+- 24 nov., `d279e69` : environ 4 fps ; 13 minutes en prison, puis une perte de périphérique.
+- 24 nov., `7b0f736` avec `VICTORY_RELAY=2` : environ 4,5 fps.
+- 24 nov., réglages du lanceur de la PR #172 sans DRED : environ 5,5 fps. Lot 4 (trois pull requests) avec `VICTORY_RELAY=2` : environ 6,6 fps, scintillement au démarrage corrigé.
+- 24 nov., lot 8 (`d138351`, puis `19feca8`) : 4,8 à 5,4 fps, environ 6 550 dessins par image, shaders du cache d'irradiance traduits. Avec la bibliothèque de disposition des textures de Microsoft (`-XgDll`) : 5,4 à 7,1 fps, contre 5,1 à 5,6 sans.
+- 25 nov., `80d58f8` : 5,3 à 6,9 fps depuis une nouvelle sauvegarde jusqu'au monde, pas de perte de périphérique ; cinématiques complètes (observé).
+- 25 nov., base Neptune (2026-11-25c), Windows 11, RTX 4070 SUPER, i7-13700KF : médiane de 13,8 fps dans le monde, 15,6 à 17 fps sur la dernière minute, 72,5 ms par image. Avec `-Quality` : 7 à 9 fps, 51 à 93 refus de textures contre environ 300.
+- 25 nov., Proton (GE-Proton11-12), Fedora 44, RX 9070 XT : médiane de 3,7 fps sur environ 23 minutes, aucun plantage. Les zones à l'ombre et en intérieur restent noires.
+- 26 nov., matin : médiane de 13,4 fps. 26 nov., après-midi : médiane de 16 à 17 fps sur la même machine, après #358 (copies), #386 (trois options de fxceless, +17 % en test A/B) et #394 (balayage du tas, +7 % et quatre fois moins d'à-coups).
+
+Le goulot est le processeur, pas la carte graphique : ce sont les copies et les relectures qui émulent la mémoire unifiée de la console. Le chantier mémoire unifiée est en cours. Mesuré sans dessin, le seul code du jeu tient 30 fps.
+
 ## Méthode
 
 Le banc charge chaque module PE d'un dossier, lance ses callbacks TLS puis `DllMain(base, DLL_PROCESS_ATTACH, 0)`. Un module est **initialisé** quand `DllMain` renvoie `TRUE`. Le banc ne copie aucun fichier dans le dépôt : seuls les noms des modules et les mesures sont publiés.

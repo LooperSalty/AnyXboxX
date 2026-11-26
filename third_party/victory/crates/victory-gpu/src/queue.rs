@@ -506,6 +506,9 @@ pub(crate) fn release_held(all: bool) {
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
+                        // (Neptune) A signal of the fence carried behind
+                        // merged submissions goes to the card with them now.
+                        crate::host::merge_fence_asked(fence);
                         break;
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
@@ -595,9 +598,10 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                     // Behind what was sent to the card and not waited
-                    // for, if anything was.
+                    // for, if anything was (and behind the submissions held
+                    // back to be merged, which go first or carry it).
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
+                        if !crate::host::merge_signal(fence, value) && !crate::host::late_signal(fence, value) {
                             crate::fence::set(fence as This, value);
                         }
                     }
@@ -616,10 +620,11 @@ pub(crate) fn release_held(all: bool) {
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
 /// submissions sent to the card without a wait (`crate::host::late`), it
-/// will once those in the air have run.
+/// will once those in the air have run (Neptune: or those held back to be
+/// merged, `crate::host::merge_wait`, which may send them first).
 #[cfg(windows)]
 fn value_met(wait: &crate::list::ValueWait) -> bool {
-    wait.met() || (crate::host::late() && crate::host::late_met(wait))
+    wait.met() || (crate::host::late() && (crate::host::merge_wait(wait) || crate::host::late_met(wait)))
 }
 
 fn queue<'a>(this: This) -> &'a Queue {
@@ -810,6 +815,12 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if hold(this, || Held::Signal(fence as usize, value)) {
         return S_OK;
     }
+    // (Neptune) Behind the submissions held back to be merged: they go to
+    // the card first, or carry it.
+    #[cfg(windows)]
+    if crate::host::merge_signal(fence as usize, value) {
+        return S_OK;
+    }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
@@ -925,6 +936,11 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // (cool_fox `e05d463`) Threads sleeping on that word see it now.
+        #[cfg(windows)]
+        if crate::fence::value_wake_on() {
+            crate::fence::wake_word(at.cast());
+        }
     }
 }
 
@@ -1019,6 +1035,10 @@ type Named = Option<(usize, Option<usize>)>;
 fn present_now(named: Named) {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // (Neptune) Title submissions held back to be merged go to the card
+    // before anything of the present.
+    #[cfg(windows)]
+    crate::host::merge_send(crate::merge::Why::Present);
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -1035,6 +1055,9 @@ fn present_now(named: Named) {
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     release_held(forces());
+    // (Neptune) And what that held back to be merged, before the frame goes.
+    #[cfg(windows)]
+    crate::host::merge_send(crate::merge::Why::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -1174,6 +1197,10 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    // (Neptune) The queue's submissions before it saw the mappings as they
+    // were: those held back to be merged are prepared now, before the change.
+    #[cfg(windows)]
+    crate::host::merge_send(crate::merge::Why::Mappings);
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

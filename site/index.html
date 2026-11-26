@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Can it run GTA VI? | AnyXboxX</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Ccircle cx=%228%22 cy=%228%22 r=%227%22 fill=%22%23ff5c8a%22/%3E%3C/svg%3E">
-<meta name="description" content="Can Grand Theft Auto VI (Xbox Series, build 1.0.2.1) run on a PC yet? Status, disk space and a hardware estimate, from AnyXboxX and Leonida.">
+<meta name="description" content="Can Grand Theft Auto VI (Xbox Series, build 1.0.2.1) run on a PC yet? Status and measured performance, from AnyXboxX.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&display=swap" rel="stylesheet">
@@ -46,41 +46,22 @@ h2 { font-weight: 800; font-size: clamp(1.6rem, 3.6vw, 2.3rem); line-height: 1.1
 .lead { max-width: 64ch; color: var(--haze); margin: 0 0 22px; }
 .note { max-width: 72ch; color: var(--haze); font-size: .92rem; margin: 16px 0 0; }
 
-/* Disk space: one bar at scale (30 + 370 = 400) */
-.bar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: var(--violet); }
-.bar span { display: block; }
-.bar .run { background: var(--lagoon); }
-.bar .assets { background: linear-gradient(90deg, var(--flamingo), var(--mango)); }
-.disk { list-style: none; padding: 0; margin: 18px 0 0; display: grid; gap: 18px;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-.disk li { border-left: 4px solid var(--line); padding-left: 14px; }
-.disk li[data-disk="run"] { border-color: var(--lagoon); }
-.disk li[data-disk="assets"] { border-color: var(--flamingo); }
-.disk li[data-disk="full"] { border-color: var(--foam); }
-.disk .gb { font-weight: 800; font-size: 2.2rem; line-height: 1; font-variant-numeric: tabular-nums; }
-.disk .what { font-weight: 600; margin-top: 4px; }
-.disk p { margin: 4px 0 0; color: var(--haze); font-size: .93rem; }
-
-/* Estimator */
-.estimator { display: grid; gap: 28px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: stretch;
-  background: var(--violet); border-radius: 18px; padding: 26px; }
-.estimator label { display: block; font-weight: 600; margin: 14px 0 6px; }
-.estimator label:first-of-type { margin-top: 0; }
-.estimator select, .estimator input[type="text"] { width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--line);
-  background: var(--night); color: var(--foam); font: inherit; }
-.estimator .check { display: flex; gap: 10px; align-items: center; font-weight: 400; }
-.estimator .check input { width: 18px; height: 18px; accent-color: var(--flamingo); }
-.hint { min-height: 1.2em; margin: 4px 0 0; color: var(--haze); font-size: .85rem; }
-.hint.miss { color: var(--no); }
-#detected { list-style: none; padding: 0; margin: 0 0 18px; color: var(--haze); font-size: .92rem; }
-#result { border-radius: 14px; padding: 22px; background: var(--night); }
-#fps { font-weight: 800; font-size: clamp(2.6rem, 6vw, 3.6rem); line-height: 1; color: var(--mango);
-  font-variant-numeric: tabular-nums; }
-#quality { font-weight: 600; font-size: 1.1rem; margin: 10px 0 0; }
-#bottleneck { color: var(--haze); margin: 6px 0 0; }
-#notes { margin: 14px 0 0; padding-left: 18px; color: var(--haze); font-size: .93rem; }
-#notes li { margin: 4px 0; }
-.empty { color: var(--haze); margin: 0; }
+/* Navigation and measured figures */
+.hero-content { position: relative; z-index: 1; width: 100%; max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+.hero-nav { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 24px;
+  padding-top: 22px; }
+.hero-nav .brand { color: var(--foam); font-weight: 800; text-decoration: none; }
+.nav-links { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.nav-links a { color: var(--foam); font-weight: 600; text-decoration: none; }
+.nav-links a:hover { color: var(--mango); }
+.benchmarks { list-style: none; padding: 0; margin: 0; display: grid; gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.benchmarks li { background: var(--violet); border-radius: 14px; padding: 22px; }
+.benchmarks h3 { font-weight: 600; font-size: 1.05rem; margin: 0 0 8px; }
+.metric { font-weight: 800; font-size: clamp(2.4rem, 5vw, 3.2rem); line-height: 1; color: var(--mango);
+  margin: 0 0 12px; font-variant-numeric: tabular-nums; }
+.metric span { font-size: 1rem; font-weight: 600; color: var(--haze); }
+.benchmarks .detail { color: var(--haze); font-size: .95rem; margin: 0; }
 
 /* Status */
 .status { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--line); }
@@ -109,7 +90,6 @@ footer p { max-width: 80ch; margin: 0 0 6px; }
 
 @media (max-width: 760px) {
   .hero::after { background: linear-gradient(to bottom, rgba(29, 15, 51, 0) 30%, rgba(29, 15, 51, .82) 58%, var(--night)); }
-  .estimator { grid-template-columns: 1fr; padding: 18px; }
   .status li { grid-template-columns: 14px minmax(0, 1fr); }
   .status .detail { grid-column: 2; }
 }
@@ -165,94 +145,90 @@ footer p { max-width: 80ch; margin: 0 0 6px; }
         M1500 570c34-50 94-78 156-72-52 16-98 46-134 88zM1498 572c64-16 134 4 180 50-54-26-114-38-174-26z"/>
     </g>
   </svg>
-  <div class="hero-text">
-    <h1>Can it run GTA VI on PC?</h1>
-    <div class="verdict" id="verdict">Not yet.</div>
-    <p>The game's executable (<code>game_scarlett_master.exe</code>) is missing from the package studied, so the game itself has never been started, by AnyXboxX or by Leonida. Once an executable is available, expect at least a few weeks of work before the game is even minimally playable.</p>
-    <p class="build">Grand Theft Auto VI for Xbox Series, build 1.0.2.1. Status checked on <time datetime="2026-11-23">23 November 2026</time>.</p>
+  <div class="hero-content">
+    <nav class="hero-nav" aria-label="Status page">
+      <a class="brand" href="https://github.com/LooperSalty/AnyXboxX">AnyXboxX</a>
+      <div class="nav-links">
+        <a href="#status-title">Status</a>
+        <a href="#perf-title">Performance</a>
+        <a href="#setup-title">Setup</a>
+      </div>
+    </nav>
+    <div class="hero-text">
+      <h1>Can it run GTA VI on PC?</h1>
+      <div class="verdict" id="verdict">It runs.</div>
+      <p>The Xbox Series build (1.0.2.1) starts, plays its cutscenes and reaches the open world on a PC, through VIctory, which AnyXboxX includes. It is still experimental: about 16–17 fps in the world on a high-end PC, with some graphics missing and ray tracing off.</p>
+      <p class="build">Grand Theft Auto VI for Xbox Series, build 1.0.2.1 · Status as of <time datetime="2026-11-26">26 November 2026</time></p>
+    </div>
   </div>
 </header>
 
 <main>
-  <section aria-labelledby="disk-title">
-    <h2 id="disk-title">Disk space to plan for</h2>
-    <p class="lead">These are work files, on top of the game package itself, which the runtime reads in place. Work folders can go on another drive.</p>
-    <div class="bar" role="img" aria-label="400 GB in total: 30 GB to run the game, 370 GB for the optional asset export">
-      <span class="run" style="width: 7.5%"></span><span class="assets" style="width: 92.5%"></span>
-    </div>
-    <ul class="disk">
-      <li data-disk="run" data-gb="30"><div class="gb">~30 GB</div><div class="what">To run the game</div>
-        <p>Leonida's <code>check</code>, <code>shaders</code> and <code>runtime</code> stages.</p></li>
-      <li data-disk="assets" data-gb="370"><div class="gb">~370 GB</div><div class="what">Asset export, optional</div>
-        <p>Only for the asset tools (models, textures, audio). Not needed to play.</p></li>
-      <li data-disk="full" data-gb="400"><div class="gb">~400 GB</div><div class="what">Full build</div>
-        <p>All stages. Sizes as Windows Explorer shows them (GiB): 400 GiB is about 430 GB.</p></li>
-    </ul>
-    <p class="note">Source: the prerequisites in Leonida's README.</p>
-  </section>
-
-  <section aria-labelledby="pc-title">
-    <h2 id="pc-title">Will my PC run it?</h2>
-    <p class="lead">An estimate from your graphics card, processor and memory. Your browser fills in what it can; correct anything it got wrong.</p>
-    <div class="estimator">
-      <div>
-        <ul id="detected"><li>Detecting your hardware…</li></ul>
-        <label for="gpu">Graphics card</label>
-        <input id="gpu" type="text" list="gpu-list" autocomplete="off" spellcheck="false" placeholder="Type to search, for example 4070 or 6700 XT">
-        <datalist id="gpu-list"></datalist><p class="hint" id="gpu-hint"></p>
-        <label class="check"><input type="checkbox" id="laptop"> Laptop version of this card</label>
-        <label for="cpu">Processor</label>
-        <input id="cpu" type="text" list="cpu-list" autocomplete="off" spellcheck="false" placeholder="Type to search, for example 13700K or 7800X3D">
-        <datalist id="cpu-list"></datalist><p class="hint" id="cpu-hint"></p>
-        <label for="ram">Memory (RAM)</label><select id="ram"></select>
-      </div>
-      <div id="result" aria-live="polite">
-        <p class="empty" id="empty">Type your graphics card to see an estimate.</p>
-        <div id="answer" hidden>
-          <div id="fps"></div>
-          <p id="quality"></p>
-          <p id="bottleneck"></p>
-          <ul id="notes"></ul>
-        </div>
-      </div>
-    </div>
-    <p class="note"><b>This is a guess, not a measurement</b>: the game does not run yet. It compares your parts to the Xbox Series X (graphics and processor indexes from public benchmarks, about ±20 %), assumes the console version runs at 30 fps and that translation costs 20 to 60 % more. Real numbers will replace it once the game boots. Detection happens in your browser; nothing is sent anywhere.</p>
-  </section>
-
   <section aria-labelledby="status-title">
     <h2 id="status-title">Where things stand</h2>
     <ul class="status">
-      <li class="no"><span class="dot"></span><b>Game executable</b><span class="detail"><span class="state">Missing.</span>Nothing can boot without it.</span></li>
-      <li class="no"><span class="dot"></span><b>Booting, story mode</b><span class="detail"><span class="state">No.</span>Waits for the executable.</span></li>
-      <li class="ok"><span class="dot"></span><b>GPU shaders</b><span class="detail"><span class="state">Done.</span>All 26,503 of the game's shaders translate from RDNA 2 to SPIR-V and pass <code>spirv-val</code> (Leonida).</span></li>
-      <li class="ok"><span class="dot"></span><b>Models, textures, audio</b><span class="detail"><span class="state">Exported.</span>Read from the player's own copy (Leonida); some texture formats are still partial.</span></li>
-      <li class="wip"><span class="dot"></span><b>Xbox Direct3D 12 to Vulkan</b><span class="detail"><span class="state">In progress.</span>Device, queues and resources work; ray tracing is under way (Leonida).</span></li>
-      <li class="wip"><span class="dot"></span><b>Console system functions</b><span class="detail"><span class="state">In progress.</span>AnyXboxX has written 210 of the 396 GDK functions; Leonida has its own. The two projects share their work.</span></li>
+      <li class="ok"><span class="dot" aria-hidden="true"></span><b>Boot and menus</b>
+        <span class="detail"><span class="state">Observed.</span> The profile screen, first-run settings and pause menu work.</span></li>
+      <li class="ok"><span class="dot" aria-hidden="true"></span><b>Cutscenes and open world</b>
+        <span class="detail"><span class="state">Observed.</span> The cutscenes play in full and the player moves through the world.</span></li>
+      <li class="wip"><span class="dot" aria-hidden="true"></span><b>Frame rate</b>
+        <span class="detail"><span class="state">In progress.</span> The processor is the bottleneck: it emulates the console's unified memory, through copies and read-backs.</span></li>
+      <li class="wip"><span class="dot" aria-hidden="true"></span><b>Graphics</b>
+        <span class="detail"><span class="state">In progress.</span> Ray tracing is off, so indoor and shadowed areas are dark. Some graphics are missing, and objects can turn black briefly while textures stream in.</span></li>
+      <li class="wip"><span class="dot" aria-hidden="true"></span><b>Linux with Proton</b>
+        <span class="detail"><span class="state">Experimental.</span> A 23-minute run reached Chapter 1 on Fedora 44 with a Radeon RX 9070 XT and a patched GE-Proton11-12.
+          <a href="https://github.com/LooperSalty/AnyXboxX/blob/main/docs/running-gta6.md#on-linux-proton-amd">Linux notes</a></span></li>
     </ul>
+    <p class="note">The measurements of each earlier build are listed in <a href="https://github.com/LooperSalty/AnyXboxX/blob/main/docs/progress.md">docs/progress.md</a>.</p>
   </section>
 
-  <section aria-labelledby="needs-title">
-    <h2 id="needs-title">What you will need, once it works</h2>
-    <ul class="needs">
-      <li>Your own copy of the Xbox Series package, version 1.0.2.1. Nothing here provides it or explains how to get it.</li>
-      <li>Windows 10 or 11, 64-bit, and a graphics card with Vulkan.</li>
-      <li>The disk space above.</li>
+  <section aria-labelledby="perf-title">
+    <h2 id="perf-title">Measured performance</h2>
+    <p class="lead">Measured by the maintainer on 26 November 2026 with Windows 11, a Core i7-13700KF, a GeForce RTX 4070 SUPER and 32 GB of RAM, in Series X mode with a warmed shader cache.</p>
+    <ul class="benchmarks">
+      <li>
+        <h3>Median in the world</h3>
+        <p class="metric">16–17 <span>fps</span></p>
+        <p class="detail">Up from 13.4 fps on the morning of 26 November, after three pull requests on the copies and the memory scan (#358, #386, #394).</p>
+      </li>
+      <li>
+        <h3>Picture-first mode</h3>
+        <p class="metric">7–9 <span>fps</span></p>
+        <p class="detail">The launcher's Quality preset: better lighting and textures, fewer texture refusals, lower frame rate (measured on 25 November).</p>
+      </li>
+      <li>
+        <h3>Memory in play</h3>
+        <p class="metric">28–30 <span>GB</span></p>
+        <p class="detail">Used by the game process. A 12 GB graphics card runs short of texture memory; the launcher has a preset for it.</p>
+      </li>
     </ul>
+    <p class="note">Results vary with hardware and settings.</p>
+  </section>
+
+  <section aria-labelledby="setup-title">
+    <h2 id="setup-title">What you need</h2>
+    <ul class="needs">
+      <li>Your own copy of the Xbox Series package, version 1.0.2.1, with its <code>game_scarlett_master.exe</code>. Nothing here provides it or explains how to get it.</li>
+      <li>Windows 10 or 11, 64-bit, an AVX2 processor, and a Direct3D 12 graphics card with shader model 6.6 and mesh shaders (NVIDIA RTX 20 series or newer, AMD RDNA 2 or newer).</li>
+      <li>32 GB of RAM recommended, and more than 30 GB free on the system drive: the shader cache alone reached about 13 GB in one precompilation run.</li>
+      <li>Rust and the Visual Studio C++ Build Tools, to build VIctory the first time you play.</li>
+    </ul>
+    <p class="note"><a href="https://github.com/LooperSalty/AnyXboxX/blob/main/docs/launcher.md">Read the launcher guide</a> · <a href="https://github.com/LooperSalty/AnyXboxX/blob/main/docs/running-gta6.md">Command-line guide</a></p>
   </section>
 
   <section aria-labelledby="follow-title">
     <h2 id="follow-title">Follow the work</h2>
     <div class="links">
       <a href="https://github.com/LooperSalty/AnyXboxX">AnyXboxX on GitHub</a>
+      <a href="https://github.com/LooperSalty/AnyXboxX/issues">Open issues</a>
+      <a href="https://discord.gg/TcX42vRyPU">Discord</a>
     </div>
-    <p class="note">Leonida, the project this page once tracked, was deleted from GitHub on 2026-11-24.</p>
   </section>
 </main>
 
 <footer>
-  <p>AnyXboxX and Leonida are open-source projects under the GPL 3.0. They contain no game files, keys or executables. The illustration above is original.</p>
+  <p>AnyXboxX is an open-source project under the GPL 3.0. It contains no game files, keys or executables. The illustration above is original.</p>
   <p>Not affiliated with or endorsed by Rockstar Games, Take-Two Interactive or Microsoft. Grand Theft Auto and Xbox are trademarks of their respective owners.</p>
 </footer>
-<script type="module" src="app.js"></script>
 </body>
 </html>

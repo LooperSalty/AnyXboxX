@@ -79,6 +79,130 @@ uint F16Rndne(uint h) {                           // au plus proche pair, en ent
   bool up = r > half || (r == half && ((t >> f) & 1u) != 0u);
   return s | (t + (up ? 1u << f : 0u));           // la retenue passe dans l'exposant
 }
+uint F16Rcp(uint h) {
+  uint s = h & 0x8000u, a = h & 0x7FFFu;
+  if (a > 0x7C00u) return 0x7E00u;
+  if (a == 0u) return s | 0x7C00u;
+  if (a == 0x7C00u) return s;
+  precise float r = 1.0f / asfloat(F16ToF32(h));
+  return F32ToF16(asuint(r));
+}
+uint F16Sqrt(uint h) {
+  uint a = h & 0x7FFFu;
+  if (a > 0x7C00u) return 0x7E00u;
+  if (a == 0u) return h;
+  if ((h & 0x8000u) != 0u) return 0x7E00u;
+  if (a == 0x7C00u) return 0x7C00u;
+  precise float r = sqrt(asfloat(F16ToF32(h)));
+  return F32ToF16(asuint(r));
+}
+uint F16Rsq(uint h) {
+  uint s = h & 0x8000u, a = h & 0x7FFFu;
+  if (a > 0x7C00u) return 0x7E00u;
+  if (a == 0u) return s | 0x7C00u;
+  if (s != 0u) return 0x7E00u;
+  if (a == 0x7C00u) return 0u;
+  precise float r = 1.0f / sqrt(asfloat(F16ToF32(h)));
+  return F32ToF16(asuint(r));
+}
+uint F16Log(uint h) {
+  uint a = h & 0x7FFFu;
+  if (a > 0x7C00u) return 0x7E00u;
+  if (a == 0u) return 0xFC00u;
+  if ((h & 0x8000u) != 0u) return 0x7E00u;
+  if (a == 0x7C00u) return 0x7C00u;
+  if (h == 0x3C00u) return 0u;
+  // Réduction x = 2^e * m avec m ∈ [√0.5, √2] puis polynôme impair en t = (m - 1)/(m + 1) : indépendant de log2() GPU.
+  uint fb = F16ToF32(h);
+  int e = int(fb >> 23) - 127;
+  precise float m = asfloat((fb & 0x007FFFFFu) | 0x3F800000u);
+  if (m > asfloat(0x3FB504F3u)) { m *= 0.5f; e += 1; }
+  precise float t = (m - 1.0f) / (m + 1.0f);
+  precise float t2 = t * t;
+  precise float p = asfloat(0x3DE38E39u);          // 1/9
+  p = p * t2 + asfloat(0x3E124925u);               // 1/7
+  p = p * t2 + asfloat(0x3E4CCCCDu);               // 1/5
+  p = p * t2 + asfloat(0x3EAAAAABu);               // 1/3
+  p = p * t2 + 1.0f;
+  precise float r = float(e) + (t * asfloat(0x4038AA3Bu)) * p;
+  return F32ToF16(asuint(r));
+}
+uint F16Exp(uint h) {
+  uint a = h & 0x7FFFu;
+  if (a > 0x7C00u) return 0x7E00u;
+  if (a == 0u) return 0x3C00u;
+  if (h == 0xFC00u) return 0u;
+  if (h == 0x7C00u) return 0x7C00u;
+  precise float x = asfloat(F16ToF32(h));
+  if (x >= 16.0f) return 0x7C00u;
+  if (x <= -25.0f) return 0u;
+  int n = int(floor(x + 0.5f));
+  precise float f = x - float(n);
+  // ln(2) scindé (13 bits hauts) : f * LN2_HI est exact en f32 pour toute mantisse f16 (11 bits).
+  precise float y_hi = f * asfloat(0x3F317000u);
+  precise float y_lo = f * asfloat(0x3805FDF4u);
+  precise float y = y_hi + y_lo;
+  precise float p = asfloat(0x39500D01u);          // 1/5040
+  p = p * y + asfloat(0x3AB60B61u);                // 1/720
+  p = p * y + asfloat(0x3C088889u);                // 1/120
+  p = p * y + asfloat(0x3D2AAAABu);                // 1/24
+  p = p * y + asfloat(0x3E2AAAABu);                // 1/6
+  p = p * y + 0.5f;
+  precise float rem = y_lo + (y * y) * p;
+  // TwoSum + arrondi à l'impair (comme F16Fma) : évite le double arrondi (ex. 0x11C5 → 0x3C01).
+  precise float s1 = 1.0f + y_hi;
+  precise float t1 = s1 - 1.0f;
+  precise float e1 = (1.0f - (s1 - t1)) + (y_hi - t1);
+  precise float d2 = e1 + rem;
+  precise float s = s1 + d2;
+  precise float t = s - s1;
+  precise float e = (s1 - (s - t)) + (d2 - t);
+  uint r = asuint(s);
+  if (e != 0.0f && (r & 1u) == 0u)
+    r += (e > 0.0f) ? 1u : 0xFFFFFFFFu;
+  precise float scaled = asfloat(r) * asfloat(uint(n + 127) << 23);
+  return F32ToF16(asuint(scaled));
+}
+uint F16Trig(uint h, bool is_cos) {
+  uint a = h & 0x7FFFu;
+  if (a >= 0x7C00u) return 0x7E00u;
+  if (a == 0u) return is_cos ? 0x3C00u : h;
+  precise float x = abs(asfloat(F16ToF32(h)));
+  bool neg = (h & 0x8000u) != 0u && !is_cos;
+  precise float t = x - trunc(x);
+  uint q = uint(floor(t * 4.0f));
+  precise float u = t - float(q) * 0.25f;
+  if (is_cos) q = (q + 1u) & 3u;
+  if (u == 0.0f) {
+    if ((q & 1u) == 0u) return 0u;
+    return ((q == 3u) != neg) ? 0xBC00u : 0x3C00u;
+  }
+  if ((q & 1u) != 0u) u = 0.25f - u;
+  // 2π scindé (11 bits hauts) + série de Taylor sur [0, π/4] : indépendant des approximations sin/cos GPU.
+  precise float val = 0.0f;
+  if (u > 0.125f) {
+    precise float v = 0.25f - u;
+    precise float th = v * asfloat(0x40C90000u) + v * asfloat(0x3AFDAA22u);
+    precise float th2 = th * th;
+    precise float p = asfloat(0x37D00D01u);        // 1/40320
+    p = p * th2 - asfloat(0x3AB60B61u);            // -1/720
+    p = p * th2 + asfloat(0x3D2AAAABu);            // 1/24
+    p = p * th2 - 0.5f;
+    val = 1.0f + th2 * p;
+  } else {
+    precise float th_hi = u * asfloat(0x40C90000u);
+    precise float th_lo = u * asfloat(0x3AFDAA22u);
+    precise float th = th_hi + th_lo;
+    precise float th2 = th * th;
+    precise float p = asfloat(0x3638EF1Du);        // 1/362880
+    p = p * th2 - asfloat(0x39500D01u);            // -1/5040
+    p = p * th2 + asfloat(0x3C088889u);            // 1/120
+    p = p * th2 - asfloat(0x3E2AAAABu);            // -1/6
+    val = th_hi + (th_lo + (th * th2) * p);
+  }
+  uint bits = F32ToF16(asuint(val));
+  return (bits != 0u && ((q >= 2u) != neg)) ? (bits ^ 0x8000u) : bits;
+}
 """
 
 # Expression de chaque opération : {a} {b} {c} sources, {d} moitié basse de vdst avant l'instruction, {k} littéral.
@@ -95,6 +219,10 @@ TEMPLATES = {
     "v_ceil_f16": "F32ToF16(asuint(ceil(asfloat(F16ToF32({a})))))",
     "v_trunc_f16": "F32ToF16(asuint(trunc(asfloat(F16ToF32({a})))))",
     "v_rndne_f16": "F16Rndne({a})",
+    # Transcendantes f16 (ISA RDNA 2, §12.8, VOP1 84-88 et 96-97, p. 147-149).
+    "v_rcp_f16": "F16Rcp({a})", "v_sqrt_f16": "F16Sqrt({a})", "v_rsq_f16": "F16Rsq({a})",
+    "v_log_f16": "F16Log({a})", "v_exp_f16": "F16Exp({a})",
+    "v_sin_f16": "F16Trig({a}, false)", "v_cos_f16": "F16Trig({a}, true)",
 }
 
 

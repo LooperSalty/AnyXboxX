@@ -1,24 +1,22 @@
-"""Site GitHub Pages (site/index.html) : structure et estimation matérielle."""
+"""Site GitHub Pages (site/index.html) : état publié, publié tel quel par .github/workflows/pages.yml."""
 from pathlib import Path
-
-import pytest
 
 RACINE = Path(__file__).resolve().parents[1]
 SITE = RACINE / "site" / "index.html"
 
 
-def test_site_states_the_game_is_not_playable():
+def test_site_states_the_game_runs():
     html = SITE.read_text(encoding="utf-8")
-    assert "Not yet." in html and "game_scarlett_master.exe" in html
-    assert "leonida/progress.html" not in html
+    assert 'id="verdict">It runs.</div>' in html
+    assert "Not yet." not in html and "does not run yet" not in html
 
 
-def test_hardware_estimate_logic_passes_its_node_tests():
-    import shutil
-    import subprocess
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node absent : la logique de site/estimate.js se teste avec node --test")
-    resultat = subprocess.run([node, "--test", str(RACINE / "site" / "estimate.test.mjs")],
-                              capture_output=True, text=True, encoding="utf-8", timeout=120)
-    assert resultat.returncode == 0, resultat.stdout[-2000:] + resultat.stderr[-2000:]
+def test_site_links_to_the_launcher_guide_and_the_measured_figures():
+    html = SITE.read_text(encoding="utf-8")
+    assert "docs/launcher.md" in html
+    assert "16–17" in html and "13.4 fps" in html
+
+
+def test_site_has_no_leftover_estimator_script():
+    assert not (RACINE / "site" / "estimate.js").exists()
+    assert 'src="app.js"' not in SITE.read_text(encoding="utf-8")

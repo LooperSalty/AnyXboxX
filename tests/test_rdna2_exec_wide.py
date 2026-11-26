@@ -160,6 +160,25 @@ def test_fma_rounds_once():
     assert result64(wave, 12) == 0.0                                    # mul puis add : deux arrondis
 
 
+def test_fma_overflow_and_signed_zero():
+    """Overflowing finite FMA returns ±infinity; product overflow cancelled by c stays finite; -0.0 follows IEEE 754."""
+    wave = rdna2_exec.run(program(
+        *mov64(2, dbits(MAX_DOUBLE)), *mov64(4, dbits(-MAX_DOUBLE)),
+        *mov64(6, NEG_ZERO64), *mov64(8, 0),
+        *vop3("v_fma_f64", 10, V + 2, TWO, V + 8),                      # MAX * 2 + 0 → +inf
+        *vop3("v_fma_f64", 12, V + 4, TWO, V + 8),                      # -MAX * 2 + 0 → -inf
+        *vop3("v_fma_f64", 14, V + 2, TWO, V + 4),                      # MAX * 2 - MAX → MAX
+        *vop3("v_fma_f64", 16, V + 6, ONE, V + 6),                      # -0 * 1 + -0 → -0
+        *vop3("v_fma_f64", 18, V + 6, ONE, V + 8),                      # -0 * 1 + +0 → +0
+        *vop3("v_fma_f64", 20, ONE, ONE, ONE, neg=0b001)))              # -1 * 1 + 1 → +0
+    assert result64(wave, 10) == math.inf
+    assert result64(wave, 12) == -math.inf
+    assert result64(wave, 14) == MAX_DOUBLE
+    assert (wave.v[16][0] | wave.v[17][0] << 32) == NEG_ZERO64
+    assert (wave.v[18][0] | wave.v[19][0] << 32) == 0
+    assert (wave.v[20][0] | wave.v[21][0] << 32) == 0
+
+
 def test_binary_double_operations_and_modifiers():
     wave = rdna2_exec.run(program(
         *mov64(2, dbits(0.1)), *mov64(4, dbits(0.2)), *mov64(6, dbits(math.nan)),

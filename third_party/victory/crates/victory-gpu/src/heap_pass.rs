@@ -33,6 +33,45 @@ pub(crate) fn full_pass() -> bool {
     *ON.get_or_init(|| !std::env::var_os("VICTORY_HEAP_PASS_DIRTY").is_some_and(|v| v == "1"))
 }
 
+/// Passes between two scans of all kept slots while `VICTORY_HEAP_SCAN_ALT` asks for the slow scan.
+pub(crate) const ALT_SCAN_EVERY: u64 = 16;
+/// Seconds per phase of `VICTORY_HEAP_SCAN_ALT=alt`.
+const ALT_PHASE_S: u64 = 20;
+
+/// `VICTORY_HEAP_SCAN_ALT`: `1` scans every [`ALT_SCAN_EVERY`] passes all the time; `alt` does so
+/// for twenty seconds, then scans every pass for twenty seconds, in turn (each change said in the
+/// log). Unset or `0`: the scan interval stays `VICTORY_HEAP_SCAN_EVERY` (every pass by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AltMode {
+    Off,
+    Always,
+    Toggle,
+}
+
+pub(crate) fn alt_mode() -> AltMode {
+    static MODE: std::sync::OnceLock<AltMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SCAN_ALT").as_deref() {
+        Ok("1") => AltMode::Always,
+        Ok("alt") => AltMode::Toggle,
+        _ => AltMode::Off,
+    })
+}
+
+/// Whether the slow scan is on `elapsed_secs` after the start, in `mode`.
+pub(crate) fn alt_slow_phase(mode: AltMode, elapsed_secs: u64) -> bool {
+    match mode {
+        AltMode::Off => false,
+        AltMode::Always => true,
+        AltMode::Toggle => (elapsed_secs / ALT_PHASE_S) % 2 == 1,
+    }
+}
+
+/// The interval between two scans: `base` (the configured one) or, in the slow phase, the slower
+/// of `base` and [`ALT_SCAN_EVERY`].
+pub(crate) fn interval_for(base: u64, slow: bool) -> u64 {
+    if slow { base.max(ALT_SCAN_EVERY) } else { base }
+}
+
 /// A slot's record in title memory: the tag and two words
 /// (`descriptor::record_at`).
 pub(crate) type Record = [u32; 3];
@@ -54,7 +93,7 @@ struct Copy<C> {
 }
 
 /// Passes between two scans of all kept slots' raw records in title memory
-/// for past-the-API copies (`VICTORY_HEAP_SCAN_EVERY`, default 16).
+/// for past-the-API copies (`VICTORY_HEAP_SCAN_EVERY`, default 1: every pass).
 pub(crate) fn scan_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -82,6 +121,8 @@ pub(crate) struct Picked<C> {
     full: bool,
     /// Interval for scanning all kept slots for past-the-API record changes.
     scan_every: u64,
+    /// The slow scan of `VICTORY_HEAP_SCAN_ALT` was on at the last pass (logged when it changes).
+    alt_slow: bool,
 }
 
 impl<C: Clone> Picked<C> {
@@ -99,6 +140,7 @@ impl<C: Clone> Picked<C> {
             forgotten: None,
             full,
             scan_every: scan_every.max(1),
+            alt_slow: false,
         }
     }
 
@@ -128,6 +170,7 @@ impl<C: Clone> Picked<C> {
         let pass = self.passes;
         self.passes += 1;
         let forgotten = self.forgotten.replace(Vec::new());
+        let every = self.current_scan_every();
         if self.full {
             if pass.is_multiple_of(ORPHANS_EVERY) {
                 self.clear();
@@ -154,7 +197,7 @@ impl<C: Clone> Picked<C> {
                 );
             }
         }
-        if pass.is_multiple_of(self.scan_every) {
+        if pass.is_multiple_of(every) {
             for (&slot, kept) in &self.slots {
                 if record(slot) != Some(kept.record) {
                     due.insert(slot);
@@ -163,13 +206,32 @@ impl<C: Clone> Picked<C> {
         }
         let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
         for (&slot, &seen) in &self.orphans {
-            if orphans_too || (pass.is_multiple_of(self.scan_every) && record(slot) != Some(seen)) {
+            if orphans_too || (pass.is_multiple_of(every) && record(slot) != Some(seen)) {
                 due.insert(slot);
             }
         }
         let mut due: Vec<u32> = due.into_iter().collect();
         due.sort_unstable();
         due
+    }
+
+    /// The scan interval now: the configured one, or the slow one in the slow phase of `VICTORY_HEAP_SCAN_ALT`.
+    fn current_scan_every(&mut self) -> u64 {
+        let mode = alt_mode();
+        if mode == AltMode::Off {
+            return self.scan_every;
+        }
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        let slow = alt_slow_phase(mode, elapsed);
+        if slow != self.alt_slow {
+            self.alt_slow = slow;
+            tracing::info!(
+                "heap scan of every kept slot for past-the-API records (VICTORY_HEAP_SCAN_ALT): {}",
+                if slow { "every 16 passes" } else { "every pass, as before" }
+            );
+        }
+        interval_for(self.scan_every, slow)
     }
 
     fn record_of(&self, slot: u32) -> Option<Record> {
@@ -404,5 +466,23 @@ mod tests {
             let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) { vec![0, 1, 2, 3] } else { vec![2] };
             assert_eq!(due, want, "pass {n}");
         }
+    }
+
+    #[test]
+    fn the_alt_scan_is_slow_only_in_its_slow_phase() {
+        assert!(!alt_slow_phase(AltMode::Off, 0));
+        assert!(!alt_slow_phase(AltMode::Off, 1000));
+        assert!(alt_slow_phase(AltMode::Always, 0));
+        assert!(!alt_slow_phase(AltMode::Toggle, 19));
+        assert!(alt_slow_phase(AltMode::Toggle, 20));
+        assert!(alt_slow_phase(AltMode::Toggle, 39));
+        assert!(!alt_slow_phase(AltMode::Toggle, 40));
+    }
+
+    #[test]
+    fn the_slow_phase_scans_every_16_passes_and_the_default_stays() {
+        assert_eq!(interval_for(1, false), 1);
+        assert_eq!(interval_for(1, true), ALT_SCAN_EVERY);
+        assert_eq!(interval_for(32, true), 32);
     }
 }

@@ -41,6 +41,11 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// (Neptune) A lock to each slot: the recording threads write different slots.
     kept: Vec<Mutex<Option<ID3D12Resource>>>,
+    /// (Neptune) The slots that go on showing an older view of a texture while the newer one
+    /// waits in the queue ([`keep_views`], [`keep_other_views`]), with
+    /// [`kept_views_yield`]: what they hold is given up when the card has no room
+    /// ([`HostHeap::yield_kept_views`]).
+    keeping: Mutex<std::collections::BTreeSet<u32>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -792,6 +797,22 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Format-kind flag for a typed buffer view in the [`SLOT_STRIDES`] table:
+/// `SLOT_TYPED_UINT` for `*_UINT` formats, `SLOT_TYPED_SINT` for `*_SINT`
+/// formats, and `0` for float/normalized/other formats.
+fn typed_int_flag(format: DXGI_FORMAT) -> u32 {
+    match format.0 as u32 {
+        // R32G32B32A32_UINT, R32G32B32_UINT, R16G16B16A16_UINT, R32G32_UINT,
+        // R10G10B10A2_UINT, R8G8B8A8_UINT, R16G16_UINT, R32_UINT, R8G8_UINT,
+        // R16_UINT, R8_UINT
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => victory_shader::emit::SLOT_TYPED_UINT,
+        // R32G32B32A32_SINT, R32G32B32_SINT, R16G16B16A16_SINT, R32G32_SINT,
+        // R8G8B8A8_SINT, R16G16_SINT, R32_SINT, R8G8_SINT, R16_SINT, R8_SINT
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => victory_shader::emit::SLOT_TYPED_SINT,
+        _ => 0,
+    }
+}
+
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
@@ -817,13 +838,19 @@ fn view_stride(view: &View) -> Option<u32> {
             (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
         }
     };
-    Some(if stride > 0 {
+    let bytes = if stride > 0 {
         stride
     } else if raw {
         1
     } else {
         crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
-    })
+    };
+    let flags = if stride == 0 && !raw {
+        typed_int_flag(format)
+    } else {
+        0
+    };
+    Some((bytes & victory_shader::emit::SLOT_STRIDE_MASK) | flags)
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -1040,6 +1067,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             made_too: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            keeping: Mutex::default(),
             next: Mutex::new((0, taken)),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1737,6 +1765,38 @@ impl HostHeap {
             .collect()
     }
 
+    /// (Neptune) The card has no room for the textures the queue waits to make
+    /// ([`kept_views_yield`]): the slots that go on showing an older texture while a newer view
+    /// waits are made null, so that nothing holds what they showed and the sweep can let it go
+    /// (`crate::resource::let_go_idle`); their newer views stay in the queue and are made when
+    /// there is room. Returns how many slots were made null.
+    ///
+    /// Each such slot held the host copy of a texture the title had replaced there; with the
+    /// card full, the newer one was never made, so the older one was never let go: in the world
+    /// of the title this fork works on, some 3 GB of the card stayed "filled idle but held"
+    /// while about 3,500 uploads of the queue were refused.
+    pub(crate) fn yield_kept_views(&self) -> u64 {
+        let slots = std::mem::take(&mut *self.keeping.lock().unwrap_or_else(|e| e.into_inner()));
+        if slots.is_empty() {
+            return 0;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0;
+        for index in slots {
+            if made.get(index as usize).is_some_and(|&key| key != 0) {
+                self.unmake(&mut made, index);
+                n += 1;
+            }
+        }
+        KEPT_YIELDED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        n
+    }
+
+    /// (Neptune) How many slots go on showing an older texture now ([`HostHeap::keeping`]).
+    pub(crate) fn keeping_now(&self) -> usize {
+        self.keeping.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
@@ -2034,6 +2094,18 @@ impl HostHeap {
         }
     }
 
+    /// Writes the element-stride / typed-format metadata dword for host heap
+    /// slot `index` into the GPU-visible [`SLOT_STRIDES`] table.
+    fn write_stride_entry(&self, index: u32, entry: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -2041,6 +2113,7 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        self.write_stride_entry(index, view_stride(view).unwrap_or(0));
         self.keep(index, kept.flatten());
     }
 
@@ -2051,11 +2124,16 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
+        self.write_stride_entry(index, 0);
         self.keep(index, None);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // (Neptune) What it shows now is what it was written with, or nothing.
+        if kept_views_yield() {
+            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+        }
         if let Some(slot) = self.kept.get(index as usize) {
             // A running submission may still read the old resource through
             // this slot.
@@ -2091,6 +2169,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
+        self.write_stride_entry(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2355,6 +2434,9 @@ impl HostHeap {
                 && self.kept.get(index as usize).is_some_and(|k| k.lock().unwrap_or_else(|e| e.into_inner()).is_some());
             if later && keep_views() && (same || other) {
                 if same { &KEPT_VIEWS } else { &KEPT_OTHER_VIEWS }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if kept_views_yield() {
+                    self.keeping.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                }
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
@@ -3340,6 +3422,22 @@ fn keep_views() -> bool {
 /// the start: the slot kept showing the old texture until the new one was made.
 pub(crate) static KEPT_OTHER_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// (Neptune) Slots made null since the start because they showed an older texture while the
+/// card had no room for the newer one ([`HostHeap::yield_kept_views`]).
+pub(crate) static KEPT_YIELDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (Neptune) Slots showing an older texture as of the texture queue's last pass.
+pub(crate) static KEEPING_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (Neptune) Whether a slot that goes on showing an older texture while the newer one waits
+/// ([`keep_views`], [`keep_other_views`]) gives it up when the card has no room for the
+/// newer one (`VICTORY_KEPT_VIEWS_YIELD=1`; off by default: it keeps it until the newer one
+/// is made, which with the card full may be never).
+pub(crate) fn kept_views_yield() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEPT_VIEWS_YIELD").is_some_and(|v| v == "1"))
+}
+
 /// (Neptune) Whether a slot written with a view of another texture keeps showing the one it
 /// showed until the new one is made (`VICTORY_KEEP_OTHER_VIEWS=0`: null at once, as before).
 fn keep_other_views() -> bool {
@@ -3752,6 +3850,43 @@ mod tests {
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
     }
 
+    /// Typed integer buffer views (such as compute_graph_ops's R16G16B16A16_UINT
+    /// and R16_UINT tensor pools) carry SLOT_TYPED_UINT / SLOT_TYPED_SINT in
+    /// their strides-table entry while keeping their byte stride in the low bits.
+    #[test]
+    fn typed_integer_buffer_views_carry_their_format_flag_in_the_strides_table() {
+        use victory_shader::emit::{SLOT_STRIDE_MASK, SLOT_TYPED_SINT, SLOT_TYPED_UINT};
+        let uav_typed = |fmt: u32| View::Unordered(1, 0, Some([fmt, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        let srv_typed = |fmt: u32| View::Shader(1, Some([fmt, 1, 0, 0, 0, 64, 0, 0, 0, 0]));
+
+        // R16G16B16A16_UINT (12): 8-byte elements, UINT flag set.
+        let e = view_stride(&uav_typed(12)).unwrap();
+        assert_eq!(e & SLOT_STRIDE_MASK, 8);
+        assert_eq!(e & (SLOT_TYPED_UINT | SLOT_TYPED_SINT), SLOT_TYPED_UINT);
+
+        // R16_UINT (57): 2-byte elements, UINT flag set (both UAV and SRV).
+        for v in [uav_typed(57), srv_typed(57)] {
+            let e = view_stride(&v).unwrap();
+            assert_eq!(e & SLOT_STRIDE_MASK, 2);
+            assert_eq!(e & (SLOT_TYPED_UINT | SLOT_TYPED_SINT), SLOT_TYPED_UINT);
+        }
+
+        // R16G16B16A16_SINT (14): 8-byte elements, SINT flag set.
+        let e = view_stride(&uav_typed(14)).unwrap();
+        assert_eq!(e & SLOT_STRIDE_MASK, 8);
+        assert_eq!(e & (SLOT_TYPED_UINT | SLOT_TYPED_SINT), SLOT_TYPED_SINT);
+
+        // R16G16B16A16_FLOAT (10) and R16_FLOAT (54): no integer flag.
+        assert_eq!(view_stride(&uav_typed(10)), Some(8));
+        assert_eq!(view_stride(&srv_typed(54)), Some(2));
+
+        // Structured (Format=0, Stride=16) and Raw (Format=39, Flags=1): no integer flag.
+        let structured = View::Unordered(1, 0, Some([0, 1, 0, 0, 64, 16, 0, 0, 0, 0]));
+        let raw = View::Unordered(1, 0, Some([39, 1, 0, 0, 64, 0, 0, 0, 1, 0]));
+        assert_eq!(view_stride(&structured), Some(16));
+        assert_eq!(view_stride(&raw), Some(1));
+    }
+
     /// The queue of textures picked by index serves the slots looked at
     /// before first, then the newest write and the oldest in turns; a
     /// slot whose memory is not there is looked at again after
@@ -4034,6 +4169,30 @@ mod tests {
         assert_eq!(queued(), []);
         host.sweep_part(0..8, handle, 50, true, &mut counts);
         assert_eq!(queued(), [1]);
+    }
+
+    /// (Neptune) With the card full, a slot that goes on showing an older texture while the
+    /// newer one waits gives it up: it is made null and leaves the set. A slot not made is
+    /// not counted, and one outside the set is left as it is.
+    #[test]
+    fn slots_keeping_an_older_texture_give_it_up_for_room() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        {
+            let mut made = heap.made.lock().unwrap();
+            made[2] = 1 << 32 | 5;
+            made[3] = 1 << 32 | 6;
+        }
+        heap.keeping.lock().unwrap().extend([2, 4]);
+        assert_eq!(heap.keeping_now(), 2);
+        assert_eq!(heap.yield_kept_views(), 1);
+        {
+            let made = heap.made.lock().unwrap();
+            assert_eq!((made[2], made[3], made[4]), (0, 1 << 32 | 6, 0));
+        }
+        assert_eq!(heap.keeping_now(), 0);
+        assert_eq!(heap.yield_kept_views(), 0);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

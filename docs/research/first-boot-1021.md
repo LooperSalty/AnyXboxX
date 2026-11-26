@@ -2,10 +2,8 @@
 
 # First boot of the 1.0.2.1 executable: what we measured
 
-Continued the same evening, up to the frame loop, in [leonida-boot-2026-11-23.md](leonida-boot-2026-11-23.md).
-
 State as of 23 November 2026. This note files the research of that day on `game_scarlett_master.exe`
-(build 1.0.2.1) and on the first launches of that executable under Leonida's `gta6rt`. It supersedes the
+(build 1.0.2.1) and on the first launches of that executable under a third-party runtime (since taken down). It supersedes the
 "executable absent" state of [first-executable-leads.md](first-executable-leads.md) (22 November).
 
 **Rules 1 and 2 of [AGENTS.md](../../AGENTS.md) apply.** The note holds only function names, vtable slots,
@@ -32,7 +30,7 @@ the repository.
 | Toolchain | two `.xbld` sections name two GDK editions (April 2025 Update 2 and October 2025); debug path of a Scarlett master build | measured |
 | TLS | two callbacks: the first (acts on `reason == 2` only) and the second (reasons 3 and 0) | measured |
 | Control Flow Guard | `GuardFlags = 0`; the three CFG pointers are initialised in the file to stubs of the image | measured |
-| Package DLLs | `XboxBvhBuilder` (7 imports), `amd_fidelityfx_loader_xbox` (4), `libHttpClient.GDK` (38), `Bink2Scarlett` (23), plus the MSVC runtime copies. Leonida's `make_game.py --check` reports every expected package file present | measured; presence, not authenticity |
+| Package DLLs | `XboxBvhBuilder` (7 imports), `amd_fidelityfx_loader_xbox` (4), `libHttpClient.GDK` (38), `Bink2Scarlett` (23), plus the MSVC runtime copies. The package check of that third-party runtime reports every expected package file present | measured; presence, not authenticity |
 
 The provenance of the package is not authenticated, as in the other notes.
 
@@ -43,14 +41,14 @@ implementation nor a correct ABI.
 
 | Provider | Result | Source |
 | --- | --- | --- |
-| Leonida `gta6rt --dry-run` | shim 52, host Windows 432, package module 72, **unimplemented 31** (code 0) | measured, Codex |
-| Leonida, static table | the same split, with 30 unimplemented: `XMemTransferMemory` is served by the source but reported missing by an older local binary | measured, Claude |
+| Third-party runtime (since taken down), dry run | shim 52, host Windows 432, package module 72, **unimplemented 31** (code 0) | measured, Codex |
+| Same runtime, static table | the same split, with 30 unimplemented: `XMemTransferMemory` is served by the source but reported missing by an older local binary | measured, Claude |
 | AnyXboxX coverage tool | package 209, AnyXboxX 6, TomBox 15, Windows 341, **missing 16** (9 `AcpHal`, 5 `chad`, `DStorageGetFactory`, `XGSuggestSwizzleMode`) | measured, Codex |
 
-The 16 of AnyXboxX and the 31 of Leonida are not comparable: AnyXboxX counts TomBox's DLLs as available
+The 16 of AnyXboxX and the 31 of the third-party runtime are not comparable: AnyXboxX counts TomBox's DLLs as available
 (through `ANYXBOXX_TOMBOX_DIR`) and counts all Windows API sets as served.
 
-Imports with no implementation in Leonida (31):
+Imports with no implementation in the third-party runtime (31):
 
 | DLL | Functions | Status |
 | --- | --- | --- |
@@ -101,24 +99,23 @@ through indirect paths (vtables, callback tables), so "reached from `WinMain`" i
 Other static facts for later: `DStorageGetFactory` is used lazily by a file device .
 It needs the output pointer non-null and HRESULT 0, else `int3`, then calls method at vtable offset `+0x40`
 with `0x2000000` (a staging size: assumed), tested for sign. `GameInput.dll!#1`
-binds to the host's `GameInput.dll`, because Leonida registers its shim under `GameInputCreate`, not `#1`.
+binds to the host's `GameInput.dll`, because the third-party runtime registers its shim under `GameInputCreate`, not `#1`.
 
-## 4. Stops measured under `gta6rt`
+## 4. Stops measured under a third-party runtime
 
-Own copy of the executable, Windows 11, RTX 4070 SUPER, `gta6rt` built from Leonida `main` `1cc6e3c1`, package
-mounted read-only. The first column is the order we met them. Fixes cited are open or closed pull requests of
-[Leonida](https://github.com/ItsNotRexed/Leonida), credited to their authors. "Local stand-in" means a private
-patch, never published, used to find the next stop.
+Own copy of the executable, Windows 11, RTX 4070 SUPER, a third-party runtime (since taken down, so these runs
+cannot be repeated) built from source, package mounted read-only. The first column is the order we met them.
+"Local stand-in" means a private patch, never published, used to find the next stop.
 
-| # | Stop | Cause | Status | Pull request that treats it |
-| --- | --- | --- | --- | --- |
-| 0 | exit code 127 or 3 in under a second, no import called, 12 trace events (maps, `DllMain`, TLS callbacks), no exception traced | an `int3` is not an event in the trace; explained by the later stops | measured; explanation assumed | none: lesson for tooling (section 5) |
-| 1 | `UNIMPLEMENTED d3d12_xs.dll!D3D12ConfigureVirtualMemoryX`, exit 3, called from the memory init of the title | import absent. Same stop on the reference build, 3 runs in `stop` mode and 3 in `log` mode | measured | #6792 by undeadhuman37 (merged 2026-11-23) |
-| 2 | `int3` `0x80000003` in the same init, right after `Configure...` returned `S_OK` | third `XMemVirtualAlloc` of the init (size `0x49400000`, attributes `0x20003000`, `r9 = 0x183`, protection `0x22004`) fails with `ERROR_NOT_SUPPORTED` | measured with a local stand-in that ignores the attribute word and keeps `protect & 0xff` | #6709 by Stalkerino (64 KiB reservation forms), #4531 by labj1987 (2 and 4 MiB pages), #6878 by mrp1no (closed; non-zero attribute word, console protection bits), #6919 by NiiRoZz (open; 2 MiB pages and placeholders). Added in turn on top of #6792, #6709, #4531 and #5253 (maxxgabriel) left the same `int3` (bisect) |
-| 3 | `int3` in the physical-memory allocation wrapper after `XMemAllocatePhysicalPages(rcx = 0x280, ...)` | physical pages not served. A stand-in returning `rcx * 64 KiB` of `VirtualAlloc` gives the same stop; `XMemMapPhysicalPages` is not called before it. The real handle shape is not established | measured; cause assumed | #6919 (the seven missing `xmem` imports); the coordination issue lists #6878 as covering the same ground |
-| 4 | `int3` in the device init: device slot 48 (`CreateCommandQueueX`), second and third queue | queue descriptions `{Type 2, Priority 0, Flags 0x1 / 0x2 / 0x3, NodeMask 0}`. PC accepts only `0x1`, so `0x2` gives `E_INVALIDARG` | measured | routing in #6935 by Kam471 (merged); the `Flags` measurement is our review comment on it; #6954 by Pipodi and #7037 by sneylol (open) |
-| 5 | `int3` in the device init: device slot 73 (`CreateCommandListX`) | `riid = c3827890-4024-474c-98cf-645b51dc4874`, the only GUID of that form in `.rdata`. The PC device answers `E_NOINTERFACE` (`0x80004002`). The same device and DIRECT allocator create the list for the PC IID `c3827890-e548-4cfa-96cf-5689a9370f80` (independent synthetic test, Codex) | measured. That the console IID is the PC `ID3D12GraphicsCommandList6` is assumed: only the first 32 bits match | #7076 by NiiRoZz (open; console list proxy, depends on #6935 and #2490 by NolanCotter). Our #7124 was closed in its favour, measurements added there |
-| 6 | `int3` in the device init: list slot 9 (`+0x48`, `Close` in the PC table) returns a negative HRESULT | right after creation the title calls list slots 132 (`+0x420`) and 131 (`+0x418`), results unused, then slot 9, tested. The PC list has 80 slots, so a raw PC list cannot serve `+0x420`. Meaning of 131 and 132: unknown | measured; nature of the slots not established | none yet; #2490 (console-ABI command lists) is the nearest |
+| # | Stop | Cause | Status |
+| --- | --- | --- | --- |
+| 0 | exit code 127 or 3 in under a second, no import called, 12 trace events (maps, `DllMain`, TLS callbacks), no exception traced | an `int3` is not an event in the trace; explained by the later stops | measured; explanation assumed; lesson for tooling (section 5) |
+| 1 | `UNIMPLEMENTED d3d12_xs.dll!D3D12ConfigureVirtualMemoryX`, exit 3, called from the memory init of the title | import absent. Same stop on the reference build, 3 runs in `stop` mode and 3 in `log` mode | measured |
+| 2 | `int3` `0x80000003` in the same init, right after `Configure...` returned `S_OK` | third `XMemVirtualAlloc` of the init (size `0x49400000`, attributes `0x20003000`, `r9 = 0x183`, protection `0x22004`) fails with `ERROR_NOT_SUPPORTED` | measured with a local stand-in that ignores the attribute word and keeps `protect & 0xff`; third-party patches for this stop, added in turn, left the same `int3` (bisect) |
+| 3 | `int3` in the physical-memory allocation wrapper after `XMemAllocatePhysicalPages(rcx = 0x280, ...)` | physical pages not served. A stand-in returning `rcx * 64 KiB` of `VirtualAlloc` gives the same stop; `XMemMapPhysicalPages` is not called before it. The real handle shape is not established | measured; cause assumed |
+| 4 | `int3` in the device init: device slot 48 (`CreateCommandQueueX`), second and third queue | queue descriptions `{Type 2, Priority 0, Flags 0x1 / 0x2 / 0x3, NodeMask 0}`. PC accepts only `0x1`, so `0x2` gives `E_INVALIDARG` | measured |
+| 5 | `int3` in the device init: device slot 73 (`CreateCommandListX`) | `riid = c3827890-4024-474c-98cf-645b51dc4874`, the only GUID of that form in `.rdata`. The PC device answers `E_NOINTERFACE` (`0x80004002`). The same device and DIRECT allocator create the list for the PC IID `c3827890-e548-4cfa-96cf-5689a9370f80` (independent synthetic test, Codex) | measured. That the console IID is the PC `ID3D12GraphicsCommandList6` is assumed: only the first 32 bits match |
+| 6 | `int3` in the device init: list slot 9 (`+0x48`, `Close` in the PC table) returns a negative HRESULT | right after creation the title calls list slots 132 (`+0x420`) and 131 (`+0x418`), results unused, then slot 9, tested. The PC list has 80 slots, so a raw PC list cannot serve `+0x420`. Meaning of 131 and 132: unknown | measured; nature of the slots not established |
 
 Argument shapes of list slots 132 and 131 (static, Codex). First list: slot 132 `(0x700000, 0, 0, 0xffffffffff00)`,
 slot 131 `(0xc3c0, 0x80020000, 0, 0xffffffffff00)`. Second list, in a loop: slot 132 `(0x100000, 0, 0, 0xffffffffff00)`,
@@ -129,23 +126,23 @@ pointers.
 
 | Prediction | Detail | Status |
 | --- | --- | --- |
-| `XErrorReport` not exported by the shim | `GetProcAddress("XErrorReport")` returning NULL leads to `0x89240101` then `int3` in `WinMain`. At the time of the bisect, #6582 (Kam471, open) had no effect on the stop, so the base already got past it | assumed; the prediction was not reproduced |
+| `XErrorReport` not exported by the shim | `GetProcAddress("XErrorReport")` returning NULL leads to `0x89240101` then `int3` in `WinMain`. At the time of the bisect, adding that export had no effect on the stop, so the base already got past it | assumed; the prediction was not reproduced |
 | `DStorageGetFactory` | an unimplemented thunk leaves the output unset and the title hits `int3` | measured statically; run-time behaviour reported by others (stop 24 below) |
-| `GameInput.dll!#1` | binds to the host DLL, bypassing the SDL3 shim | measured statically |
+| `GameInput.dll!#1` | binds to the host DLL, bypassing the runtime's shim | measured statically |
 
 ### Public measurements by others
 
-KkelebekK (Linux, Wine 11.21, Leonida #6910, 2026-11-23) went further with local stand-ins and numbered their own
+KkelebekK (Linux, Wine 11.21, the same third-party runtime, public report of 2026-11-23, since taken down) went further with local stand-ins and numbered their own
 stops 13 to 26. Their numbering is not ours. We only list what bears on AnyXboxX.
 
 | Their stop | Shape | Relevance |
 | --- | --- | --- |
-| 13 | descriptor heap: console heap description carries the title's address at `+0x10` and a size at `+0x18`; heap slot 9 must return that address (#6915) | heap model |
+| 13 | descriptor heap: console heap description carries the title's address at `+0x10` and a size at `+0x18`; heap slot 9 must return that address | heap model |
 | 16 | device slot 127, the `CreateCommittedResource3` shape, with a barrier layout | device ABI |
 | 19, 20, 21 | device slots 41, 61, 74 and 86 | device ABI |
-| 22 | `XGSuggestSwizzleMode`, then `XGCreateTextureComputer`; the computer's slot 8 is called once per mip. An `E_NOTIMPL` that leaves the output unset makes the title call through garbage (#6891, #7009) | `xg_xs` |
+| 22 | `XGSuggestSwizzleMode`, then `XGCreateTextureComputer`; the computer's slot 8 is called once per mip. An `E_NOTIMPL` that leaves the output unset makes the title call through garbage | `xg_xs` |
 | 23 | `XMemMapPhysicalPagesScatter`, one call of `0x1a40` pages | `xmem` |
-| 24 | DirectStorage opens its queue; #4348 by mariuslozo-boop answers zlib, BCPack and swizzle requests with `E_NOTIMPL` and the run goes on | `XCRDAPI` |
+| 24 | DirectStorage opens its queue; a third-party patch answering zlib, BCPack and swizzle requests with `E_NOTIMPL` lets the run go on | `XCRDAPI` |
 | 26 | device slot 57, once per pipeline, then slot 108 | pipelines |
 
 Static analysis by Codex on slot 57 : `rdx` points at a block
@@ -185,8 +182,8 @@ Order of work, by the measured stops. "Assumed" items need a test before anyone 
 | W3 | **Done, PR #107.** `XMemAlloc(0x60000, 0xf0814000)`: check that the ERA decoder of `runtime/xmem/era_heap.cpp` does not refuse this word ("physical memory refused" returns NULL, which the title treats as an error branch) | static call site | decode of this word assumed |
 | W4 | **Done, PR #107.** `D3D12ConfigureVirtualMemoryX`: the AnyXboxX `d3d12_xs` does not export it (TomBox does, and rejects a NULL description with `E_INVALIDARG`). Test a non-null description whose second 32-bit field derives from a size, expect `S_OK` | stop 1 | measured shape; field meaning assumed |
 | W5 | **Resolved by reusing TomBox (section 6).** **Device slot table.** Compare the slots the title uses before the first `Close` failure (8, 9, 16, 26, 36, 41, 48, 49, 57, 61, 73, 74, 79, 86, 127, and list slots 9, 131, 132) with TomBox's `d3d12_xs` (194 of 200 methods claimed). Output: a table slot, shape, covered or not, in [tombox.md](tombox.md) | sections 3 and 4 | slots measured; TomBox coverage not compared |
-| W6 | **Not done: needs the console list proxy first (Leonida #7076), see section 6.** Console command list: find out what list slots 131 and 132 are, from TomBox's console list ABI, before anyone writes a wrapper. Do not pass a raw PC list to the title | stops 5, 6 | slot meaning unknown |
-| W7 | **Done, this PR: minimal `XCRDAPI.dll`.** **`DStorageGetFactory`** is missing from AnyXboxX and TomBox. A minimal `XCRDAPI.dll` must write the output pointer, return 0, and expose the method at `+0x40` returning a non-negative HRESULT; file reads can answer `E_NOTIMPL` as #4348 does. Leonida's #4348 is GPL-3.0, reusable with credit (rule 2) | static, stop 24 | measured |
+| W6 | **Not done: needs a console list proxy first, see section 6.** Console command list: find out what list slots 131 and 132 are, from TomBox's console list ABI, before anyone writes a wrapper. Do not pass a raw PC list to the title | stops 5, 6 | slot meaning unknown |
+| W7 | **Done, this PR: minimal `XCRDAPI.dll`.** **`DStorageGetFactory`** is missing from AnyXboxX and TomBox. A minimal `XCRDAPI.dll` must write the output pointer, return 0, and expose the method at `+0x40` returning a non-negative HRESULT; file reads can answer `E_NOTIMPL` as the patch of stop 24 does | static, stop 24 | measured |
 | W8 | **Blocked, see section 6.** **`xg_xs`**: `XGSuggestSwizzleMode` is missing. `XGCreateTextureComputer` must hand back an object whose slot 8 exists even if it writes no tiled data, and no stub may leave an output pointer unset. `anyxboxx-texture` (SW_4K_S) is the natural back end | stop 22 (KkelebekK) | measured by others |
 | W9 | **Done, this PR: `tests/test_gdk_boot.py`; return type kept, see section 7.** `xgameruntime`: `XErrorReport` is exported with a `void` return (`runtime/xgameruntime/xgameruntime.def`); the title only tests the pointer, so this looks harmless. Add a launcher test that the six `GetProcAddress` names resolve, that the options bits `2`, `4`, `8` are accepted, and that `xgameruntime.dll` loads by full path when the game executable sits in another folder | steps 6 to 8 | harmless return type assumed |
 | W10 | **Done, this PR: see section 7.** `ConsoleMode`: `runtime/xgameruntime/registry.cpp` serves `0x64`, which converts to 7 and passes the title's test. Keep a test pinning `0x64`, and the `RegOpenKeyW` variant (the title uses it) | step 9 | measured and consistent |
@@ -195,7 +192,7 @@ Order of work, by the measured stops. "Assumed" items need a test before anyone 
 | W13 | **Done, this PR: host dependency documented in [day-one.md](../day-one.md), no shim, see section 7.** `GameInput.dll!#1`: AnyXboxX has no GameInput shim. The title's single caller binds to the host DLL. Choose: serve ordinal 1 from the launcher, or document the host dependency | static | measured; ABI version unchecked |
 | W14 | Audio (`chad` 5, `xapu` 5 from TomBox, `AcpHal` 9): missing, but not established as boot-blocking, since the call chain is indirect. Keep after W1 to W8 | section 2 | assumed |
 | W15 | **Done, this PR: recorded in [day-one.md](../day-one.md), section 3.** Host-only imports: `api-ms-win-core-psm-appnotify-*`, `ext-ms-win-rtcore-ntuser-*`, MFPlat, WS2_32 by ordinal. Native mode depends on a recent Windows host; record this in [day-one.md](../day-one.md) | section 2 | measured on Windows 11 only |
-| W16 | **Not done: no public source, see section 7.** `__XMemAllocationHooks__`: the title exports a data symbol that no source of Leonida reads. If `XMemAlloc*` misbehaves, check whether the console runtime reads it through `GetProcAddress` on the executable | export table | purpose assumed |
+| W16 | **Not done: no public source, see section 7.** `__XMemAllocationHooks__`: the title exports a data symbol that no source of the third-party runtime of section 4 read. If `XMemAlloc*` misbehaves, check whether the console runtime reads it through `GetProcAddress` on the executable | export table | purpose assumed |
 
 W1, W3, W7, W8, W9, W10, W11 and W12 can be done from public documentation and synthetic tests. W5 and W6
 need TomBox's sources only. None of them needs to read the game again.
@@ -210,16 +207,16 @@ need TomBox's sources only. None of them needs to read the game again.
   output, both through TomBox's `xmem` and `XCRDAPI`. Not in TomBox and still ours: `xgameruntime`, `kernelx`,
   `anyxboxx_tls`; and the xmem export `XMemGetAllocationHooks`, which TomBox lacks (no import of it was found in the
   title's static analysis; to propose upstream).
-- **W6.** Not done. Slots 131 and 132 belong to a console command list, which AnyXboxX does not have; the list
-  proxy (Leonida #7076) comes first. When it exists, these slots must log their arguments and return `E_NOTIMPL`
+- **W6.** Not done. Slots 131 and 132 belong to a console command list, which AnyXboxX does not have; a list
+  proxy comes first. When it exists, these slots must log their arguments and return `E_NOTIMPL`
   (the title ignores their results), never 0.
 - **W7.** `runtime/xcrdapi/` builds `XCRDAPI.dll`. `DStorageGetFactory` writes a factory with the console layout
   (slots 0 to 8). Slot 8 (`SetStagingBufferSize`, +0x40) returns `S_OK` and logs the size, which is ignored because no
   staging buffer exists yet: a documented no-op that keeps the title's sign test passing. `CreateQueue`, `OpenFile`,
   `CreateStatusArray` and `SetCpuAffinity` return `E_NOTIMPL` with a null output. File reads are not served yet.
   Tests: `tests/test_xcrdapi.py`.
-- **W8.** Blocked. `XGSuggestSwizzleMode` has no public signature (searched in Leonida, TomBox, the local GDK and
-  public documentation), so no output argument can be written safely. TomBox's `XGCreateTextureComputer`
+- **W8.** Blocked. `XGSuggestSwizzleMode` has no public signature (searched in the third-party runtime of section 4, since
+  taken down, in TomBox, the local GDK and public documentation), so no output argument can be written safely. TomBox's `XGCreateTextureComputer`
   (`crates/compat/xg_xs/src/lib.rs`, lines 372 to 381) returns early for a dimension above 4 and on its error branch
   without writing `*out`. Observed in the source, not measured on the title. The fix belongs upstream, since
   `third_party/` is not edited here.
@@ -302,12 +299,5 @@ need TomBox's sources only. None of them needs to read the game again.
 
 - Static analysis of the executable: Claude (REA 6.10.1, capstone, `.pdata` bounds). Reports, IID scan, targeted
   Ghidra decompilations and the independent `CreateCommandList` test: Codex.
-- Leonida pull requests and coordination: [#6935](https://github.com/ItsNotRexed/Leonida/pull/6935) (Kam471),
-  [#7076](https://github.com/ItsNotRexed/Leonida/pull/7076) (NiiRoZz), #7124 (ours, closed),
-  [#6910](https://github.com/ItsNotRexed/Leonida/issues/6910) and
-  [#7049](https://github.com/ItsNotRexed/Leonida/issues/7049) (coordination, KoertLichtendonk),
-  #6792, #6709, #4531, #6878, #6919, #5253, #6582, #6954, #7037, #4348, #2490.
-- Our comments with the measurements: the review comment of 2026-11-23 on #6935 (queue `Flags`) and the comment
-  on #7076 (command-list IID and list slots), both limited to counts, HRESULTs and the IID.
-- Neighbouring projects in general: [neighbors.md](neighbors.md); Leonida's GTA 6 notes:
-  [leonida-gta6.md](leonida-gta6.md).
+- Stops 13 to 26 of section 4: KkelebekK.
+- Neighbouring projects in general: [neighbors.md](neighbors.md).

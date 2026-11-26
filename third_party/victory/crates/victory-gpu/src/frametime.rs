@@ -279,19 +279,42 @@ fn display_driver_version(gpu: Option<&str>) -> Option<String> {
 
 /// `32.0.16.2124` -> `621.24`: the last five digits of the third and fourth
 /// parts.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn nvidia_driver_number(windows: &str) -> Option<String> {
     let mut parts = windows.split('.');
     let _major = parts.next()?;
     let _minor = parts.next()?;
     let third = parts.next()?;
     let fourth = parts.next()?;
-    let digits: String = format!("{third}{fourth}")
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
-    let tail = digits.get(digits.len().checked_sub(5)?..)?;
-    Some(format!("{}.{}", &tail[..3], &tail[3..]))
+    let mut tail = [0u8; 5];
+    let mut seen = 0usize;
+    for b in third.bytes().chain(fourth.bytes()) {
+        if b.is_ascii_digit() {
+            tail[seen % 5] = b;
+            seen += 1;
+        }
+    }
+    if seen < 5 {
+        return None;
+    }
+    let start = seen % 5;
+    let ordered = [
+        tail[start],
+        tail[(start + 1) % 5],
+        tail[(start + 2) % 5],
+        b'.',
+        tail[(start + 3) % 5],
+        tail[(start + 4) % 5],
+    ];
+    std::str::from_utf8(&ordered).ok().map(str::to_owned)
+}
+
+/// Converts raw interval microsecond totals into `(max_ms, avg_ms, count)`.
+fn summarize_interval(max_us: u64, sum_us: u64, count: u64) -> (f64, f64, u64) {
+    let max = max_us as f64 / 1000.0;
+    let sum = sum_us as f64 / 1000.0;
+    let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+    (max, avg, count)
 }
 
 /// Times one presented frame. Called for every present, before the frame
@@ -304,9 +327,16 @@ pub(crate) fn tick() {
     let now = Instant::now();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(previous) = *last {
-        let micros = now.duration_since(previous).as_micros() as u64;
+        let micros = u64::try_from(now.duration_since(previous).as_micros()).unwrap_or(u64::MAX);
         MAX_US.fetch_max(micros, Ordering::Relaxed);
-        SUM_US.fetch_add(micros, Ordering::Relaxed);
+        let mut cur = SUM_US.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_add(micros);
+            match SUM_US.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
         COUNT.fetch_add(1, Ordering::Relaxed);
     }
     *last = Some(now);
@@ -315,15 +345,10 @@ pub(crate) fn tick() {
 /// The worst and average frame in the interval, in milliseconds, and how
 /// many frames were timed; resets them.
 pub(crate) fn take_interval() -> (f64, f64, u64) {
-    let max = MAX_US.swap(0, Ordering::Relaxed) as f64 / 1000.0;
-    let sum = SUM_US.swap(0, Ordering::Relaxed) as f64 / 1000.0;
+    let max_us = MAX_US.swap(0, Ordering::Relaxed);
+    let sum_us = SUM_US.swap(0, Ordering::Relaxed);
     let count = COUNT.swap(0, Ordering::Relaxed);
-    let avg = if count > 0 {
-        sum / count as f64
-    } else {
-        0.0
-    };
-    (max, avg, count)
+    summarize_interval(max_us, sum_us, count)
 }
 
 /// One summary interval's figures: times per frame in ms, sizes per frame in
@@ -368,17 +393,9 @@ pub(crate) struct Row {
     pub cpu_pct: f64,
 }
 
-/// Appends `r` when the dump is on.
-pub(crate) fn record(r: &Row) {
-    let Some(file) = file() else {
-        return;
-    };
-    let t_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = writeln!(
-        file,
+fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
+    writeln!(
+        out,
         "{t_ms},{frame},{frames:.3},{fps:.3},{ms:.3},{max:.3},{avg:.3},\
          {cpu:.3},{gpu:.3},{gpu_pct:.3},{copies_ms:.3},{copies_mb:.3},\
          {textures_ms:.3},{textures_mb:.3},{copyback_ms:.3},{copyback_mb:.3},\
@@ -423,6 +440,58 @@ pub(crate) fn record(r: &Row) {
         depth_planes = r.depth_planes,
         ram_mb = r.ram_mb,
         cpu_pct = r.cpu_pct,
-    );
+    )
+}
+
+/// Appends `r` when the dump is on.
+pub(crate) fn record(r: &Row) {
+    let Some(file) = file() else {
+        return;
+    };
+    let t_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write_row(&mut *file, t_ms, r);
     let _ = file.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_interval_handles_empty_single_spike_and_large_totals() {
+        assert_eq!(summarize_interval(0, 0, 0), (0.0, 0.0, 0));
+        assert_eq!(summarize_interval(16_667, 16_667, 1), (16.667, 16.667, 1));
+        // 3 frames: 10 ms, 10 ms, 100 ms spike -> max 100 ms, avg 40 ms.
+        let (max_ms, avg_ms, count) = summarize_interval(100_000, 120_000, 3);
+        assert_eq!(count, 3);
+        assert!((max_ms - 100.0).abs() < 1e-9);
+        assert!((avg_ms - 40.0).abs() < 1e-9);
+        // Large values never produce NaN or panic.
+        let (max_big, avg_big, count_big) = summarize_interval(u64::MAX, u64::MAX, 10);
+        assert_eq!(count_big, 10);
+        assert!(max_big.is_finite() && avg_big.is_finite() && max_big >= avg_big);
+    }
+
+    #[test]
+    fn nvidia_driver_number_parses_public_version_and_rejects_short_inputs() {
+        assert_eq!(nvidia_driver_number("32.0.16.2124").as_deref(), Some("621.24"));
+        assert_eq!(nvidia_driver_number("31.0.15.5123").as_deref(), Some("551.23"));
+        assert_eq!(nvidia_driver_number("31.0.5.5123").as_deref(), Some("551.23"));
+        assert_eq!(nvidia_driver_number("31.0.1.23"), None);
+        assert_eq!(nvidia_driver_number("31.0.15"), None);
+        assert_eq!(nvidia_driver_number(""), None);
+    }
+
+    #[test]
+    fn csv_row_matches_header_column_count() {
+        let header_cols = HEADER.trim_end().split(',').count();
+        let mut buf = Vec::new();
+        write_row(&mut buf, 123_456, &Row::default()).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let row_cols = line.trim_end().split(',').count();
+        assert_eq!(row_cols, header_cols);
+    }
 }

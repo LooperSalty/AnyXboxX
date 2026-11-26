@@ -2,7 +2,7 @@
 
 # VIctory, xcl and five-star-recomp: the three neighbours tracked since 24 November
 
-State on 24 November 2026, after the deletion of Leonida. Rule 2 of [AGENTS.md](../../AGENTS.md) applies: only export names, slots, shapes, flags/HRESULT and counts, each labelled "measured"; no addresses, bytes, strings, shader names or hashes, no logs of the game. Overview of the other neighbours: [neighbors.md](neighbors.md).
+State on 24 November 2026. Rule 2 of [AGENTS.md](../../AGENTS.md) applies: only export names, slots, shapes, flags/HRESULT and counts, each labelled "measured"; no addresses, bytes, strings, shader names or hashes, no logs of the game. Overview of the other neighbours: [neighbors.md](neighbors.md).
 
 | Project | Language, licence | What it does |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ Our issues [#68](https://github.com/LooperSalty/AnyXboxX/issues/68) (structured 
 
 ## Integration (2026-11-24)
 
-Our integration was published on the fork [LooperSalty/victory](https://github.com/LooperSalty/victory) and, when this note was written, tracked by this repository as the `third_party/victory` submodule (the hourly neighbours workflow followed the stable branch). VIctory is now copied into the repository under `third_party/victory`; `tools/lancer_victory.ps1` builds and launches it on your own game folder.
+Our integration was published on the fork [LooperSalty/victory](https://github.com/LooperSalty/victory) and, when this note was written, tracked by this repository as the `third_party/victory` submodule (the hourly neighbours workflow followed the stable branch). VIctory is now copied into the repository under `third_party/victory`; `anyxboxx run` builds and launches it on your own game folder.
 
 - Branch `anyxboxx/stable`: VIctory `main` plus the 24 pull requests credited in [THIRD_PARTY.md](../../THIRD_PARTY.md), with local adaptations (conflicts resolved, memory ranges that were already up to date deduplicated, a `VICTORY_CAPPED_DYNAMIC` setting for the dynamic descriptor range on a capped NVIDIA heap). This is the branch we pin.
 - Branch `anyxboxx/essai`: the stable branch plus four more pull requests (#294, #709, #571, #452). **Experimental only**: it still causes GPU hangs.

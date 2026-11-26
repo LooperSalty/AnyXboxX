@@ -1,6 +1,8 @@
 //! (Neptune) Pooled upload memory for transient windows (`VICTORY_CARD_WINDOW_UPLOAD=1`,
 //! `crate::shadow::window_upload`): a window with a card side keeps no CPU side; the pages
-//! that changed are copied into a [`Chunk`] here and sent from it to the card side.
+//! that changed are copied into a [`Chunk`] here and sent from it to the card side. (With
+//! `VICTORY_WINDOW_SKIP_SAME=1` not those that hold what their window last sent:
+//! `crate::shadow::window_skip_same`.)
 //!
 //! A chunk keeps its slab busy until it is dropped. A chunk is dropped when the copy sends it
 //! and its plan is let go (`Host::card_done`, after the submission that copied it has run on
@@ -69,14 +71,28 @@ impl Drop for Chunk {
     }
 }
 
-struct Pool {
-    slabs: Vec<Arc<Slab>>,
-    /// The slab being filled and where.
-    cur: usize,
+struct PooledSlab {
+    slab: Arc<Slab>,
+    /// End of the reserved ranges. A live slab can still append after this point.
     at: u64,
 }
 
-static POOL: Mutex<Pool> = Mutex::new(Pool { slabs: Vec::new(), cur: 0, at: 0 });
+impl PooledSlab {
+    fn fits(&mut self, n: u64) -> bool {
+        if self.slab.live.load(Ordering::Acquire) == 0 {
+            self.at = 0;
+        }
+        self.at + n <= self.slab.size
+    }
+}
+
+struct Pool {
+    slabs: Vec<PooledSlab>,
+    /// The last slab used, tried first for the next chunk.
+    cur: usize,
+}
+
+static POOL: Mutex<Pool> = Mutex::new(Pool { slabs: Vec::new(), cur: 0 });
 /// Bytes of slabs in the pool (peak), of overflow slabs alive (now), allocations that needed one.
 static POOLED: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
@@ -98,28 +114,28 @@ pub(crate) fn alloc(n: u64) -> Option<Chunk> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let pool = &mut *pool;
     if n <= SLAB {
-        // The slab in hand (a slab with no chunk left starts again), then any idle one, then a new one.
-        if pool.slabs.get(pool.cur).is_some_and(|s| s.live.load(Ordering::Acquire) == 0) {
-            pool.at = 0;
+        // Try the current slab, then space left in any earlier slab.
+        let mut slot = if pool.slabs.get_mut(pool.cur).is_some_and(|slab| slab.fits(n)) {
+            Some(pool.cur)
+        } else {
+            pool.slabs.iter_mut().position(|slab| slab.fits(n))
+        };
+        if slot.is_none()
+            && POOLED.load(Ordering::Relaxed) + SLAB <= most()
+            && let Some(slab) = make(SLAB, false)
+        {
+            let total = POOLED.fetch_add(SLAB, Ordering::Relaxed) + SLAB;
+            PEAK.fetch_max(total, Ordering::Relaxed);
+            pool.slabs.push(PooledSlab { slab, at: 0 });
+            slot = Some(pool.slabs.len() - 1);
         }
-        let fits = |pool: &Pool| pool.slabs.get(pool.cur).is_some_and(|s| pool.at + n <= s.size);
-        if !fits(pool) {
-            if let Some(i) = pool.slabs.iter().position(|s| s.live.load(Ordering::Acquire) == 0) {
-                (pool.cur, pool.at) = (i, 0);
-            } else if POOLED.load(Ordering::Relaxed) + SLAB <= most() {
-                if let Some(slab) = make(SLAB, false) {
-                    let total = POOLED.fetch_add(SLAB, Ordering::Relaxed) + SLAB;
-                    PEAK.fetch_max(total, Ordering::Relaxed);
-                    pool.slabs.push(slab);
-                    (pool.cur, pool.at) = (pool.slabs.len() - 1, 0);
-                }
-            }
-        }
-        if fits(pool) {
-            let slab = pool.slabs[pool.cur].clone();
+        if let Some(i) = slot {
+            pool.cur = i;
+            let entry = &mut pool.slabs[i];
+            let slab = entry.slab.clone();
             slab.live.fetch_add(1, Ordering::Relaxed);
-            let offset = pool.at;
-            pool.at += n;
+            let offset = entry.at;
+            entry.at += n;
             return Some(Chunk { slab, offset });
         }
     }
@@ -147,3 +163,6 @@ pub(crate) fn stats() -> [u64; 4] {
         OVERFLOWS.load(Ordering::Relaxed),
     ]
 }
+
+#[cfg(test)]
+mod tests;

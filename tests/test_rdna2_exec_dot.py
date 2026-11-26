@@ -71,13 +71,11 @@ def test_undocumented_modifiers_are_refused_by_name(modifiers, named):
         rdna2_hlsl.translate(code)
 
 
-def test_f16_and_packed_forms_stay_named():
+def test_f16_and_packed_forms_are_handled_outside_integer_dot():
+    from emu import rdna2_exec_dot
     for name in ("v_dot2_f32_f16", "v_pk_add_f16"):
-        assert not rdna2_exec.executable("VOP3P", name)
-        with pytest.raises(rdna2_exec.Untranslated, match=name):
-            run(*vop3p(name, 2, V + 0, V + 0))
-        with pytest.raises(rdna2_hlsl.Untranslatable, match=name):
-            rdna2_hlsl.translate(program(*vop3p(name, 2, V + 0, V + 0)))
+        assert not rdna2_exec_dot.supports(name)
+        assert rdna2_exec.executable("VOP3P", name)
 
 
 def dot_program(lane_offset, store):

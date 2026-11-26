@@ -1,0 +1,18 @@
+[package]
+name = "anyxboxx-tls"
+description = "anyxboxx_tls.dll in Rust, no_std: the TLS carrier that lends the game's TLS template. Port of runtime/tls (C++), same exports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# anyxboxx_tls.dll. The DLL has no dependency and no Rust std: its TLS block must hold the carrier
+# only (see src/tls_image.rs). The pure logic is unit-tested under std (cfg(test)).
+name = "anyxboxx_tls"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "anyxboxx-native-launcher"
+description = "Native mode launcher components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

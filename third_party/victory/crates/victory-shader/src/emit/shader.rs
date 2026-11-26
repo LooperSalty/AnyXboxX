@@ -26,6 +26,22 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Low bits of a [`SLOT_STRIDES`] entry holding the element byte stride.
+pub const SLOT_STRIDE_MASK: u32 = 0x3FFF_FFFF;
+/// High bit of a [`SLOT_STRIDES`] entry: the view at that heap slot is an
+/// unsigned integer (`*_UINT`) typed buffer, so typed loads/stores must use
+/// `TypedBuffer<uint4>` (`bufferLoad.i32`/`bufferStore.i32`) without float
+/// conversion (and without `f32<->f16` conversion for `_d16_` accesses).
+pub const SLOT_TYPED_UINT: u32 = 1 << 31;
+/// Bit 30 of a [`SLOT_STRIDES`] entry: the view at that heap slot is a signed
+/// integer (`*_SINT`) typed buffer (`TypedBuffer<int4>`).
+pub const SLOT_TYPED_SINT: u32 = 1 << 30;
+/// The root SRV `t<SLOT_TYPED>` in [`ROOT_CBV_SPACE`] of a shader that reads
+/// or writes typed buffers (`buffer_load_format_*` / `buffer_store_format_*`):
+/// points to the same [`SLOT_STRIDES`] buffer as [`SLOT_STRIDES`] (for the
+/// [`SLOT_TYPED_UINT`] / [`SLOT_TYPED_SINT`] bits) without asking the host to
+/// prepare every buffer view of the view heap.
+pub const SLOT_TYPED: u8 = 252;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -102,6 +118,7 @@ pub(crate) struct Types {
     pub bind: Ty,
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
+    pub res_ret_i32: Ty,
 }
 
 /// What a mesh shader declares beyond its thread-group size.
@@ -192,6 +209,7 @@ impl Shader {
         let bind = m.named_struct("dx.types.ResBind", vec![i32, i32, i32, i8]);
         let cbuf_ret = m.named_struct("dx.types.CBufRet.i32", vec![i32, i32, i32, i32]);
         let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32, f32, f32, f32, i32]);
+        let res_ret_i32 = m.named_struct("dx.types.ResRet.i32", vec![i32, i32, i32, i32, i32]);
         let main_ty = m.func_ty(void, vec![]);
         m.ptr(main_ty);
         let main = m.function("main", main_ty, None, true);
@@ -208,6 +226,7 @@ impl Shader {
                 bind,
                 cbuf_ret,
                 res_ret,
+                res_ret_i32,
             },
             pixel,
             inputs: Vec::new(),
