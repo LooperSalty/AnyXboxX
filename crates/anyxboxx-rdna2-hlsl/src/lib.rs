@@ -11,6 +11,7 @@ mod scalar_wide;
 mod vector_binary;
 mod vector_compare;
 mod vector_movrel;
+mod vector_ternary;
 mod vector_unary;
 
 const PRELUDE: &str = concat!(
@@ -34,6 +35,19 @@ pub fn translate(data: &[u8]) -> Result<String, String> {
         match name.as_str() {
             "s_nop" => (),
             "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
+            _ if instruction.family == "VOP3" => {
+                let offset = instruction.offset;
+                if offset + instruction.size * 4 > data.len() || instruction.size < 2 {
+                    return Err(format!("truncated instruction: {name}"));
+                }
+                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                let literal = (instruction.size > 2)
+                    .then(|| u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()));
+                let line = vector_ternary::statement(&name, word, literal)?;
+                lines.push_str("  ");
+                lines.push_str(&line);
+                lines.push('\n');
+            }
             _ if instruction.family == "VOPC" => {
                 let offset = instruction.offset;
                 let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
