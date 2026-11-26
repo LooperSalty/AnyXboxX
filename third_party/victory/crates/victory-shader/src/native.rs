@@ -718,7 +718,7 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -807,6 +807,36 @@ mod tests {
             out.extend_from_slice(blob);
         }
         out
+    }
+
+    /// Wave64 CS with 16 VGPRs, four root constants in s0..3, and one raw UAV
+    /// in the descriptor table at s4. All offsets are relative to the FSSM payload.
+    pub(crate) fn wave64_uav_container(code: &[u8]) -> Vec<u8> {
+        let mut blob = fssm(&[(HwStage::Cs, code)]);
+        let stage = stage_data_at(&blob, HwStage::Cs);
+        let record = stage - RECORD_SIZE as usize;
+        blob[record + RECORD_REGS..][..4].copy_from_slice(&16u32.to_le_bytes());
+        blob[stage + CS_RSRC2..][..4].copy_from_slice(&(5u32 << 1).to_le_bytes());
+        blob[stage + CS_THREADS..][..12].copy_from_slice(&[64, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+
+        let layout = (blob.len() - FSSM_HEADER) as u64;
+        for entry in [
+            [0u32, 0, 4, 0, 0],  // root constants, slot 0
+            [3, 0, 1, 0, 0x104], // descriptor table, slot 1, user SGPR 4
+        ] {
+            blob.extend(entry.into_iter().flat_map(u32::to_le_bytes));
+        }
+        let used = (blob.len() - FSSM_HEADER) as u64;
+        blob.extend([3, 3, 0, 0]); // UAV in a table
+        blob.extend([0; 12]); // table offset, lower bound and stride
+        blob.extend([4, 4, 1, 0]); // four descriptor dwords, s4, slot 1
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&layout.to_le_bytes());
+        blob[record + RECORD_USED..][..8].copy_from_slice(&used.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[2, 0, 0, 0, 1, 0, 0, 0]);
+        let dxil = part(&[(KIND_NATIVE, &xbch(&blob))]);
+        crate::dxbc::build(&[(crate::FourCC::DXIL, &dxil)])
     }
 
     #[test]

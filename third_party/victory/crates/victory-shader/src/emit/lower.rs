@@ -4531,6 +4531,13 @@ impl<'a> Lower<'a> {
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
+            // A lane masked by EXEC contributes zero to another lane's swizzle.
+            let x = if let Some(g) = guard {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, g, x, zero)
+            } else {
+                x
+            };
             let lane = self.lane_index();
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
             let src = if offset & 0x8000 != 0 {

@@ -17,6 +17,27 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+mod generated_loops;
+mod generated_swizzles;
+
+/// Run the public translator on a synthetic container with the layout of `native()`.
+fn translate_wave64_uav(code: &[u8]) -> Result<HostShader, ShaderError> {
+    let container = crate::native::tests::wave64_uav_container(code);
+    let before = lower::TEST_HOST_WAVE.replace(Some(32));
+    let selected = super::translate(&container);
+    lower::TEST_HOST_WAVE.set(before);
+    selected
+}
+
+#[test]
+fn wave64_uav_container_preserves_the_test_program_and_bindings() {
+    let program = native(&stores([0, 0, 0, 0]));
+    let bytes = crate::native::tests::wave64_uav_container(&program.code);
+    let container = crate::Container::parse(&bytes).unwrap();
+    let dxil = container.part(crate::FourCC::DXIL).unwrap();
+    assert_eq!(crate::native_programs(dxil.data).unwrap(), [program]);
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.
@@ -1016,6 +1037,35 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
     let Some(got) = run_paired(&shader, [s0, 0, 0, 0], 256) else { return };
     same_as_console(&got, &want);
     eprintln!("ran on the hardware device: permutes, row masks, swizzles and lane writes as on the console");
+}
+
+#[test]
+fn guarded_swizzles_read_zero_from_inactive_lanes() {
+    let mut w = vec![
+        vop2(0x25, 1, k(1), 0), // v1 = lane + 1, always nonzero
+        vop1(0x01, 2, k(42)),
+        vop1(0x01, 3, k(42)),
+        vop2(0x1B, 4, k(1), 0),
+        vopc(0xC2, k(0), 4),
+        sop1(0x24, 12, VCC), // even lanes active
+    ];
+    w.extend(ds(0x35, 2, 1, 0, 0x801B)); // reverse each quad: read an odd lane
+    w.extend(ds(0x35, 3, 1, 0, 0x401F)); // swap 16: read another even lane
+    w.push(sop1(0x04, EXEC, 12));
+    w.extend(stores([1, 2, 3, 4]));
+    let n = native(&w);
+    let p = ir::build(&n.code, true, n.vgprs).unwrap();
+    let shader = lowered(&n, &p, &HashSet::new()).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    let want: Vec<u32> = (0..64)
+        .flat_map(|lane| {
+            let (quad, swap) = if lane & 1 == 0 { (0, (lane ^ 16) + 1) } else { (42, 42) };
+            [lane + 1, quad, swap, lane & 1]
+        })
+        .collect();
+    same_as_console(&got, &want);
+    eprintln!("ran guarded swizzles across both halves");
 }
 
 /// [`program`]'s wave OR inside a per-lane branch, in the paired form: the OR of both halves'
