@@ -11,6 +11,12 @@ from emu.rdna2_hlsl_ops import Untranslatable
 _TABLE = ", ".join(f"0x{value:08X}u" for value in images.UNORM8)
 _COMP = ("x", "y", "z", "w")
 STORE_BARRIER = "AllMemoryBarrierWithGroupSync();"
+_ATOMIC_OP_CODES = {
+    "image_atomic_swap": 0, "image_atomic_cmpswap": 1, "image_atomic_add": 2, "image_atomic_sub": 3,
+    "image_atomic_smin": 4, "image_atomic_umin": 5, "image_atomic_smax": 6, "image_atomic_umax": 7,
+    "image_atomic_and": 8, "image_atomic_or": 9, "image_atomic_xor": 10, "image_atomic_inc": 11,
+    "image_atomic_dec": 12, "image_atomic_fcmpswap": 13, "image_atomic_fmin": 14, "image_atomic_fmax": 15,
+}
 
 HELPERS = f"""
 static const uint UNORM8[256] = {{ {_TABLE} }};
@@ -92,8 +98,15 @@ uint4 ImageTexel(uint4 t, int x, int y) {{
     uint2 v2 = g_memory.Load2(base + pixel * 8u);
     return uint4(v2.x, v2.y, 0u, {images.ONE_BITS:#x}u);
   }}
+  if (format == {images.FORMAT_32_32_UINT}u || format == {images.FORMAT_32_32_SINT}u) {{
+    uint2 v2 = g_memory.Load2(base + pixel * 8u);
+    return uint4(v2.x, v2.y, 0u, 1u);
+  }}
   if (format == {images.FORMAT_32_FLOAT}u) {{
     return uint4(g_memory.Load(base + pixel * 4u), 0u, 0u, {images.ONE_BITS:#x}u);
+  }}
+  if (format == {images.FORMAT_32_UINT}u || format == {images.FORMAT_32_SINT}u) {{
+    return uint4(g_memory.Load(base + pixel * 4u), 0u, 0u, 1u);
   }}
   if (format == {images.FORMAT_8_8_8_8_UNORM}u) {{
     uint w = g_memory.Load(base + pixel * 4u);
@@ -271,11 +284,11 @@ void ImageStore(uint4 t, uint x, uint y, uint mip, uint dmask, uint4 vals) {{
     if ((dmask & 2u) != 0u) g_memory.Store(addr + 4u, vals.y);
     if ((dmask & 4u) != 0u) g_memory.Store(addr + 8u, vals.z);
     if ((dmask & 8u) != 0u) g_memory.Store(addr + 12u, vals.w);
-  }} else if (format == {images.FORMAT_32_32_FLOAT}u) {{
+  }} else if (format == {images.FORMAT_32_32_FLOAT}u || format == {images.FORMAT_32_32_UINT}u || format == {images.FORMAT_32_32_SINT}u) {{
     uint addr = base + pixel * 8u;
     if ((dmask & 1u) != 0u) g_memory.Store(addr, vals.x);
     if ((dmask & 2u) != 0u) g_memory.Store(addr + 4u, vals.y);
-  }} else if (format == {images.FORMAT_32_FLOAT}u) {{
+  }} else if (format == {images.FORMAT_32_FLOAT}u || format == {images.FORMAT_32_UINT}u || format == {images.FORMAT_32_SINT}u) {{
     if ((dmask & 1u) != 0u) g_memory.Store(base + pixel * 4u, vals.x);
   }} else if (format == {images.FORMAT_8_8_8_8_UNORM}u) {{
     uint addr = base + pixel * 4u;
@@ -311,6 +324,57 @@ void ImageStore(uint4 t, uint x, uint y, uint mip, uint dmask, uint4 vals) {{
 uint4 ImageResInfo(uint4 t, uint mip) {{
   return mip == 0u ? uint4(ImageWidth(t), ImageHeight(t), 1u, 1u) : uint4(0u, 0u, 0u, 1u);
 }}
+
+uint ImageAtomic32(uint4 t, uint x, uint y, uint op, uint data0, uint data1) {{
+  uint w = ImageWidth(t);
+  uint h = ImageHeight(t);
+  if (x >= w || y >= h) return 0u;
+  uint format = (t.y >> 20) & 0x1FFu;
+  if (format != {images.FORMAT_32_UINT}u && format != {images.FORMAT_32_SINT}u && format != {images.FORMAT_32_FLOAT}u) return 0u;
+  uint addr = (t.x << 8) + (y * w + x) * 4u;
+  uint old = 0u;
+  if (op == 0u) {{ g_memory.InterlockedExchange(addr, data0, old); return old; }}
+  if (op == 1u) {{ g_memory.InterlockedCompareExchange(addr, data1, data0, old); return old; }}
+  if (op == 2u) {{ g_memory.InterlockedAdd(addr, data0, old); return old; }}
+  if (op == 3u) {{ g_memory.InterlockedAdd(addr, 0u - data0, old); return old; }}
+  if (op == 5u) {{ g_memory.InterlockedMin(addr, data0, old); return old; }}
+  if (op == 7u) {{ g_memory.InterlockedMax(addr, data0, old); return old; }}
+  if (op == 8u) {{ g_memory.InterlockedAnd(addr, data0, old); return old; }}
+  if (op == 9u) {{ g_memory.InterlockedOr(addr, data0, old); return old; }}
+  if (op == 10u) {{ g_memory.InterlockedXor(addr, data0, old); return old; }}
+  uint cur = g_memory.Load(addr);
+  for (uint iter = 0u; iter < 256u; ++iter) {{
+    uint next = cur;
+    if (op == 4u) {{
+      next = (asint(data0) < asint(cur)) ? data0 : cur;
+    }} else if (op == 6u) {{
+      next = (asint(data0) > asint(cur)) ? data0 : cur;
+    }} else if (op == 11u) {{
+      next = (cur >= data0) ? 0u : (cur + 1u);
+    }} else if (op == 12u) {{
+      next = (cur == 0u || cur > data0) ? data0 : (cur - 1u);
+    }} else if (op == 13u) {{
+      bool cur_nan = ((cur & 0x7F800000u) == 0x7F800000u) && ((cur & 0x007FFFFFu) != 0u);
+      bool cmp_nan = ((data1 & 0x7F800000u) == 0x7F800000u) && ((data1 & 0x007FFFFFu) != 0u);
+      next = (!cur_nan && !cmp_nan && (asfloat(cur) == asfloat(data1))) ? data0 : cur;
+    }} else if (op == 14u) {{
+      bool cur_nan = ((cur & 0x7F800000u) == 0x7F800000u) && ((cur & 0x007FFFFFu) != 0u);
+      bool dat_nan = ((data0 & 0x7F800000u) == 0x7F800000u) && ((data0 & 0x007FFFFFu) != 0u);
+      if (cur_nan || dat_nan) next = (cur_nan && !dat_nan) ? data0 : cur;
+      else next = (asfloat(data0) < asfloat(cur)) ? data0 : cur;
+    }} else if (op == 15u) {{
+      bool cur_nan = ((cur & 0x7F800000u) == 0x7F800000u) && ((cur & 0x007FFFFFu) != 0u);
+      bool dat_nan = ((data0 & 0x7F800000u) == 0x7F800000u) && ((data0 & 0x007FFFFFu) != 0u);
+      if (cur_nan || dat_nan) next = (cur_nan && !dat_nan) ? data0 : cur;
+      else next = (asfloat(data0) > asfloat(cur)) ? data0 : cur;
+    }}
+    uint prev;
+    g_memory.InterlockedCompareExchange(addr, cur, next, prev);
+    if (prev == cur) return prev;
+    cur = prev;
+  }}
+  return cur;
+}}
 """
 
 
@@ -330,6 +394,15 @@ def statements(name, word, active):
     dmask, vdata = fields["dmask"], fields["vdata"]
     addrs = images.address_registers(name, fields)
     t_decl = f"uint4 t = uint4(s[{r}], s[{r + 1}], s[{r + 2}], s[{r + 3}]);"
+    if name in images.ATOMIC_OPS:
+        width = images.atomic_width(name, dmask)
+        if width != 32:
+            raise Untranslatable(f"non traduite en HLSL : {name} (atomique 64 bits)")
+        op_code = _ATOMIC_OP_CODES[name]
+        data1 = f"v[{vdata + 1}]" if name in images.ATOMIC_CMPSWAP_OPS else "0u"
+        call = f"ImageAtomic32(t, v[{addrs[0]}], v[{addrs[1]}], {op_code}u, v[{vdata}], {data1})"
+        keep = f" uint old = {call}; v[{vdata}] = old;" if fields["glc"] else f" {call};"
+        return [f"if ({active}) {{ {t_decl}{keep} }}", STORE_BARRIER]
     if name in ("image_store", "image_store_mip"):
         slot, packed = 0, []
         for k in range(4):

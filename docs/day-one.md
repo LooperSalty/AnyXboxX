@@ -8,9 +8,9 @@ Steps to follow once the package executable (for example `game_scarlett_master.e
 
 ```powershell
 git submodule update --init
+cargo build --release
 cmake -S runtime -B runtime/build -A x64
 cmake --build runtime/build --config Release
-cargo build --release --manifest-path rust/Cargo.toml
 python tools/build_tombox.py d3d12_xs xg_xs xmem
 ```
 

@@ -21,6 +21,8 @@ FRAME_MS = 33
 DEMO = HERE / "demo.pe"
 XBOX_SERIES_X = 7
 ERRORS = (ValueError, OSError, ET.ParseError, pefile.PEFormatError, UcError)
+# Le traducteur SPIR-V tiers a été retiré (#262) : --spirv est refusé par son nom plutôt qu'ignoré.
+SPIRV_REMOVED = "--spirv : le traducteur SPIR-V a été retiré (#262) ; utilisez --hlsl"
 TITLE = "AnyXboxX — Xbox Series X emulator (prototype)"
 
 
@@ -264,6 +266,9 @@ def main(argv):
         # --rdna2 <shader.bin> [--liste | --executer | --hlsl] : familles, listing, exécution ou traduction HLSL
         from emu import rdna2
 
+        if "--spirv" in argv[2:]:
+            print(f"Erreur : {SPIRV_REMOVED}", file=sys.stderr)
+            return 2
         try:
             data = Path(argv[1]).read_bytes()
         except OSError as error:
@@ -280,18 +285,6 @@ def main(argv):
             try:
                 print(rdna2_hlsl.translate(data))
             except rdna2_hlsl.Untranslatable as error:
-                print(f"Arrêt : {error}", file=sys.stderr)
-                return 1
-            return 0
-        if "--spirv" in argv[2:]:
-            # --spirv [vs|ps|cs|ms|gs] : SPIR-V par le traducteur de Leonida (third_party/leonida)
-            from emu import rdna2_spirv
-
-            after = argv[argv.index("--spirv") + 1:]
-            stage = after[0] if after and after[0] in rdna2_spirv.STAGES else "cs"
-            try:
-                print(rdna2_spirv.translate(data, stage))
-            except rdna2_spirv.Untranslatable as error:
                 print(f"Arrêt : {error}", file=sys.stderr)
                 return 1
             return 0

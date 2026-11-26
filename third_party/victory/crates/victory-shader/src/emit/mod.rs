@@ -96,6 +96,7 @@ pub mod host;
 mod idiom;
 mod link;
 mod lower;
+pub mod nvidia;
 mod own_bits;
 mod rect;
 mod sampler;
@@ -107,6 +108,8 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod wave32_nvidia_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
@@ -121,9 +124,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDE_MASK,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TYPED, SLOT_TYPED_SINT, SLOT_TYPED_UINT, USER_DATA_SPACE,
+    USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -323,8 +326,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    // (`ACCC`, native code another compiler made, only with `VICTORY_WAVE32_NVIDIA=1`)
     let dxil = c
         .part(FourCC::DXIL)
+        .or_else(|| c.part(FourCC::ACCC).filter(|_| nvidia::enabled()))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
@@ -567,6 +572,17 @@ fn emit_forms(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE32_NVIDIA=1` ([`nvidia`]): a compute program of an `ACCC` container
+        // stopped at a lane mask exchanged where not every lane runs gets its active-lane
+        // loop taken wave-wide (a single guest wave can iterate it until both host halves are
+        // done; [`widen`] checks the latch and the convergence). Unless `VICTORY_WAVE_WIDE`
+        // is set: explicit policy wins.
+        let driver_loop = nvidia::enabled()
+            && std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // Where an approximate form below translates the program, the paired form
         // ([`paired`]) is tried first: it runs each console wave as one host wave and gives
         // what the console's 64 lanes compute, at no barrier but the entry's; the approximate
@@ -612,7 +628,7 @@ fn emit_forms(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -620,7 +636,7 @@ fn emit_forms(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, driver_loop && !wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again;
@@ -711,7 +727,7 @@ fn emit_forms(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -804,6 +820,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -851,8 +868,33 @@ fn widen(
             }
             return r;
         }
+        if active_loop_only && !active_loop_latch(p, &wide, &more) {
+            return r;
+        }
         wide.extend(more);
     }
+}
+
+/// Whether `more`, the branches `widen` would take wave-wide next, is only the backward
+/// branch on the SCC that `s_andn2_wrexec_b64` has just set (and nothing was widened before).
+/// That instruction restricts EXEC to the unfinished lanes: the guest repeats the loop while
+/// either host half still has work, and the individual vector writes keep their EXEC
+/// predicates.
+fn active_loop_latch(p: &ir::Program, wide: &std::collections::HashSet<usize>, more: &[usize]) -> bool {
+    let [latch] = more else {
+        return false;
+    };
+    let block = &p.blocks[*latch];
+    let [.., update, branch] = block.insts.as_slice() else {
+        return false;
+    };
+    wide.is_empty()
+        && update.name() == "s_andn2_wrexec_b64"
+        && branch.name() == "s_cbranch_scc1"
+        && matches!(
+            block.exit,
+            ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+        )
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form

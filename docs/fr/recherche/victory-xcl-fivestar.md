@@ -2,7 +2,7 @@
 
 # VIctory, xcl et five-star-recomp : les trois voisins suivis depuis le 24 novembre
 
-État au 24 novembre 2026, après la suppression de Leonida. La règle 2 de [AGENTS.md](../../../AGENTS.md) s'applique : seulement des noms d'exports, slots, formes, flags/HRESULT et comptes, chacun étiqueté « mesuré » ; aucune adresse, octet, chaîne, nom ou hash de shader, aucun log du jeu. Vue d'ensemble des autres voisins : [voisins.md](voisins.md).
+État au 24 novembre 2026. La règle 2 de [AGENTS.md](../../../AGENTS.md) s'applique : seulement des noms d'exports, slots, formes, flags/HRESULT et comptes, chacun étiqueté « mesuré » ; aucune adresse, octet, chaîne, nom ou hash de shader, aucun log du jeu. Vue d'ensemble des autres voisins : [voisins.md](voisins.md).
 
 | Projet | Langage, licence | Ce qu'il fait |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ Nos issues [#68](https://github.com/LooperSalty/AnyXboxX/issues/68) (contrôle d
 
 ## Intégration (2026-11-24)
 
-Notre intégration était publiée sur le fork [LooperSalty/victory](https://github.com/LooperSalty/victory) et, quand cette note a été écrite, suivie par ce dépôt comme sous-module `third_party/victory` (le workflow horaire des voisins suivait la branche stable). VIctory est maintenant copié dans le dépôt sous `third_party/victory` ; `tools/lancer_victory.ps1` le compile et le lance sur votre propre dossier de jeu.
+Notre intégration était publiée sur le fork [LooperSalty/victory](https://github.com/LooperSalty/victory) et, quand cette note a été écrite, suivie par ce dépôt comme sous-module `third_party/victory` (le workflow horaire des voisins suivait la branche stable). VIctory est maintenant copié dans le dépôt sous `third_party/victory` ; `anyxboxx run` le compile et le lance sur votre propre dossier de jeu.
 
 - Branche `anyxboxx/stable` : VIctory `main` plus les 24 pull requests créditées dans [THIRD_PARTY.md](../../../THIRD_PARTY.md), avec des adaptations locales (conflits résolus, plages mémoire déjà à jour dédupliquées, réglage `VICTORY_CAPPED_DYNAMIC` pour la plage de descripteurs dynamiques sur un tas plafonné NVIDIA). C'est la branche que nous épinglons.
 - Branche `anyxboxx/essai` : la branche stable plus quatre pull requests (#294, #709, #571, #452). **Expérimentale seulement** : elle provoque encore des blocages du GPU.

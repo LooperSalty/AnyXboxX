@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, rust/full]
   workflow_dispatch:
 
 # Lecture seule : la CI ne pousse rien et n'écrit pas dans le dépôt.
@@ -30,7 +30,7 @@ jobs:
       - run: python -m pip install ruff pytest
       - name: ruff (même règles que les mainteneurs)
         run: python -m ruff check --select W605,F,E9 PrototypeScarlett tests tools
-      - name: README dans les 9 langues
+      - name: README en anglais et en français
         run: python -m pytest tests/test_readme_sync.py -q
 
   victory-policy:
@@ -52,11 +52,18 @@ jobs:
   pytest:
     # Garder « pytest » : c'est le nom du check exigé par la protection de main.
     name: pytest
-    needs: lint
+    # Pas de « needs: lint » : les trois jobs démarrent ensemble. lint reste exigé et bloque la
+    # fusion s'il échoue ; l'attendre ne faisait qu'ajouter son temps (runner compris) à celui-ci.
     runs-on: windows-latest
     timeout-minutes: 30
     env:
       ANYXBOXX_REQUIRE_RUNTIME: "1"
+      # Compilation CI plus rapide que le profil release local : sans informations de débogage,
+      # optimisation 1, sans incrémental (inutile sur un runner neuf). Les binaires restent
+      # optimisés ; seuls les temps de compilation changent.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,25 +72,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Runtime C++
+      # Version de Rust épinglée à la racine (rust-toolchain.toml, comme VIctory) : installée
+      # avant tout appel à cargo, pour TomBox et l'espace racine.
+      - name: Rust épinglé (rust-toolchain.toml)
+        run: rustup toolchain install
+      # Cache des dépendances compilées (racine et TomBox). Écrit aussi depuis les PR : sans cela une
+      # PR qui change Cargo.lock, ou la première après un changement de toolchain, recompile tout
+      # (plus de 15 min sur un runner à 4 cœurs). Clé propre à ce job (shared-key).
+      - name: Cache Rust (racine et third_party/tombox)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pytest
+          workspaces: |
+            . -> target
+            third_party/tombox -> target
+          cache-on-failure: true
+      # Seulement les binaires et DLL que pytest lance : le lanceur graphique (egui, wgpu, winit),
+      # le plus gros arbre de dépendances, n'est compilé et testé que par le job « cargo test ».
+      - name: Rust (binaires et DLL lus par pytest)
+        run: cargo build --release --workspace --exclude anyxboxx-launcher
+      # Après cargo : runtime/CMakeLists.txt copie dans runtime/build/bin les DLL du runtime déjà
+      # portées en Rust (target/release), à côté des DLL C++.
+      - name: Runtime C++ (et DLL Rust du runtime)
         run: |
           cmake -S runtime -B runtime/build -A x64
           cmake --build runtime/build --config Release
-      # Cache des dépendances compilées des deux espaces Cargo (rust/ et TomBox), sans nos propres
-      # crates. Écrit seulement depuis main pour ne pas multiplier les gros caches de PR ; les PR
-      # le lisent.
-      - name: Cache Rust (rust/ et third_party/tombox)
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            rust -> target
-            third_party/tombox -> target
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Rust (passerelle vers TomBox)
-        run: |
-          cargo build --release --manifest-path rust/Cargo.toml
-          cargo test --release --manifest-path rust/Cargo.toml
       # rust-cache ne garde que les dépendances : les 15 crates de TomBox elles-mêmes (membres de
       # son espace Cargo) seraient recompilées à chaque passage. Les 8 DLL ne dépendent que du
       # commit du sous-module, du script et de la version de rustc : on les met en cache telles
@@ -104,5 +117,33 @@ jobs:
         if: steps.tombox-dlls.outputs.cache-hit != 'true'
         run: python tools/build_tombox.py
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      # pytest-xdist, un processus par cœur : mesuré en local sur 1 421 tests, 61 s en série
+      # contre 15 s avec -n 4 (ANYXBOXX_REQUIRE_RUNTIME=1, GPU en WARP), mêmes résultats. Le cache
+      # du runtime C++ de #348 n'est pas repris : CMake copie ici les DLL Rust de target/release,
+      # il doit tourner après cargo à chaque passage.
       - name: pytest (suite complète, nombre de tests comparé aux README)
-        run: python -m pytest
+        run: python -m pytest -n auto
+
+  cargo-test:
+    # Tests Rust de tout l'espace racine, lanceur graphique compris, en parallèle de pytest.
+    name: cargo test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Rust épinglé (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Cache Rust (racine)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-test
+          cache-on-failure: true
+      - name: cargo test (espace racine)
+        run: cargo test --release --workspace

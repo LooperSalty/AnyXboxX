@@ -98,8 +98,16 @@ struct Card {
     /// upload memory (`crate::windowup`), in the order they were copied, until [`card_dirty`]
     /// takes them for the send.
     chunks: Mutex<Vec<(usize, usize, crate::windowup::Chunk)>>,
+    /// (Neptune) Transient window: per 4 KiB page of title memory from the window's first on, a
+    /// print of the bytes last copied into a chunk for it (0: none, or only a part of the page)
+    /// ([`window_skip_same`]); empty until the window first takes title memory. Locked around
+    /// the copy into chunks, with `chunks` locked inside it.
+    prints: Mutex<Vec<u64>>,
     /// (Neptune) Whether `dirty` took a range since [`card_dirty`] last looked.
     flagged: std::sync::atomic::AtomicBool,
+    /// The copy this is part of, once it is registered ([`note_carded`]):
+    /// what [`Card::flag`] puts in [`FLAGGED`].
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -235,6 +243,49 @@ pub(crate) fn card_room_kept() -> u64 {
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// The copies in the card's memory whose [`Card::flagged`] went up since
+/// [`card_dirty`] last took them, each once per time it went up.
+///
+/// [`card_dirty`] went through all of [`CARDED`] at every submission (about
+/// 59 a frame in the world) to find the few that changed: in a 30 s profile
+/// of the world that pass was 2.5 % of the submitting thread's time, though
+/// it took no lock of the copies it passed over.
+static FLAGGED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// A copy just made in the card's memory: listed in [`CARDED`], and in
+/// [`FLAGGED`] if it is made flagged (its first send takes it whole).
+/// Copies that are gone are taken off [`CARDED`] here, each time its length
+/// reaches a power of two.
+fn note_carded(shadow: &Arc<Shadow>) {
+    let Some(card) = &shadow.card else {
+        return;
+    };
+    let weak = Arc::downgrade(shadow);
+    let _ = card.me.set(weak.clone());
+    {
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        if carded.len() >= 64 && carded.len().is_power_of_two() {
+            carded.retain(|w| w.strong_count() > 0);
+        }
+        carded.push(weak.clone());
+    }
+    if card.flagged.load(Ordering::Acquire) {
+        FLAGGED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+}
+
+impl Card {
+    /// `dirty` or `chunks` took something (after it is in them): the copy is
+    /// flagged, and goes into [`FLAGGED`] if it was not flagged already.
+    fn flag(&self) {
+        if !self.flagged.swap(true, Ordering::AcqRel)
+            && let Some(me) = self.me.get()
+        {
+            FLAGGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+    }
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -452,23 +503,24 @@ fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>)>, Vec<Uploads>) {
     let mut out = Vec::new();
     let mut uploads: Vec<Uploads> = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    // Only the copies flagged since the last call ([`FLAGGED`]); one flagged
+    // again while this runs is in the next call's list.
+    let flagged = std::mem::take(&mut *FLAGGED.lock().unwrap_or_else(|e| e.into_inner()));
+    for weak in flagged {
         let Some(shadow) = weak.upgrade() else {
-            return false;
+            continue;
         };
-        // (Neptune) Nothing changed since it was last asked, as for nearly all of the
-        // thousands of them at any one submission: no lock taken.
+        // (Neptune) No longer flagged: nothing to take.
         if shadow.card.as_ref().is_some_and(|c| !c.flagged.swap(false, Ordering::AcqRel)) {
-            return true;
+            continue;
         }
         if shadow.transient() {
             let taken = shadow.card.as_ref().map(|c| std::mem::take(&mut *c.chunks.lock().unwrap_or_else(|e| e.into_inner())));
             if let Some(taken) = taken.filter(|t| !t.is_empty()) {
                 uploads.push((shadow, taken));
             }
-            return true;
+            continue;
         }
         let ranges = shadow
             .card
@@ -487,8 +539,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
         }
-        true
-    });
+    }
     (out, uploads)
 }
 
@@ -1944,6 +1995,481 @@ pub(crate) fn window_upload() -> bool {
 /// Transient windows alive, buffers not folded into one, shader writes declared to one.
 pub(crate) static TRANSIENT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// (Neptune) What a transient window does with a 4 KiB page of title memory it takes that holds
+/// the bytes it last sent for the page (`VICTORY_WINDOW_SKIP_SAME`, [`window_skip_same`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkipSame {
+    /// `0`: sends it again and compares nothing, the code path as before the switch.
+    Off,
+    /// Unset, the default: sends it again; one page in 16, picked by its address
+    /// ([`sampled_page`]), is read again and compared, for the frame-rate line.
+    Sample,
+    /// `1`: leaves it out. It is neither copied nor sent: the card side holds those bytes.
+    Skip,
+}
+
+/// (Neptune) `VICTORY_WINDOW_SKIP_SAME` ([`SkipSame`]; read once).
+///
+/// A transient window ([`window_upload`]) has no CPU side to compare with, so every page the
+/// write watch or the guards name is copied into a chunk and sent up whole: some 72 MB a frame
+/// in the world (Series S, 20 fps), against 12 MB that differed of the 50 MB the copies in the
+/// card's memory compared. A page written need not hold other bytes: the title rewrites
+/// constant data. With `1` each window keeps a print of the bytes it last sent for
+/// each 4 KiB page ([`page_print`], 8 bytes a page: 8 KiB for a window of 4 MiB), and a page
+/// whose bytes give the same print is neither copied into a chunk nor sent.
+///
+/// What it rests on: the card side holds what the window last sent for each page. Nothing but
+/// its sends writes it, and `Host::card_before` copies them in the order they were copied (a
+/// send that replaces an earlier one before it went up comes after it). A buffer is not folded
+/// into a transient window; a declared write of shaders to one (unordered access, a title buffer
+/// copy on the card, title memory by address) is a bug, counted and logged
+/// ([`Shadow::transient_written`]), and from then on the window compares nothing and sends all
+/// it takes. A window let go takes its prints with it, so one made again for the same memory
+/// starts with none; a page sent only in part has none; a chunk is not read after its send.
+/// shortcut: two pages that differ and give the same print (about once in 2^64) leave the card
+/// side with the older bytes until the title writes the page again.
+pub(crate) fn window_skip_same() -> SkipSame {
+    static MODE: std::sync::OnceLock<SkipSame> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_WINDOW_SKIP_SAME").ok().as_deref().map(str::trim) {
+        Some("1") => SkipSame::Skip,
+        Some("0") => SkipSame::Off,
+        _ => SkipSame::Sample,
+    })
+}
+
+/// (Neptune) The pages transient windows keep a print of ([`window_skip_same`]).
+const PRINTED: usize = 4 << 10;
+
+/// (Neptune) Bytes of the 4 KiB pages transient windows took since the last frame-rate line, by
+/// what they were ([`Sent`]): the bytes the window last sent there, other bytes, nothing to
+/// compare with (never sent, a page taken in part, or a window shaders write). With
+/// [`SkipSame::Sample`] the pages compared, 16 times over: an estimate.
+static WINDOW_SAME: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// (Neptune) Bytes of title memory transient windows took since the last frame-rate line: sent
+/// up (copied into chunks), and left out ([`SkipSame::Skip`]).
+static WINDOW_TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// (Neptune) With the frame line, while there are transient windows ([`window_upload`]): what
+/// they took of title memory per frame over `frames`, sent and left out, and against what they
+/// last sent ([`WINDOW_SAME`], [`window_skip_same`]). Taken and reset.
+pub(crate) fn window_same_line(frames: f64) {
+    if !window_upload() {
+        return;
+    }
+    let mb = |n: &AtomicU64| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+    let [sent, left] = WINDOW_TAKEN.each_ref().map(mb);
+    let [same, other, unknown] = WINDOW_SAME.each_ref().map(mb);
+    let skip = match window_skip_same() {
+        SkipSame::Skip => "1: left out",
+        SkipSame::Sample => "unset: sent again, one 4 KiB page in 16 compared",
+        SkipSame::Off => "0: sent again, nothing compared",
+    };
+    tracing::info!(
+        "title memory transient windows took per frame: {sent:.1} MB sent up, {left:.1} MB left out; of what they \
+         took, {same:.1} MB held the bytes the window last sent for their 4 KiB page, {other:.1} MB other bytes, \
+         {unknown:.1} MB nothing to compare with (VICTORY_WINDOW_SKIP_SAME={skip})"
+    );
+}
+
+/// (Neptune) Bytes of the transient windows' prints alive (`Card::prints`), for the ram line.
+static WINDOW_PRINT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// (Neptune) [`WINDOW_PRINT_BYTES`].
+pub(crate) fn window_print_bytes() -> u64 {
+    WINDOW_PRINT_BYTES.load(Ordering::Relaxed)
+}
+
+/// (Neptune) What the bytes of a 4 KiB page a transient window takes are against its print of
+/// what it last sent for the page: the index into [`WINDOW_SAME`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    Same = 0,
+    Other = 1,
+    Unknown = 2,
+}
+
+/// (Neptune) Keys of [`page_print`]: 24 for the words of the 64-byte stripes (stripe `n` of a
+/// 1 KiB block takes keys `n` to `n + 7`), then 8 to start the lanes with and to mix them by.
+/// SplitMix64's numbers from 0.
+const PRINT_KEYS: [u64; 32] = {
+    let mut keys = [0u64; 32];
+    let (mut x, mut i) = (0u64, 0);
+    while i < 32 {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        keys[i] = z ^ (z >> 31);
+        i += 1;
+    }
+    keys
+};
+
+/// (Neptune) A 64-bit print of a page's bytes ([`window_skip_same`]): equal bytes give equal
+/// prints, and two different pages the same print about once in 2^64. Eight lanes take the
+/// 64-bit words of each 64-byte stripe as XXH3 accumulates them: a word is added to the next
+/// lane, and the product of its halves, keyed by its place in the stripe and the stripe's in
+/// its 1 KiB block, to its own; the lanes are mixed after each block and folded into one at the
+/// end, with the bytes left over, as `record_print` folds a descriptor's words. Some 40 GB/s on
+/// one core. Not a hash anyone can attack: the title does not aim at it.
+fn page_print(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut lanes = [0u64; 8];
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        *lane = PRINT_KEYS[24 + i] ^ bytes.len() as u64;
+    }
+    let mut stripes = bytes.chunks_exact(64);
+    for (n, stripe) in (&mut stripes).enumerate() {
+        let key = n % 16;
+        let mut words = [0u64; 8];
+        for (word, b) in words.iter_mut().zip(stripe.chunks_exact(8)) {
+            *word = u64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+        }
+        for i in 0..8 {
+            let x = words[i] ^ PRINT_KEYS[key + i];
+            lanes[i ^ 1] = lanes[i ^ 1].wrapping_add(words[i]);
+            lanes[i] = lanes[i].wrapping_add((x & 0xffff_ffff).wrapping_mul(x >> 32));
+        }
+        if key == 15 {
+            for (i, lane) in lanes.iter_mut().enumerate() {
+                *lane = (*lane ^ (*lane >> 47) ^ PRINT_KEYS[24 + i]).wrapping_mul(0x9e37_79b1);
+            }
+        }
+    }
+    let mut rest = stripes.remainder().chunks_exact(8);
+    let words = rest.by_ref().map(|w| u64::from_le_bytes(w.try_into().unwrap_or([0; 8])));
+    let mut h = K;
+    for word in lanes.into_iter().chain(words) {
+        h = (h ^ word).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    for &b in rest.remainder() {
+        h = (h ^ u64::from(b)).wrapping_mul(K);
+    }
+    h ^ (h >> 32)
+}
+
+/// (Neptune) Of 4 KiB page `index` of a transient window, `bytes` are taken (`whole`: all of the
+/// page that lies in the window): what they are against the page's print, which becomes theirs.
+/// A part of a page leaves it none: the card side then holds bytes of two takings.
+fn page_sent(prints: &mut [u64], index: usize, whole: bool, bytes: &[u8]) -> Sent {
+    let Some(print) = prints.get_mut(index) else {
+        return Sent::Unknown;
+    };
+    if !whole {
+        *print = 0;
+        return Sent::Unknown;
+    }
+    // 0 is no print.
+    let now = page_print(bytes).max(1);
+    match std::mem::replace(print, now) {
+        was if was == now => Sent::Same,
+        0 => Sent::Unknown,
+        _ => Sent::Other,
+    }
+}
+
+/// (Neptune) The prints of a transient window over `[start, end)`: one per 4 KiB page that lies
+/// in it.
+fn prints_for(start: usize, end: usize) -> usize {
+    (end - 1) / PRINTED - start / PRINTED + 1
+}
+
+/// (Neptune) `VICTORY_WINDOW_SKIP_SAME=1`: title memory `[from, to)` of a transient window over
+/// `[start, end)`, read by `read` (address, bytes to fill) into `scratch` 256 KiB at a time; the
+/// runs of 4 KiB pages that do not hold the bytes the window last sent for them go to `send`
+/// (address, bytes), in order, and the others are left out. `prints`: the window's, one per page
+/// from `start`'s on ([`prints_for`]). What each page was goes to `tally`, in bytes. Returns the
+/// bytes sent.
+fn window_copy(
+    (start, end): (usize, usize),
+    (from, to): (usize, usize),
+    prints: &mut [u64],
+    scratch: &mut Vec<u8>,
+    tally: &mut [u64; 3],
+    mut read: impl FnMut(usize, &mut [u8]),
+    mut send: impl FnMut(usize, &[u8]),
+) -> usize {
+    // Pages never cross a block: what is read stays in the core's cache while it is printed
+    // and copied into chunks.
+    const BLOCK: usize = 256 << 10;
+    if scratch.len() < BLOCK {
+        scratch.resize(BLOCK, 0);
+    }
+    let first = start / PRINTED;
+    let (mut sent, mut at) = (0, from);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    while at < to {
+        let stop = ((at / BLOCK + 1) * BLOCK).min(to);
+        let bytes = &mut scratch[..stop - at];
+        read(at, bytes);
+        runs.clear();
+        for page in at / PRINTED..stop.div_ceil(PRINTED) {
+            let (a, b) = ((page * PRINTED).max(at), ((page + 1) * PRINTED).min(stop));
+            let whole = a == (page * PRINTED).max(start) && b == ((page + 1) * PRINTED).min(end);
+            let what = page_sent(prints, page - first, whole, &bytes[a - at..b - at]);
+            tally[what as usize] += (b - a) as u64;
+            if what == Sent::Same {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(last) if last.1 == a => last.1 = b,
+                _ => runs.push((a, b)),
+            }
+        }
+        for &(a, b) in &runs {
+            send(a, &bytes[a - at..b - at]);
+            sent += b - a;
+        }
+        at = stop;
+    }
+    sent
+}
+
+/// (Neptune) Whether 4 KiB page `page` of title memory (its number) is one of the one in 16 that
+/// [`SkipSame::Sample`] compares: picked by a multiply of its number, so the same pages each
+/// time, spread over the 64 KiB pages and the windows.
+fn sampled_page(page: usize) -> bool {
+    (page as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60 == 0
+}
+
+/// (Neptune) [`SkipSame::Sample`]: of title memory `[from, to)` a transient window over
+/// `[start, end)` has just sent, the 4 KiB pages [`sampled_page`] picks are read by `read`
+/// (address, bytes to fill; false: not all there) and compared with the window's `prints`, which
+/// take them; what they were goes to `tally`, 16 times their bytes. Nothing is left out.
+fn window_sample(
+    (start, end): (usize, usize),
+    (from, to): (usize, usize),
+    prints: &mut [u64],
+    tally: &mut [u64; 3],
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) {
+    let first = start / PRINTED;
+    let mut page_bytes = [0u8; PRINTED];
+    for page in (from / PRINTED..to.div_ceil(PRINTED)).filter(|&p| sampled_page(p)) {
+        let (a, b) = ((page * PRINTED).max(from), ((page + 1) * PRINTED).min(to));
+        let whole = a == (page * PRINTED).max(start) && b == ((page + 1) * PRINTED).min(end);
+        let bytes = &mut page_bytes[..b - a];
+        // A page not all there now is as one taken in part.
+        let what = page_sent(prints, page - first, whole && read(a, bytes), bytes);
+        tally[what as usize] += 16 * (b - a) as u64;
+    }
+}
+
+/// (Neptune) [`WINDOW_SAME`] takes `tally`.
+fn window_same_add(tally: &[u64; 3]) {
+    for (n, &bytes) in WINDOW_SAME.iter().zip(tally) {
+        if bytes != 0 {
+            n.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_same_tests {
+    use super::{PRINTED, Sent, page_print, page_sent, prints_for, sampled_page, window_copy, window_sample};
+
+    /// Title memory for the tests: bytes that differ from page to page and within each.
+    fn memory(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// Equal bytes give equal prints; a page with one bit flipped, two words or two stripes
+    /// swapped, a word moved by a byte, or one byte longer gives another.
+    #[test]
+    fn a_print_changes_with_any_change_of_the_page() {
+        let page = memory(PRINTED, 7);
+        let print = page_print(&page);
+        assert_eq!(page_print(&page.clone()), print);
+        for bit in 0..PRINTED * 8 {
+            let mut other = page.clone();
+            other[bit / 8] ^= 1 << (bit % 8);
+            assert_ne!(page_print(&other), print, "bit {bit}");
+        }
+        let swapped = |a: usize, b: usize, n: usize| {
+            let mut other = page.clone();
+            for i in 0..n {
+                other.swap(a + i, b + i);
+            }
+            page_print(&other)
+        };
+        // Words in one stripe, in two stripes of a block, in two blocks; whole stripes the
+        // same keys meet in other blocks; the halves of a word.
+        let swaps = [(0, 8, 8), (8, 72, 8), (64, 1088, 8), (0, 64, 64), (64, 1088, 64), (0, 1024, 1024), (0, 4, 4)];
+        for (a, b, n) in swaps {
+            assert_ne!(swapped(a, b, n), print, "{a} {b} {n}");
+        }
+        // Pages of zeros and of one repeated word, their sign bits flipped two at a time.
+        let zeros = vec![0u8; PRINTED];
+        let mut two = zeros.clone();
+        two[7] ^= 0x80;
+        two[15] ^= 0x80;
+        assert_ne!(page_print(&two), page_print(&zeros));
+        let mut ones = vec![0u8; PRINTED];
+        ones.iter_mut().step_by(8).for_each(|b| *b = 1);
+        assert_ne!(page_print(&ones), page_print(&zeros));
+        let mut shifted = page.clone();
+        shifted.rotate_right(1);
+        assert_ne!(page_print(&shifted), print);
+        assert_ne!(page_print(&page[..PRINTED - 1]), page_print(&page[..PRINTED - 2]));
+        assert_ne!(page_print(&page[..13]), page_print(&page[..12]));
+    }
+
+    /// A page is the same when its bytes give the print last taken, unknown the first time and
+    /// when taken in part (which leaves it no print), other when its bytes changed.
+    #[test]
+    fn a_page_is_the_same_only_after_the_same_bytes_were_taken_whole() {
+        let mut prints = vec![0u64; 3];
+        let (a, b) = (memory(PRINTED, 1), memory(PRINTED, 2));
+        assert_eq!(page_sent(&mut prints, 1, true, &a), Sent::Unknown);
+        assert_eq!(page_sent(&mut prints, 1, true, &a), Sent::Same);
+        assert_eq!(page_sent(&mut prints, 1, true, &b), Sent::Other);
+        assert_eq!(page_sent(&mut prints, 1, true, &a), Sent::Other);
+        assert_eq!(page_sent(&mut prints, 1, false, &a[..100]), Sent::Unknown);
+        assert_eq!(prints[1], 0, "a page taken in part keeps no print");
+        assert_eq!(page_sent(&mut prints, 1, true, &a), Sent::Unknown);
+        assert_eq!(page_sent(&mut prints, 1, true, &a), Sent::Same);
+        assert_eq!((prints[0], prints[2]), (0, 0), "the other pages are not touched");
+        // Past the window: nothing to compare with.
+        assert_eq!(page_sent(&mut prints, 3, true, &a), Sent::Unknown);
+    }
+
+    /// A window over title memory, refreshed again and again over the ranges asked while the
+    /// title writes some pages with other bytes and rewrites others with the bytes they hold:
+    /// with the pages that hold what was last sent left out, the card side holds the title's
+    /// bytes over every range refreshed, and nothing is sent of a page the title only rewrote.
+    #[test]
+    fn the_card_side_holds_the_titles_bytes_with_the_same_pages_left_out() {
+        const START: usize = 0x40_0000;
+        const LEN: usize = 1 << 20;
+        let mut title = memory(LEN, 3);
+        let mut card = vec![0xeeu8; LEN];
+        let mut prints = vec![0u64; prints_for(START, START + LEN)];
+        let mut scratch = Vec::new();
+        let mut refresh = |title: &[u8], card: &mut [u8], prints: &mut [u64], from: usize, to: usize| {
+            let mut tally = [0u64; 3];
+            let mut sends = Vec::new();
+            let sent = window_copy(
+                (START, START + LEN),
+                (from, to),
+                prints,
+                &mut scratch,
+                &mut tally,
+                |at, into| into.copy_from_slice(&title[at - START..at - START + into.len()]),
+                |at, bytes| {
+                    card[at - START..at - START + bytes.len()].copy_from_slice(bytes);
+                    sends.push((at, at + bytes.len()));
+                },
+            );
+            assert_eq!(&card[from - START..to - START], &title[from - START..to - START], "{from:#x}..{to:#x}");
+            assert_eq!(tally.iter().sum::<u64>(), (to - from) as u64);
+            assert_eq!(sent as u64, tally[Sent::Other as usize] + tally[Sent::Unknown as usize]);
+            // In order; two touch only where a block read ends.
+            assert!(
+                sends.windows(2).all(|w| w[0].1 < w[1].0 || (w[0].1 == w[1].0 && w[0].1 % (256 << 10) == 0)),
+                "{sends:?}"
+            );
+            (tally, sends)
+        };
+        // The first time, all of it is sent: nothing to compare with.
+        let (tally, sends) = refresh(&title, &mut card, &mut prints, START, START + LEN);
+        assert_eq!(tally, [0, 0, LEN as u64]);
+        assert_eq!(sends.len(), (LEN / (256 << 10)), "one run per block read");
+        // Nothing changed: nothing sent.
+        let (tally, sends) = refresh(&title, &mut card, &mut prints, START, START + LEN);
+        assert_eq!((tally, sends.len()), ([LEN as u64, 0, 0], 0));
+        // Pages 3 and 9 written with other bytes, 4 to 8 rewritten with their own.
+        let page = |p: usize| p * PRINTED..(p + 1) * PRINTED;
+        title[page(3)].iter_mut().for_each(|b| *b ^= 0x55);
+        title[page(9).start + 4095] ^= 1;
+        let (tally, sends) = refresh(&title, &mut card, &mut prints, START, START + 16 * PRINTED);
+        assert_eq!(tally, [14 * PRINTED as u64, 2 * PRINTED as u64, 0]);
+        let at = |p: usize| START + p * PRINTED;
+        assert_eq!(sends, [(at(3), at(4)), (at(9), at(10))]);
+        // A range that begins and ends inside pages: those are sent in part and keep no print,
+        // so they are sent whole the next time even though nothing changed. Page 21 changed
+        // and goes with the part before it; page 22 is the same and left out.
+        let (from, to) = (at(20) + 100, at(23) + 7);
+        title[page(21)].iter_mut().for_each(|b| *b = b.wrapping_add(1));
+        let (tally, sends) = refresh(&title, &mut card, &mut prints, from, to);
+        assert_eq!(tally, [PRINTED as u64, PRINTED as u64, (PRINTED - 100 + 7) as u64]);
+        assert_eq!(sends, [(from, at(22)), (at(23), to)]);
+        let (tally, sends) = refresh(&title, &mut card, &mut prints, at(20), at(24));
+        assert_eq!(tally, [2 * PRINTED as u64, 0, 2 * PRINTED as u64]);
+        assert_eq!(sends, [(at(20), at(21)), (at(23), at(24))]);
+        // Many rounds of writes, of bytes set back to what they held before the last refresh,
+        // and of ranges, the card side checked each time.
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let mut undo: Vec<(usize, u8)> = Vec::new();
+        for _ in 0..300 {
+            for _ in 0..next(6) {
+                let i = next(LEN);
+                match next(3) {
+                    0 => title[i] = title[i].wrapping_add(1 + next(255) as u8),
+                    1 => {
+                        undo.push((i, title[i]));
+                        title[i] ^= 0x10;
+                    }
+                    _ => {
+                        if let Some((i, was)) = undo.pop() {
+                            title[i] = was;
+                        }
+                    }
+                }
+            }
+            let from = START + next(LEN);
+            let to = (from + 1 + next(300 << 10)).min(START + LEN);
+            refresh(&title, &mut card, &mut prints, from, to);
+        }
+    }
+
+    /// The pages compared without the switch are about one in 16 of all, the same each time;
+    /// their bytes count 16 times, and nothing compared changes what is sent.
+    #[test]
+    fn one_page_in_sixteen_is_compared_and_counted_sixteen_times() {
+        let picked = (0..1 << 16).filter(|&p| sampled_page(p)).count();
+        assert!((3600..=4600).contains(&picked), "{picked} of 65536");
+        assert_eq!((0..1 << 16).filter(|&p| sampled_page(p)).count(), picked);
+        const START: usize = 0x80_0000;
+        const LEN: usize = 4 << 20;
+        let title = memory(LEN, 9);
+        let mut prints = vec![0u64; prints_for(START, START + LEN)];
+        let read = |at: usize, into: &mut [u8]| {
+            into.copy_from_slice(&title[at - START..at - START + into.len()]);
+            true
+        };
+        let mut tally = [0u64; 3];
+        window_sample((START, START + LEN), (START, START + LEN), &mut prints, &mut tally, read);
+        let picked = (START / PRINTED..(START + LEN) / PRINTED).filter(|&p| sampled_page(p)).count() as u64;
+        assert_eq!(tally, [0, 0, 16 * PRINTED as u64 * picked]);
+        let mut tally = [0u64; 3];
+        window_sample((START, START + LEN), (START, START + LEN), &mut prints, &mut tally, read);
+        assert_eq!(tally, [16 * PRINTED as u64 * picked, 0, 0]);
+        // A page not all there is not compared, and keeps no print.
+        let p = (START / PRINTED..).find(|&p| sampled_page(p)).unwrap_or(0);
+        let mut tally = [0u64; 3];
+        let (from, to) = (p * PRINTED, (p + 1) * PRINTED);
+        window_sample((START, START + LEN), (from, to), &mut prints, &mut tally, |_, _| false);
+        assert_eq!(tally, [0, 0, 16 * PRINTED as u64]);
+        assert_eq!(prints[p - START / PRINTED], 0);
+    }
+}
+
 /// Pages the copy-back told their copy it holds (`crate::watch::quiet_back`).
 static QUIET_BACK: AtomicU64 = AtomicU64::new(0);
 
@@ -2244,6 +2770,10 @@ impl Drop for Shadow {
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
+            }
+            let prints = card.prints.get_mut().unwrap_or_else(|e| e.into_inner()).len();
+            if prints != 0 {
+                WINDOW_PRINT_BYTES.fetch_sub(prints as u64 * 8, Ordering::Relaxed);
             }
         }
     }
@@ -2635,7 +3165,9 @@ impl Shadow {
     }
 
     /// Whether this is a transient window that shaders are said to write: a bug (it keeps no
-    /// CPU side to merge into), logged once per window.
+    /// CPU side to merge into), logged once per window. (Neptune) From then on the window
+    /// compares nothing with what it last sent ([`window_skip_same`]): its card side may hold
+    /// the shaders' bytes.
     fn transient_written(&self, address: usize) -> bool {
         if self.rebar {
             // Nothing to merge into or compare with: write-combined memory is never read.
@@ -2713,6 +3245,12 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // (Neptune) Every declaration, before the cases below that return: the sanitizer must see
+        // them all (`VICTORY_CLAMP_AFTER_WRITER`).
+        if crate::indirect::after_writer() {
+            let end = address.saturating_add(len.min(self.left(address)));
+            list.with_san(|s| s.wrote(address as usize, end as usize));
+        }
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -3487,9 +4025,17 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // (Neptune) A transient window has no CPU side: the whole pages go into a chunk of
-        // pooled upload memory, to be sent as they are (no byte compare, no snapshot).
+        // pooled upload memory, to be sent as they are (no byte compare, no snapshot), but for
+        // the 4 KiB pages that hold what the window last sent with VICTORY_WINDOW_SKIP_SAME=1.
         if self.transient() {
-            return self.copy_to_chunk(from, to);
+            let n = self.copy_to_chunk(from, to);
+            let left = to.saturating_sub(from).saturating_sub(n);
+            for (count, bytes) in WINDOW_TAKEN.iter().zip([n, left]) {
+                if bytes != 0 {
+                    count.fetch_add(bytes as u64, Ordering::Relaxed);
+                }
+            }
+            return n;
         }
         // (Neptune) A rebar window: the whole pages go straight into the card's memory. No byte
         // compare (it would read write-combined memory), no dirty ranges, no send.
@@ -3541,6 +4087,8 @@ impl Shadow {
 
     /// [`Shadow::copy`] of a transient window: title memory `[from, to)` into a chunk, noted
     /// for the send. What a read that fails leaves alone is whatever the chunk held.
+    /// (Neptune) With `VICTORY_WINDOW_SKIP_SAME=1` only the 4 KiB pages that do not hold what
+    /// the window last sent for them ([`window_skip_same`]). Returns the bytes sent.
     fn copy_to_chunk(&self, from: usize, to: usize) -> usize {
         let Some(card) = &self.card else {
             return 0;
@@ -3548,19 +4096,89 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let mode = window_skip_same();
+        // A window shaders are said to write may hold their bytes: it compares nothing.
+        let written = self.written_said.load(Ordering::Relaxed);
+        if written && mode != SkipSame::Off {
+            WINDOW_SAME[Sent::Unknown as usize].fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
+        if mode == SkipSame::Skip && !written {
+            return self.copy_to_chunks_skipping(card, from, to);
+        }
         let n = to - from;
         let Some(chunk) = crate::windowup::alloc(n as u64) else {
             crate::host::fail(format_args!("no upload memory for a window of title memory ({n} bytes)"));
         };
         crate::host::copy_mapped(chunk.ptr(), from as *const u8, n, false);
-        let (a, b) = (from - self.start as usize, to - self.start as usize);
+        if mode == SkipSame::Sample && !written {
+            let mut tally = [0u64; 3];
+            let window = (self.start as usize, (self.start + self.len) as usize);
+            window_sample(window, (from, to), &mut self.window_prints(card), &mut tally, |at, into| {
+                crate::host::read_into(at as *const u8, into)
+            });
+            window_same_add(&tally);
+        }
+        let start = self.start as usize;
+        Self::chunk_sent(card, from - start, to - start, chunk);
+        n
+    }
+
+    /// (Neptune) Notes `chunk` for the send of offsets `[a, b)` of a transient window.
+    fn chunk_sent(card: &Card, a: usize, b: usize, chunk: crate::windowup::Chunk) {
         let mut chunks = card.chunks.lock().unwrap_or_else(|e| e.into_inner());
         // Pages sent again before a send replace the earlier ones (their chunks go back at once).
         chunks.retain(|c| !(a <= c.0 && c.1 <= b));
         chunks.push((a, b, chunk));
         drop(chunks);
-        card.flagged.store(true, Ordering::Release);
-        n
+        card.flag();
+    }
+
+    /// (Neptune) A transient window's prints ([`Card::prints`]), made at the first ask.
+    fn window_prints<'a>(&self, card: &'a Card) -> std::sync::MutexGuard<'a, Vec<u64>> {
+        let mut prints = card.prints.lock().unwrap_or_else(|e| e.into_inner());
+        if prints.is_empty() {
+            let n = prints_for(self.start as usize, (self.start + self.len) as usize);
+            prints.resize(n, 0);
+            WINDOW_PRINT_BYTES.fetch_add(n as u64 * 8, Ordering::Relaxed);
+        }
+        prints
+    }
+
+    /// (Neptune) [`Shadow::copy_to_chunk`] with `VICTORY_WINDOW_SKIP_SAME=1`: title memory
+    /// `[from, to)` is read into memory of this thread's, and each run of 4 KiB pages whose
+    /// bytes are not what the window last sent goes into a chunk of its own ([`window_copy`]).
+    /// The prints stay locked until the chunks are noted: a print is always that of the last
+    /// chunk noted for its page.
+    fn copy_to_chunks_skipping(&self, card: &Card, from: usize, to: usize) -> usize {
+        thread_local! {
+            static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let mut prints = self.window_prints(card);
+        let mut tally = [0u64; 3];
+        let sent = READ.with(|read| {
+            window_copy(
+                (start, (self.start + self.len) as usize),
+                (from, to),
+                &mut prints,
+                &mut read.borrow_mut(),
+                &mut tally,
+                |at, into| crate::host::copy_mapped(into.as_mut_ptr(), at as *const u8, into.len(), false),
+                |at, bytes| {
+                    let n = bytes.len();
+                    let Some(chunk) = crate::windowup::alloc(n as u64) else {
+                        crate::host::fail(format_args!("no upload memory for a window of title memory ({n} bytes)"));
+                    };
+                    // SAFETY: the chunk's mapping holds `n` bytes (`alloc`), and nothing else
+                    // has the chunk yet.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), chunk.ptr(), n) };
+                    Self::chunk_sent(card, at - start, at - start + n, chunk);
+                },
+            )
+        });
+        drop(prints);
+        window_same_add(&tally);
+        sent
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -3584,7 +4202,7 @@ impl Shadow {
             _ => dirty.push((from, to)),
         }
         drop(dirty);
-        card.flagged.store(true, Ordering::Release);
+        card.flag();
     }
 
     /// (Neptune) [`Shadow::card_changed`] for `runs` (offset, bytes; in
@@ -3603,7 +4221,7 @@ impl Shadow {
             }
         }
         drop(dirty);
-        card.flagged.store(true, Ordering::Release);
+        card.flag();
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -4136,7 +4754,9 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 let card = Card {
                     staging: Some(buffer),
                     chunks: Mutex::default(),
+                    prints: Mutex::default(),
                     flagged: std::sync::atomic::AtomicBool::new(true),
+                    me: std::sync::OnceLock::new(),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -4164,9 +4784,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
+        note_carded(&shadow);
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
@@ -4395,7 +5013,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let card = Card {
             staging: None,
             chunks: Mutex::default(),
+            prints: Mutex::default(),
             flagged: std::sync::atomic::AtomicBool::new(true),
+            me: std::sync::OnceLock::new(),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -4413,7 +5033,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 let card = Card {
                     staging: Some(buffer),
                     chunks: Mutex::default(),
+                    prints: Mutex::default(),
                     flagged: std::sync::atomic::AtomicBool::new(true),
+                    me: std::sync::OnceLock::new(),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -4447,9 +5069,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         TRANSIENT[0].fetch_add(1, Ordering::Relaxed);
     }
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-    }
+    note_carded(&shadow);
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
@@ -4707,7 +5327,9 @@ mod card_merge_tests {
             shadow.card = Some(Card {
                 staging: Some(staging.clone()),
                 chunks: Mutex::default(),
+                prints: Mutex::default(),
                 flagged: std::sync::atomic::AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
@@ -4733,6 +5355,76 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// `card_dirty` takes the copies flagged since its last call, from the
+    /// list they went into when flagged ([`super::FLAGGED`]), each once, and
+    /// looks at no other copy in the card's memory. (The only test that
+    /// calls it: the list is the process's.)
+    #[test]
+    fn card_dirty_takes_only_the_copies_flagged_since() {
+        use super::{card_dirty, note_carded};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        let title = vec![0u8; LEN];
+        let (mut side_a, mut side_b, mut side_c) = (vec![0u8; LEN], vec![0u8; LEN], vec![0u8; LEN]);
+        let make = |side: &mut Vec<u8>, flagged: bool| {
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: Some(staging.clone()),
+                chunks: Mutex::default(),
+                prints: Mutex::default(),
+                flagged: std::sync::atomic::AtomicBool::new(flagged),
+                me: std::sync::OnceLock::new(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+            });
+            let shadow = Arc::new(shadow);
+            note_carded(&shadow);
+            shadow
+        };
+        let taken = |out: &[(Arc<Shadow>, Vec<(usize, usize)>)]| -> Vec<(*const Shadow, Vec<(usize, usize)>)> {
+            out.iter().map(|(s, r)| (Arc::as_ptr(s), r.clone())).collect()
+        };
+        // Made flagged, as copies are: its first call takes it (nothing in
+        // `dirty` yet, so nothing to send).
+        let a = make(&mut side_a, true);
+        let b = make(&mut side_b, false);
+        let c = make(&mut side_c, false);
+        let (out, uploads) = card_dirty(1);
+        assert!(out.is_empty() && uploads.is_empty());
+        assert!(!a.card.as_ref().unwrap().flagged.load(Ordering::Acquire), "the copy made flagged was not taken");
+        // b changes. c holds a range and the flag without having been put
+        // in the list: only the listed copies are looked at.
+        b.card_changed(0, 16);
+        if let Some(card) = &c.card {
+            card.dirty.lock().unwrap().push((0, 8));
+            card.flagged.store(true, Ordering::Release);
+        }
+        let (out, _) = card_dirty(2);
+        assert_eq!(taken(&out), vec![(Arc::as_ptr(&b), vec![(0, 16)])]);
+        drop(out);
+        // Nothing changed since: nothing taken.
+        assert!(card_dirty(3).0.is_empty());
+        // Changed twice before the next call: taken once, both ranges.
+        b.card_changed(16, 32);
+        b.card_changed(64, 80);
+        let (out, _) = card_dirty(4);
+        assert_eq!(taken(&out), vec![(Arc::as_ptr(&b), vec![(16, 32), (64, 80)])]);
+        drop(out);
+        // A copy let go before the call is passed over (the list holds it
+        // weakly).
+        b.card_changed(0, 4);
+        drop(b);
+        assert!(card_dirty(5).0.is_empty());
+        drop((a, c));
     }
 }
 

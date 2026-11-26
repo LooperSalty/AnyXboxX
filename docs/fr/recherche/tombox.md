@@ -40,11 +40,11 @@ Ils ont examiné le même paquet que celui étudié par AnyXboxX et arrivent à 
 
 ## Confrontation de leur décodeur
 
-Leur désassembleur RDNA 2 (`tombox-xshader`), appelé depuis la passerelle Rust d'AnyXboxX (`rust/anyxboxx-rdna2`), a été confronté aux 29 522 encodages uniques des tests de LLVM par `tools/compare_tombox.py` : aucune longueur fausse, 24 831 encodages identiques (84 %), 4 586 opcodes absents de leur table et 105 noms différents. Détail et exemples : [tombox-decodeur.md](tombox-decodeur.md). La table d'AnyXboxX, générée depuis LLVM, couvre ces opcodes manquants ; elle peut leur être proposée.
+Leur désassembleur RDNA 2 (`tombox-xshader`), appelé depuis la passerelle Rust d'AnyXboxX (`crates/anyxboxx-rdna2`), a été confronté aux 29 522 encodages uniques des tests de LLVM par `tools/compare_tombox.py` : aucune longueur fausse, 24 831 encodages identiques (84 %), 4 586 opcodes absents de leur table et 105 noms différents. Détail et exemples : [tombox-decodeur.md](tombox-decodeur.md). La table d'AnyXboxX, générée depuis LLVM, couvre ces opcodes manquants ; elle peut leur être proposée.
 
 ## Son XMA2 : leur décodeur vérifié
 
-Leur crate `xma` (LGPL-2.1 ou ultérieure) est un portage en Rust du décodeur WMA Pro / XMA de FFmpeg (`libavcodec/wmaprodec.c`). Leur test `wmapro_fate_beethoven_matches_reference`, lancé localement avec l'échantillon public `wmapro/Beethovens_9th-1_small.wma` de la suite FATE de FFmpeg et un PCM de référence produit par `ffmpeg`, donne un écart maximal de 1 sur 16 bits et un rapport signal sur bruit de 101,5 dB. AnyXboxX l'utilise dans `rust/anyxboxx-audio` (`anyxboxx_xma <entrée.xma> <sortie.wav>`) pour les fichiers RIFF XMA2 à un flux ; aucun fichier XMA2 public n'a encore servi à vérifier la chaîne complète.
+Leur crate `xma` (LGPL-2.1 ou ultérieure) est un portage en Rust du décodeur WMA Pro / XMA de FFmpeg (`libavcodec/wmaprodec.c`). Leur test `wmapro_fate_beethoven_matches_reference`, lancé localement avec l'échantillon public `wmapro/Beethovens_9th-1_small.wma` de la suite FATE de FFmpeg et un PCM de référence produit par `ffmpeg`, donne un écart maximal de 1 sur 16 bits et un rapport signal sur bruit de 101,5 dB. AnyXboxX l'utilise dans `crates/anyxboxx-audio` (`anyxboxx_xma <entrée.xma> <sortie.wav>`) pour les fichiers RIFF XMA2 à un flux ; aucun fichier XMA2 public n'a encore servi à vérifier la chaîne complète.
 
 ## Table des slots du périphérique d3d12_xs (premier démarrage, W5)
 
@@ -71,7 +71,7 @@ chaque ligne n'a été lu que là où c'est indiqué. Figée par `tests/test_d3d
 | 86 | non établi | non assigné | aucun |
 | 127 | CreateCommittedResource3 (forme) | hors table : la table de TomBox compte 90 slots | aucun |
 
-AnyXboxX ne sert aucun slot de périphérique : `runtime/d3d12_xs/d3d12_xs.def` exporte `D3D12ConfigureVirtualMemoryX`
+AnyXboxX ne sert aucun slot de périphérique : `crates/anyxboxx-d3d12-xs` exporte `D3D12ConfigureVirtualMemoryX`
 et les redirections de signature racine, pas `D3D12XboxCreateDevice`. Le manque est le proxy de périphérique entier,
 pas quelques slots : aucune correction simple n'existe. Les slots de liste 9, 131 et 132 appartiennent à la table de
 liste de commandes, que TomBox dimensionne à 110 (son tableau `vt` compte 128 entrées) ; 131 et 132 sont hors de celle-ci.

@@ -92,7 +92,13 @@ def _fma(a, b, c):
     """a × b + c arrondi une seule fois ; valeurs spéciales par le calcul flottant ordinaire."""
     if not all(math.isfinite(v) for v in (a, b, c)):
         return a * b + c
-    return float(Fraction(a) * Fraction(b) + Fraction(c))
+    exact = Fraction(a) * Fraction(b) + Fraction(c)
+    if exact == 0:
+        return -0.0 if (math.copysign(1.0, a) * math.copysign(1.0, b) < 0 and math.copysign(1.0, c) < 0) else 0.0
+    try:
+        return float(exact)
+    except OverflowError:
+        return math.inf if exact > 0 else -math.inf
 
 
 def _pick(choose):

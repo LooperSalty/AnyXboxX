@@ -1,0 +1,40 @@
+[package]
+name = "anyxboxx-xgameruntime"
+description = "xgameruntime.dll in Rust: the GDK runtime seen by the title (QueryApiImpl, served interfaces, registry, HDR). Port of runtime/xgameruntime (C++), same exports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# xgameruntime.dll: the title loads it by this name (file names are case-insensitive).
+name = "xgameruntime"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# VIctory's task queue (XTaskQueue, XAsync, XThread) is served from here, not ported.
+victory-hle.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+] }
+# COM: DXGI outputs (HDR state) and Network List Manager (connectivity), as VIctory's windows crate.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_NetworkListManager",
+    "Win32_System_Com",
+] }
+
+[lints]
+workspace = true

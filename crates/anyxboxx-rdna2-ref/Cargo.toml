@@ -1,0 +1,23 @@
+[package]
+name = "anyxboxx-rdna2-ref"
+description = "Reference interpreter of RDNA 2 programs (wave32/wave64): the Rust port of PrototypeScarlett/emu/rdna2_exec.py, checked against it instruction by instruction."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Exact arithmetic for the divide helpers (emu/rdna2_exec_div.py rounds exact rationals, Fraction in Python).
+num-bigint = "0.4"
+
+[lib]
+name = "anyxboxx_rdna2_ref"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anyxboxx-rdna2-ref"
+path = "src/main.rs"
+
+[lints]
+workspace = true
