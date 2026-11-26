@@ -73,14 +73,17 @@ pub fn files(app: &mut App, ui: &mut egui::Ui) {
             ui.label("Not checked yet.");
         }
         Verify::Running => {
-            ui.label("Checking (hashing large archives takes a while)...");
+            ui.label("Checking the files (a few seconds)...");
         }
         Verify::Failed(error) => {
             ui.colored_label(MISSING, format!("Cannot check: {error}"));
         }
         Verify::Done(report) => {
             if report.is_ok() {
-                ui.colored_label(OK, "Every required file is present and whole.");
+                ui.colored_label(
+                    OK,
+                    "Folder OK: every required file is present and its headers are sound.",
+                );
             }
             for (name, problem) in &report.problems {
                 let text = match problem {
@@ -96,19 +99,9 @@ pub fn files(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(format!("  {name}: {reason}"));
             }
             ui.add_space(6.0);
-            ui.collapsing("SHA-256 manifest", |ui| {
-                let mut text = report.manifest_text();
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .desired_rows(6)
-                        .font(egui::TextStyle::Monospace),
-                );
-                if ui.button("Copy manifest").clicked() {
-                    ui.ctx().copy_text(report.manifest_text());
-                }
-            });
         }
     }
+    crate::ui_manifest::section(app, ui);
 }
 
 /// Page 3: shader preloading (VIctory's translate into the cache), with its progress.
@@ -126,7 +119,7 @@ pub fn shaders(app: &mut App, ui: &mut egui::Ui) {
         ui.colored_label(UNKNOWN, "Check the game folder first (page 2).");
     }
     let enabled = ready && !app.is_busy();
-    if theme::glow_button(ui, enabled, "Preload shaders", vec2(0.0, 36.0), false).clicked() {
+    if theme::glow_button(ui, enabled, "Warm now", vec2(0.0, 36.0), false).clicked() {
         app.start(true);
     }
     if let Some(progress) = app.progress() {

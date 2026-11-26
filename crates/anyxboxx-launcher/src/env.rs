@@ -75,7 +75,13 @@ pub fn build_env(
         skip_pipelines: None,
         // The profile replaces the tuned set, so the base must not add it a second time.
         no_tuned_settings: true,
+        quality: false,
+        overrides: Vec::new(),
+        auto_a: false,
+        frametime_dump: false,
+        diag: false,
         dred: false,
+        warm: false,
         precompile: false,
         xg_dll: xg.map(|x| x.dll.clone()),
         xg_mode: xg.map_or(XgMode::Real, |x| x.mode),
@@ -202,7 +208,7 @@ mod tests {
         let dir = game_folder();
         let env = build_env(dir.path(), &profile("windows-nvidia"), &[], None).expect("env");
         for (key, expected) in TUNED {
-            assert_eq!(value(&env, key).as_deref(), Some(expected), "{key}");
+            assert_eq!(value(&env, key).as_deref(), Some(*expected), "{key}");
         }
         assert_eq!(
             value(&env, "VICTORY_GAME_DIR"),
@@ -242,12 +248,12 @@ mod tests {
     fn overridden_keys_lists_only_changed_profile_values() {
         let windows = profile("windows-nvidia");
         let overrides = parse_overrides(
-            "VICTORY_LATE_WAIT=0\nVICTORY_LATE_WAIT=1\nVICTORY_WIDE_BACK=1\nVKD3D_CONFIG=x",
+            "VICTORY_RELAY_OWN_QUEUE=0\nVICTORY_RELAY_OWN_QUEUE=1\nVICTORY_WINDOW_TAILS=1\nVKD3D_CONFIG=x",
         )
         .expect("valid");
         assert_eq!(
             overridden_keys(&windows, &overrides),
-            vec!["VICTORY_LATE_WAIT"]
+            vec!["VICTORY_RELAY_OWN_QUEUE"]
         );
     }
 

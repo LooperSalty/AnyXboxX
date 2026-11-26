@@ -8,9 +8,10 @@ qui les nomme, ce qui mesure ce qui reste à traduire.
 """
 import struct
 
-from emu import (rdna2, rdna2_exec_cmp64, rdna2_exec_dot, rdna2_exec_ext, rdna2_exec_format, rdna2_exec_graphics,
-                 rdna2_exec_image, rdna2_exec_memory, rdna2_exec_movrel, rdna2_exec_pc, rdna2_exec_vop3,
-                 rdna2_exec_wide)
+from emu import (rdna2, rdna2_exec_cmp64, rdna2_exec_cmpf16, rdna2_exec_dot, rdna2_exec_ext, rdna2_exec_f16,
+                 rdna2_exec_format, rdna2_exec_graphics, rdna2_exec_image, rdna2_exec_int16, rdna2_exec_memory,
+                 rdna2_exec_movrel,
+                 rdna2_exec_pc, rdna2_exec_vop3, rdna2_exec_wide)
 from emu.rdna2_exec_ops import SCALAR, VECTOR, VECTOR_COMPARE, VECTOR_NO_OPERATION, BRANCHES, float_bits
 
 LANES = 32
@@ -85,6 +86,10 @@ class Wave:
             return code - 128
         if 193 <= code <= 208:
             return (192 - code) & (MASK32 if width == 1 else (1 << 64) - 1)
+        if code in INLINE_FLOATS and width == 2:
+            # ISA RDNA 2 §5.2 (p. 32) : codes 240-248 « single or double floats », 1/(2π) double
+            # 0x3fc45f306dc9c882 ; une source 64 bits lit le double (LLVM : isInlinableLiteral64).
+            return rdna2_exec_cmp64.double_bits(rdna2_exec_cmp64.INLINE_DOUBLES[code])
         if code in INLINE_FLOATS:
             return float_bits(INLINE_FLOATS[code])
         raise Untranslated(f"opérande scalaire {code} non pris en charge")
@@ -92,6 +97,8 @@ class Wave:
     def write_scalar(self, code, value, width=1):
         if code == NULL:
             return
+        if code + width > SCALAR_REGISTERS:     # ex. : masque wave64 dans s127, s128 n'existe pas
+            raise Untranslated(f"écriture de {32 * width} bits au-delà de s127 (s{code})")
         self.s[code] = value & MASK32
         if width == 2:
             self.s[code + 1] = (value >> 32) & MASK32
@@ -149,7 +156,10 @@ def step(wave, data):
     if family == "VOP3P":
         word = int.from_bytes(data[wave.pc:wave.pc + 2 * rdna2.DWORD], "little")
         literal = struct.unpack_from("<I", data, wave.pc + 2 * rdna2.DWORD)[0] if size > 2 else None
-        rdna2_exec_dot.execute(wave, name, word, literal)
+        if name in rdna2_exec_int16.PACKED:
+            rdna2_exec_int16.execute_packed(wave, name, word, literal)
+        else:
+            rdna2_exec_dot.execute(wave, name, word, literal)
         wave.pc += size * rdna2.DWORD
         return True
     word = struct.unpack_from("<I", data, wave.pc)[0]
@@ -173,6 +183,8 @@ def step(wave, data):
         rdna2_exec_wide.execute(wave, name, (fields["src0"],), fields["vdst"], literal)
     elif name in rdna2_exec_cmp64.COMPARE64 and family == "VOPC":
         rdna2_exec_cmp64.execute(wave, name, (fields["src0"], VGPR_FIRST + fields["vsrc1"]), literal)
+    elif name in rdna2_exec_cmpf16.COMPAREF16 and family == "VOPC":   # before is_ext: refuses SDWA/DPP
+        rdna2_exec_cmpf16.execute(wave, name, fields, literal)
     elif name in rdna2_exec_movrel.VECTOR and family == "VOP1":
         if rdna2_exec_ext.is_ext(family, fields.get("src0")):
             raise Untranslated(f"instruction non traduite : {name} (SDWA/DPP)")
@@ -181,6 +193,8 @@ def step(wave, data):
         if rdna2_exec_ext.is_ext(family, fields.get("src0")):
             raise Untranslated(f"instruction non traduite : {name} (SDWA/DPP)")
         _carry(wave, name, fields, literal)
+    elif name in rdna2_exec_f16.OPERATIONS:     # avant is_ext : les formes SDWA/DPP du f16 sont refusées par rdna2_exec_f16
+        rdna2_exec_f16.execute(wave, name, fields, literal)
     elif rdna2_exec_ext.is_ext(family, fields.get("src0")):
         rdna2_exec_ext.execute(wave, family, name, fields, literal or 0)
     elif name in VECTOR:
@@ -251,7 +265,8 @@ def run(data, wave=None, max_steps=MAX_STEPS):
 VOP2_CARRY = frozenset({"v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"})
 EXECUTABLE = frozenset({"s_endpgm", *SCALAR, *VECTOR, *VECTOR_COMPARE, *VECTOR_NO_OPERATION, *BRANCHES,
                         *VOP2_CARRY, *rdna2_exec_cmp64.COMPARE64, *rdna2_exec_wide.OPERATIONS,
-                        *rdna2_exec_movrel.VECTOR, *rdna2_exec_movrel.SCALAR, *rdna2_exec_pc.OPERATIONS})
+                        *rdna2_exec_movrel.VECTOR, *rdna2_exec_movrel.SCALAR, *rdna2_exec_pc.OPERATIONS,
+                        *rdna2_exec_f16.OPERATIONS, *rdna2_exec_cmpf16.COMPAREF16})
 
 
 def executable(family, name):
@@ -259,7 +274,7 @@ def executable(family, name):
     if family == "VOP3":
         return name in rdna2_exec_vop3.EXECUTABLE
     if family == "VOP3P":
-        return rdna2_exec_dot.supports(name)
+        return rdna2_exec_dot.supports(name) or name in rdna2_exec_int16.PACKED
     if family in rdna2_exec_graphics.FAMILIES:
         return rdna2_exec_graphics.supports(family, name)
     if family in rdna2_exec_image.FAMILIES:

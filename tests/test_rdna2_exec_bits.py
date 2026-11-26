@@ -239,3 +239,23 @@ def test_32_bit_scalar_operations_match_interpreter_on_gpu():
     expected, actual = compare(scalar_parity_program())
     assert actual == expected
 
+
+
+def test_signed_64_bit_sources_sign_extend_a_32_bit_literal():
+    """ISA section 6.2.1 (p. 43): a literal is sign-extended for a signed 64-bit source, zero-extended else."""
+    wave = run(
+        sop2("s_ashr_i64", 40, LITERAL, const(1)), 0x8000_0000, scc_into(50),
+        sop2("s_ashr_i64", 42, LITERAL, const(4)), 0x7FFF_FFFF,
+        *literal(60, 40 << 16 | 4),                                     # décalage 4, largeur 40
+        sop2("s_bfe_i64", 44, LITERAL, 60), 0x8000_0000,
+        sop2("s_bfe_u64", 46, LITERAL, 60), 0x8000_0000,                # non signé : zéro-étendu
+        sop1("s_flbit_i32_i64", 51, LITERAL), 0xFFFF_FFF0,
+        sop1("s_flbit_i32_b64", 52, LITERAL), 0xFFFF_FFF0,              # bits : zéro-étendu
+        sop1("s_mov_b64", 48, LITERAL), 0x8000_0000)                    # b64 : zéro-étendu
+    assert pair(wave, 40) == 0xFFFF_FFFF_C000_0000 and wave.s[50] == 1
+    assert pair(wave, 42) == 0x07FF_FFFF
+    assert pair(wave, 44) == 0xFFFF_FFFF_F800_0000
+    assert pair(wave, 46) == 0x0800_0000
+    assert wave.s[51] == 60                                             # bit 3 : premier bit différent du signe
+    assert wave.s[52] == 32
+    assert pair(wave, 48) == 0x8000_0000

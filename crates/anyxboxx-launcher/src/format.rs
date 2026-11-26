@@ -8,6 +8,10 @@ const DOS_MAGIC: &[u8; 2] = b"MZ";
 const PE_SIGNATURE: &[u8; 4] = b"PE\0\0";
 const SECTION_HEADER_BYTES: usize = 40;
 const RPF7_MAGIC: &[u8; 4] = b"RPF7";
+/// The magic of the newer archives of this game, as it is stored in the file (the text "RPF9" read
+/// from the other end). Measured on the game's own shaders.rpf: its table layout is not known
+/// here, so only the magic and a header-sized file are checked.
+const RPF9_MAGIC: &[u8; 4] = b"9FPR";
 const RPF7_HEADER_BYTES: u64 = 16;
 const RPF7_ENTRY_BYTES: u64 = 16;
 
@@ -46,11 +50,18 @@ pub fn check_pe(head: &[u8], len: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks an RPF7 archive header: its magic, and that the entry and name tables it declares lie
-/// inside the file (a file cut inside its tables fails).
+/// Checks an RPF archive header (RPF7: its magic, and that the entry and name tables it declares lie
+/// inside the file, a file cut inside its tables fails; RPF9: its magic and header only).
 pub fn check_rpf7(head: &[u8], len: u64) -> Result<(), String> {
+    if head.get(..4) == Some(RPF9_MAGIC) {
+        return if len >= RPF7_HEADER_BYTES {
+            Ok(())
+        } else {
+            Err(format!("RPF9 archive cut inside its header ({len} bytes)"))
+        };
+    }
     if head.get(..4) != Some(RPF7_MAGIC) {
-        return Err("not an RPF7 archive (bad magic)".to_string());
+        return Err("not an RPF archive (bad magic)".to_string());
     }
     let entries = read_u32(head, 4).ok_or("RPF7 header cut short")? as u64;
     let names = read_u32(head, 8).ok_or("RPF7 header cut short")? as u64;
@@ -140,5 +151,19 @@ mod tests {
     fn rpf7_bad_magic_and_short_headers_fail() {
         assert!(check_rpf7(b"RPF2 and more bytes here", 30).is_err());
         assert!(check_rpf7(b"RPF7", 4).is_err());
+    }
+
+    #[test]
+    fn an_rpf9_archive_passes_on_its_magic_and_a_whole_header() {
+        let mut head = b"9FPR".to_vec();
+        head.extend_from_slice(&[0u8; 28]);
+        assert!(check_rpf7(&head, 400_000_000).is_ok());
+        assert!(check_rpf7(&head[..8], 8).is_err());
+    }
+
+    #[test]
+    fn an_unknown_archive_magic_is_refused() {
+        let head = b"NOPE0000000000000000".to_vec();
+        assert!(check_rpf7(&head, 100).is_err());
     }
 }

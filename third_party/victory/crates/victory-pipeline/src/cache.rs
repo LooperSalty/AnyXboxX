@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -11,18 +11,11 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
-        Self::from_parts(converter.id(), converter.version(), &[input])
-    }
-
-    /// Identifies a conversion without copying the input parts together.
-    pub fn from_parts(id: &str, version: u32, input: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
-        h.update(id.as_bytes());
+        h.update(converter.id().as_bytes());
         h.update(&[0]);
-        h.update(&version.to_le_bytes());
-        for part in input {
-            h.update(part);
-        }
+        h.update(&converter.version().to_le_bytes());
+        h.update(input);
         CacheKey(h.finalize())
     }
 
@@ -62,26 +55,35 @@ impl Cache {
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
-        self.write(&key, &output)?;
-        Ok(path)
-    }
-
-    /// Publishes an entry atomically, replacing an unreadable entry if needed.
-    pub fn write(&self, key: &CacheKey, output: &[u8]) -> Result<()> {
-        let path = self.path_for(key);
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.write_all(output)?;
-        tmp.persist(path)?;
-        Ok(())
+        // Write-then-rename so readers never see partial output.
+        let tmp = tempfile_in(dir);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let written = file.write_all(&output);
+        drop(file);
+        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        published?;
+        Ok(path)
     }
+}
+
+fn tempfile_in(dir: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(".tmp-{}-{n}", std::process::id()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Upper {

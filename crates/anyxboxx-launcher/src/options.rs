@@ -3,9 +3,8 @@
 //! names it may use: a test checks each of them against VIctory's own sources in this tree, so an
 //! option never names a variable nothing reads.
 //!
-//! Wanted by the maintainer but not offered, because this tree's VIctory has nothing behind them:
-//! an FPS overlay, auto-pressing A on the start screens, a frame-time CSV, Discord presence and the
-//! Series S console profile.
+//! Not offered, because the Neptune tree of VIctory has nothing behind them: the Series S console
+//! profile. Discord presence stays off (VICTORY_DISCORD=0, set by `anyxboxx run`).
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +14,24 @@ pub const DISPLAY_MODE: &str = "VICTORY_DISPLAY_MODE";
 pub const WINDOW_MODE: &str = "VICTORY_WINDOW_MODE";
 pub const KEYBOARD: &str = "VICTORY_KEYBOARD";
 pub const LOG: &str = "VICTORY_LOG";
+/// `VICTORY_OVERLAY=0` turns the stats overlay off; F10 shows and hides it otherwise.
+pub const OVERLAY: &str = "VICTORY_OVERLAY";
+/// Taps A on the start screens for 150 seconds (the same value as `--auto-a`).
+pub const AUTO_A: &str = "VICTORY_AUTO_A";
+/// One row a second into the cache folder's frametime.csv.
+pub const FRAMETIME_DUMP: &str = "VICTORY_FRAMETIME_DUMP";
 /// Every variable an option may set (the preset's own are in `Preset::overrides`); the tests
 /// check them against VIctory's sources.
 #[cfg(test)]
-pub const ENV_NAMES: [&str; 4] = [DISPLAY_MODE, WINDOW_MODE, KEYBOARD, LOG];
+pub const ENV_NAMES: [&str; 7] = [
+    DISPLAY_MODE,
+    WINDOW_MODE,
+    KEYBOARD,
+    LOG,
+    OVERLAY,
+    AUTO_A,
+    FRAMETIME_DUMP,
+];
 
 /// VIctory accepts a display size inside these bounds and falls back to 4K outside them.
 const WIDTH_RANGE: (u32, u32) = (640, 7680);
@@ -46,19 +59,20 @@ impl Preset {
         match self {
             Preset::Fast => "The profile as measured: the best speed known so far.",
             Preset::Quality => {
-                "Longer shader loops and bigger card buffers. Not measured: expect it to be slower."
+                "Picture first: windows and buffers read fresh each frame. About half the frame rate (measured 7 to 9 fps against 14 to 17)."
             }
         }
     }
 
-    /// The variables this preset adds on top of the profile. Fast is the profile itself.
+    /// The variables this preset adds on top of the profile. Fast is the profile itself; Quality
+    /// is main's `-Quality` set (`anyxboxx::run::QUALITY`).
     pub fn overrides(self) -> Vec<Pair> {
         match self {
             Preset::Fast => Vec::new(),
-            Preset::Quality => vec![
-                ("VICTORY_SHADER_LOOP_LIMIT".to_string(), "512".to_string()),
-                ("VICTORY_CARD_BUFFERS_MB".to_string(), "2048".to_string()),
-            ],
+            Preset::Quality => anyxboxx::run::QUALITY
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         }
     }
 }
@@ -219,6 +233,12 @@ pub struct LaunchOptions {
     pub log: LogLevel,
     /// Translate the shaders into the cache before starting the game.
     pub warm_first: bool,
+    /// The stats overlay (F10 shows and hides it). Off sets VICTORY_OVERLAY=0.
+    pub overlay: bool,
+    /// Taps A through the start screens for 150 seconds.
+    pub auto_a: bool,
+    /// Writes a frame-time CSV into the cache folder.
+    pub frametime_dump: bool,
 }
 
 impl Default for LaunchOptions {
@@ -232,6 +252,9 @@ impl Default for LaunchOptions {
             keyboard: Keyboard::Auto,
             log: LogLevel::Default,
             warm_first: false,
+            overlay: true,
+            auto_a: false,
+            frametime_dump: false,
         }
     }
 }
@@ -281,6 +304,15 @@ impl LaunchOptions {
         if let Some(value) = log {
             pairs.push((LOG.to_string(), value.to_string()));
         }
+        if !self.overlay {
+            pairs.push((OVERLAY.to_string(), "0".to_string()));
+        }
+        if self.auto_a {
+            pairs.push((AUTO_A.to_string(), "150".to_string()));
+        }
+        if self.frametime_dump {
+            pairs.push((FRAMETIME_DUMP.to_string(), "1".to_string()));
+        }
         pairs
     }
 }
@@ -316,7 +348,41 @@ mod tests {
         assert_eq!(get(WINDOW_MODE), Some("borderless"));
         assert_eq!(get(KEYBOARD), Some("azerty"));
         assert_eq!(get(LOG), Some("debug"));
-        assert_eq!(get("VICTORY_SHADER_LOOP_LIMIT"), Some("512"));
+        assert_eq!(get("VICTORY_CARD_WINDOWS_MB"), Some("0"));
+        assert_eq!(get("VICTORY_TEXTURE_STAGE_MB"), Some("192"));
+    }
+
+    #[test]
+    fn overlay_auto_a_and_frametime_are_switches_of_their_own() {
+        let options = LaunchOptions {
+            overlay: false,
+            auto_a: true,
+            frametime_dump: true,
+            ..LaunchOptions::default()
+        };
+        let pairs = options.env_pairs();
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get(OVERLAY), Some("0"));
+        assert_eq!(get(AUTO_A), Some("150"));
+        assert_eq!(get(FRAMETIME_DUMP), Some("1"));
+        // The defaults keep the overlay on and set nothing else.
+        assert!(LaunchOptions::default().overlay);
+    }
+
+    #[test]
+    fn quality_is_exactly_mains_quality_set() {
+        let quality = Preset::Quality.overrides();
+        let expected: Vec<Pair> = anyxboxx::run::QUALITY
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        assert_eq!(quality, expected);
+        assert_eq!(quality.len(), 5);
     }
 
     #[test]

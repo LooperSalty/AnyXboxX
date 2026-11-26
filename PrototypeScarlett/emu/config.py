@@ -56,9 +56,27 @@ def _hex(text):
         return 0
 
 
+def manifest_path(folder):
+    """Manifest of a package folder, its name matched without case.
+
+    Microsoft Learn names it `MicrosoftGame.config`; Windows ignores the case, Linux (Proton) does not.
+    The exact name wins, then the first entry whose name matches once lowered.
+    """
+    folder = Path(folder)
+    exact = folder / MANIFEST
+    if exact.is_file():
+        return exact
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError:
+        return exact
+    wanted = MANIFEST.lower()
+    return next((entry for entry in entries if entry.name.lower() == wanted and entry.is_file()), exact)
+
+
 def read_package(folder):
     folder = Path(folder).resolve()
-    manifest = folder / MANIFEST
+    manifest = manifest_path(folder)
     if not manifest.is_file():
         raise ValueError(f"Le dossier choisi ne contient pas {MANIFEST}.")
     if manifest.stat().st_size > MAX_MANIFEST:

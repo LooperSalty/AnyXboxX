@@ -1,4 +1,4 @@
-//! The steps of a launch as reusable pieces: the CLI (`anyxboxx run`) chains them like the
+//! The steps of a launch as reusable pieces: the CLI (`anyxboxx run`) chains them like main's
 //! script did, the graphical launcher (`crates/anyxboxx-launcher`) drives them one by one.
 
 use std::ffi::{OsStr, OsString};
@@ -8,7 +8,7 @@ use std::process::Command;
 use super::{RunArgs, RunError, settings};
 
 pub const GAME_EXE: &str = "game_scarlett_master.exe";
-/// The game's two DLLs translated with its shaders by `--precompile`.
+/// The game's two DLLs warmed with its shaders by `--precompile`.
 pub const PRECOMPILED_DLLS: [&str; 2] = ["XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll"];
 pub const SHADERS: &str = "shaders.rpf";
 
@@ -21,12 +21,14 @@ pub type Env = Vec<(String, OsString)>;
 pub struct Victory {
     pub manifest: Option<PathBuf>,
     pub exe: PathBuf,
+    /// Built with the diag profile and the diagnostics feature (`--diag`, `--dred`).
+    pub diag: bool,
 }
 
 impl Victory {
-    /// VIctory in `repo`; its target folder is `third_party\victory\target` unless
-    /// `CARGO_TARGET_DIR` is set (VIctory is its own Cargo workspace).
-    pub fn locate(repo: &Path) -> Result<Self, RunError> {
+    /// VIctory in `repo`, release build by default; its target folder is
+    /// `third_party\victory\target` unless `CARGO_TARGET_DIR` is set (VIctory is its own workspace).
+    pub fn locate(repo: &Path, diag: bool) -> Result<Self, RunError> {
         let victory = repo.join("third_party").join("victory");
         let manifest = victory.join("Cargo.toml");
         if !manifest.is_file() {
@@ -34,9 +36,11 @@ impl Victory {
         }
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map_or_else(|| victory.join("target"), PathBuf::from);
+        let profile = if diag { "diag" } else { "release" };
         Ok(Victory {
             manifest: Some(manifest),
-            exe: target.join("diag").join("victory.exe"),
+            exe: target.join(profile).join("victory.exe"),
+            diag,
         })
     }
 
@@ -49,25 +53,36 @@ impl Victory {
         Ok(Victory {
             manifest: None,
             exe: exe.to_path_buf(),
+            diag: false,
         })
     }
 
-    /// `cargo build` of the diag profile with diagnostics: does nothing when victory.exe is
-    /// current, rebuilds it after a pull that changes third_party/victory. `None` for a
-    /// prebuilt `victory.exe`.
+    /// `cargo build` of the release profile (or the diag profile with diagnostics): does nothing
+    /// when victory.exe is current. `None` for a prebuilt `victory.exe`.
     pub fn build_command(&self) -> Option<Command> {
         let manifest = self.manifest.as_ref()?;
         let mut command = Command::new("cargo");
-        command.args(["build", "--profile", "diag", "-p", "victory"]);
-        command.args(["--features", "diagnostics", "--manifest-path"]);
-        command.arg(manifest);
+        if self.diag {
+            command.args(["build", "--profile", "diag", "-p", "victory"]);
+            command.args(["--features", "diagnostics"]);
+        } else {
+            command.args(["build", "--release", "-p", "victory"]);
+        }
+        command.arg("--manifest-path").arg(manifest);
         Some(command)
     }
 
-    /// `victory translate --cache --pipelines --used-pipelines` on shaders.rpf, the game and its
-    /// two DLLs, with the game's environment (the cache key depends on it). Only these files of
-    /// the game folder are read, never the folder around it.
-    pub fn translate_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
+    /// `victory warm <archives>` with the game's environment (the cache key depends on it).
+    pub fn warm_command(&self, archives: &[PathBuf], env: &Env) -> Command {
+        let mut command = Command::new(&self.exe);
+        command.arg("warm").args(archives);
+        command.envs(pairs(env));
+        command
+    }
+
+    /// `victory warm` on shaders.rpf, the game and its two DLLs (`--precompile`), with the game's
+    /// environment. Only these files of the game folder are read, never the folder around them.
+    pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
         let shaders = game_dir.join(SHADERS);
         let dlls: Vec<PathBuf> = PRECOMPILED_DLLS.iter().map(|d| game_dir.join(d)).collect();
         for needed in std::iter::once(&shaders).chain(&dlls) {
@@ -76,8 +91,8 @@ impl Victory {
             }
         }
         let mut command = Command::new(&self.exe);
-        command.args(["translate", "--cache", "--pipelines", "--used-pipelines"]);
         command
+            .arg("warm")
             .arg(&shaders)
             .arg(game_dir.join(GAME_EXE))
             .args(&dlls);
@@ -95,6 +110,27 @@ impl Victory {
         command.envs(pairs(env));
         command
     }
+}
+
+/// The `.rpf` archives directly in `game_dir`, sorted by name (never the folder's other trees).
+pub fn warm_archives(game_dir: &Path) -> Result<Vec<PathBuf>, RunError> {
+    let entries = std::fs::read_dir(game_dir)
+        .map_err(|e| RunError::Spawn(game_dir.display().to_string(), e))?;
+    let mut archives: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rpf"))
+        })
+        .collect();
+    if archives.is_empty() {
+        return Err(RunError::NoArchive(game_dir.display().to_string()));
+    }
+    archives.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(archives)
 }
 
 /// The game executable of `game_dir`, which must exist.

@@ -19,6 +19,20 @@ fn names(env: &[(String, OsString)]) -> Vec<&str> {
     env.iter().map(|(k, _)| k.as_str()).collect()
 }
 
+fn value(env: &[(String, OsString)], name: &str) -> Option<OsString> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+}
+
+/// Always set, before the tuned set: the script sets these two first.
+const HEAD: [&str; 3] = [
+    "VICTORY_GAME_DIR",
+    "VICTORY_DISCORD",
+    "VICTORY_OCEAN_READBACK",
+];
+
 #[test]
 fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
     let env = settings::base(&parse(&["--game-dir", "G"]));
@@ -26,22 +40,77 @@ fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
         env[0],
         ("VICTORY_GAME_DIR".to_string(), OsString::from("G"))
     );
-    assert_eq!(env.len(), 1 + TUNED.len());
+    assert_eq!(env.len(), HEAD.len() + TUNED.len());
     assert!(
         TUNED
             .iter()
-            .all(|(k, v)| env.iter().any(|(n, x)| n == k && x == v))
+            .all(|(k, v)| value(&env, k) == Some(OsString::from(v)))
+    );
+    assert_eq!(value(&env, "VICTORY_DISCORD"), Some(OsString::from("0")));
+    assert_eq!(
+        value(&env, "VICTORY_OCEAN_READBACK"),
+        Some(OsString::from("1"))
     );
     let env = settings::base(&parse(&["--game-dir", "G", "--no-tuned-settings"]));
-    assert_eq!(names(&env), ["VICTORY_GAME_DIR"]);
+    assert_eq!(names(&env), HEAD);
+}
+
+#[test]
+fn the_tuned_set_is_neptune_s_measured_set() {
+    // Golden copy: tests/fixtures/lancer_victory_neptune.ps1 (checked in tests/test_anyxboxx_run.py).
+    assert_eq!(TUNED.len(), 39);
+    assert!(TUNED.contains(&("VICTORY_HEAP_PASS_DIRTY", "1")));
+    assert!(TUNED.contains(&("VICTORY_CARD_WINDOWS_MB", "1536")));
+    assert!(TUNED.contains(&("VICTORY_RELAY", "2")));
+}
+
+#[test]
+fn quality_is_applied_after_the_tuned_set_and_before_overrides() {
+    let env = settings::base(&parse(&[
+        "--game-dir",
+        "G",
+        "--quality",
+        "--override",
+        "VICTORY_RELAY=0",
+    ]));
+    assert_eq!(
+        value(&env, "VICTORY_CARD_WINDOWS_MB"),
+        Some(OsString::from("0"))
+    );
+    assert_eq!(
+        value(&env, "VICTORY_TEXTURE_STAGE_MB"),
+        Some(OsString::from("192"))
+    );
+    assert_eq!(value(&env, "VICTORY_RELAY"), Some(OsString::from("0")));
+    let quality_at = env
+        .iter()
+        .position(|(k, _)| k == "VICTORY_CARD_WINDOWS_MB")
+        .unwrap();
+    let override_at = env.iter().rposition(|(k, _)| k == "VICTORY_RELAY").unwrap();
+    assert!(quality_at < override_at);
+}
+
+#[test]
+fn overrides_must_be_victory_variables_in_key_value_form() {
+    assert!(Cli::try_parse_from(["anyxboxx", "--game-dir", "G", "--override", "PATH=x"]).is_err());
+    assert!(
+        Cli::try_parse_from(["anyxboxx", "--game-dir", "G", "--override", "VICTORY_RELAY"])
+            .is_err()
+    );
+    let args = parse(&["--game-dir", "G", "--override", "VICTORY_LATE_WAIT=12000"]);
+    assert_eq!(
+        args.overrides,
+        [("VICTORY_LATE_WAIT".to_string(), "12000".to_string())]
+    );
 }
 
 #[test]
 fn the_relay_and_dred_are_never_in_the_tuned_table() {
+    // Relay is set by Neptune's tuned set itself (VICTORY_RELAY=2); DRED and XG stay opt-in.
     assert!(
         TUNED
             .iter()
-            .all(|(k, _)| !k.contains("RELAY") && !k.contains("DRED") && !k.contains("XG"))
+            .all(|(k, _)| !k.contains("DRED") && !k.contains("XG"))
     );
 }
 
@@ -55,17 +124,23 @@ fn opt_in_switches_add_their_variable() {
         "--batch-card-rehash",
         "--skip-pipelines",
         "3",
+        "--auto-a",
+        "--frametime-dump",
     ]));
+    let mut expected = HEAD.to_vec();
+    expected.extend([
+        "VICTORY_AUTO_A",
+        "VICTORY_FRAMETIME_DUMP",
+        "VICTORY_D3D12_DRED",
+        "VICTORY_CARD_REHASH_RUNS",
+        "VICTORY_SKIP_PIPELINES",
+    ]);
+    assert_eq!(names(&env), expected);
+    assert_eq!(value(&env, "VICTORY_AUTO_A"), Some(OsString::from("150")));
     assert_eq!(
-        names(&env),
-        [
-            "VICTORY_GAME_DIR",
-            "VICTORY_D3D12_DRED",
-            "VICTORY_CARD_REHASH_RUNS",
-            "VICTORY_SKIP_PIPELINES"
-        ]
+        value(&env, "VICTORY_SKIP_PIPELINES"),
+        Some(OsString::from("3"))
     );
-    assert_eq!(env[3].1, OsString::from("3"));
     // An empty value is not passed, like `-SkipPipelines ''` in the script.
     let env = settings::base(&parse(&[
         "--game-dir",
@@ -74,7 +149,14 @@ fn opt_in_switches_add_their_variable() {
         "--skip-pipelines",
         "",
     ]));
-    assert_eq!(names(&env), ["VICTORY_GAME_DIR"]);
+    assert_eq!(names(&env), HEAD);
+}
+
+#[test]
+fn dred_needs_the_diag_profile() {
+    assert!(parse(&["--game-dir", "G", "--dred"]).uses_diag());
+    assert!(parse(&["--game-dir", "G", "--diag"]).uses_diag());
+    assert!(!parse(&["--game-dir", "G"]).uses_diag());
 }
 
 #[test]
@@ -87,10 +169,13 @@ fn powershell_names_are_accepted() {
         "--XgMode",
         "compare",
         "--Precompile",
+        "--Warm",
+        "--Quality",
+        "--AutoA",
     ]);
     assert_eq!(args.game_dir, PathBuf::from("G"));
     assert_eq!(args.xg_mode, XgMode::Compare);
-    assert!(args.precompile);
+    assert!(args.precompile && args.warm && args.quality && args.auto_a);
 }
 
 #[test]
@@ -110,12 +195,11 @@ fn the_xg_library_is_passed_with_an_absolute_path_and_its_mode() {
         dll.to_str().unwrap(),
     ]);
     let env = environment(&args).unwrap();
-    assert_eq!(
-        names(&env),
-        ["VICTORY_GAME_DIR", "VICTORY_XG_DLL", "VICTORY_XG_MODE"]
-    );
-    assert!(PathBuf::from(&env[1].1).is_absolute());
-    assert_eq!(env[2].1, OsString::from("real"));
+    let mut expected = HEAD.to_vec();
+    expected.extend(["VICTORY_XG_DLL", "VICTORY_XG_MODE"]);
+    assert_eq!(names(&env), expected);
+    assert!(PathBuf::from(value(&env, "VICTORY_XG_DLL").unwrap()).is_absolute());
+    assert_eq!(value(&env, "VICTORY_XG_MODE"), Some(OsString::from("real")));
 }
 
 #[test]
@@ -134,14 +218,53 @@ fn a_prebuilt_victory_has_nothing_to_build() {
 }
 
 #[test]
-fn a_located_victory_is_built_with_cargo() {
+fn a_located_victory_is_built_in_release_by_default_and_in_diag_on_request() {
     let repo = std::env::temp_dir().join(format!("anyxboxx-run-located-{}", std::process::id()));
     let victory = repo.join("third_party").join("victory");
     std::fs::create_dir_all(&victory).unwrap();
     std::fs::write(victory.join("Cargo.toml"), b"").unwrap();
-    let build = Victory::locate(&repo).unwrap().build_command().unwrap();
+    let release = Victory::locate(&repo, false).unwrap();
+    let diag = Victory::locate(&repo, true).unwrap();
     std::fs::remove_dir_all(&repo).unwrap();
+    assert!(
+        release.exe.ends_with("release/victory.exe")
+            || release.exe.ends_with(r"release\victory.exe")
+    );
+    assert!(diag.exe.ends_with(r"diag\victory.exe") || diag.exe.ends_with("diag/victory.exe"));
+    let build = release.build_command().unwrap();
     assert_eq!(build.get_program(), "cargo");
+    assert!(build.get_args().any(|a| a == "--release"));
+    assert!(
+        diag.build_command()
+            .unwrap()
+            .get_args()
+            .any(|a| a == "diagnostics")
+    );
+}
+
+#[test]
+fn warm_archives_are_the_game_folder_rpf_files_only_sorted() {
+    let dir = std::env::temp_dir().join(format!("anyxboxx-run-warm-{}", std::process::id()));
+    let nested = dir.join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(dir.join("b.rpf"), b"").unwrap();
+    std::fs::write(dir.join("A.RPF"), b"").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"").unwrap();
+    std::fs::write(nested.join("deep.rpf"), b"").unwrap();
+    let found = steps::warm_archives(&dir);
+    let empty =
+        std::env::temp_dir().join(format!("anyxboxx-run-warm-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
+    let none = steps::warm_archives(&empty);
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&empty).unwrap();
+    let names: Vec<String> = found
+        .unwrap()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["A.RPF", "b.rpf"]);
+    assert!(matches!(none, Err(RunError::NoArchive(_))));
 }
 
 #[test]

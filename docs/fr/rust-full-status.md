@@ -2,6 +2,12 @@
 
 Version anglaise : [../rust-full-status.md](../rust-full-status.md). Plan : [architecture-rust.md](architecture-rust.md).
 
+## Base : main (VIctory Neptune)
+
+Cette branche contient désormais `origin/main` (fusion de la PR #277 et de tout ce qui la précède) : `third_party/victory` est l'arbre Neptune de main, avec deux de nos correctifs réappliqués par-dessus (VICTORY_KEYBOARD et VICTORY_WINDOW_MODE=borderless, commit b27dbae4), puis les changements de rust/full sur xmem (EraFields) et xasync. `anyxboxx run` donne à VIctory le jeu de réglages du lanceur de main : build release, jeu Neptune (39 variables, mesuré le 25 novembre 2026), `-Quality` (`--quality`), `--override`, `--auto-a`, `--frametime-dump`, `--warm`, `--precompile`, `--diag`/`--dred`. La copie de référence du script de main est `tests/fixtures/lancer_victory_neptune.ps1` ; `tests/test_anyxboxx_run.py` et `tests/test_lanceur_victory.py` comparent les réglages Rust à elle. Le lanceur graphique démarre le jeu détaché (journal sous `%LOCALAPPDATA%AnyXboxXogs`), se ferme dès que le jeu tourne sauf si « Garder le lanceur ouvert » est coché, et réchauffe le cache des shaders automatiquement quand le marqueur de ce build et de cet environnement manque ou est périmé (`warm-state.txt`).
+
+À régler après la fusion : les tests de parité `anyxboxx-rdna2-ref` (`tests/test_rdna2_ref_parity.py`, 5 tests) échouent : le modèle Python de main exécute désormais des formes que l'interpréteur Rust refuse encore (VOP3P, SDWA/DPP de VOPC, accès typés aux tampons). Elles doivent être portées dans `crates/anyxboxx-rdna2-ref` avant la fusion de cette branche.
+
 ## La tester en local (Windows)
 
 ```powershell
@@ -68,7 +74,7 @@ Profils (`crates/anyxboxx-launcher/profiles.toml`, un test chacun) :
 
 | Composant (avant) | Maintenant sur `rust/full` | Vérification de parité | Ancien code |
 | --- | --- | --- | --- |
-| `tools/lancer_victory.ps1` (PowerShell) | `anyxboxx run` (`crates/anyxboxx`) | mêmes appels, même environnement `VICTORY_*` et mêmes codes de sortie que le script, avec un faux cargo et un faux victory.exe | **supprimé** ; `tests/test_anyxboxx_run.py` garde les attentes |
+| `anyxboxx run` (PowerShell) | `anyxboxx run` (`crates/anyxboxx`) | mêmes appels, même environnement `VICTORY_*` et mêmes codes de sortie que le script, avec un faux cargo et un faux victory.exe | **supprimé** ; `tests/test_anyxboxx_run.py` garde les attentes |
 | `emu/loader.py` (chargeur PE) | `crates/anyxboxx-pe` (sur `victory-pe`) | `tests/test_rust_pe_parity.py` : 13 images, même JSON et mêmes protections de pages | gardé (le bac à sable Python s'en sert encore) |
 | `--rapport` (`emu/report.py`, `config.py`) | `anyxboxx rapport` (`crates/anyxboxx-report`) | `tests/test_rust_rapport_parity.py` : même texte sur 7 cibles, mêmes refus sur 5 | gardé (utilisé par la CLI Python et les outils) |
 | `--traduction` | `anyxboxx traduction` | `tests/test_rust_traduction_parity.py` : même tableau, SVG identique à l'octet sur 6 configurations | gardé |

@@ -23,23 +23,23 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
+pub mod frametime;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
-mod l6;
-mod l7perf;
+mod overlay;
 #[cfg(windows)]
-mod l7;
+mod pixels;
 #[cfg(windows)]
-mod l7unlit;
-#[cfg(windows)]
-mod l8ww;
-#[cfg(windows)]
-mod l9guard;
+mod screenshot;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -49,6 +49,7 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+mod heap_pass;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -60,10 +61,20 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod ramline;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod windowup;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+pub mod titlemem;
 #[cfg(windows)]
 mod watch;
 
@@ -73,6 +84,7 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    KernelWrite, kernel_write, kernel_writes_held, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_reserved, title_memory_written, writing as kernel_will_write,
+    Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,
+    title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
+    written_through_view,
 };

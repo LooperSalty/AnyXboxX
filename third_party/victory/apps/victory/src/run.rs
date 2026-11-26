@@ -19,25 +19,32 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // `VICTORY_FRAMETIME_DUMP=1`: write beside the rest of Victory's cache.
+    if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
+        victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
-    }
+    let label = match victory_game::identify(&hash) {
+        Some(build) => format!("{} ({hash})", build.label),
+        None => format!("unknown ({hash})"),
+    };
+    println!("build          {label}");
+    victory_gpu::frametime::use_build_label(label);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
-    // whole run (two blocks of 114.7 MB each for Grand Theft Auto VI, in
+    // whole run (two blocks of 114.7 MB each for the title, in
     // physical memory: run 65's memory map).
     drop(prepared);
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    victory_hle::runtime::set_image_size(image.base(), image.info().size_of_image as usize);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -75,6 +82,7 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
     }
 
     let policy = match unimplemented {
@@ -192,7 +200,7 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
@@ -247,6 +255,7 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

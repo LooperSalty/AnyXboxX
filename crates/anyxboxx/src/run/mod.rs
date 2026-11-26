@@ -1,16 +1,20 @@
 //! `anyxboxx run`: builds VIctory (cargo does nothing when it is current) and launches it on the
-//! user's own game folder. Rust replacement of the former `tools/lancer_victory.ps1`, step for step: same
-//! checks, same build command, same environment, same precompile step, same exit code.
+//! user's own game folder. Rust replacement of main's `tools/lancer_victory.ps1`: same checks,
+//! same build, same environment (`tests/fixtures/lancer_victory_neptune.ps1` is the golden copy),
+//! same warm and precompile steps, same exit code.
 
 mod settings;
 mod steps;
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use clap::{Args, ValueEnum};
 
-pub use settings::TUNED;
-pub use steps::{Env, GAME_EXE, PRECOMPILED_DLLS, SHADERS, Victory, environment, game_exe, status};
+pub use settings::{ALWAYS, QUALITY, TUNED};
+pub use steps::{
+    Env, GAME_EXE, PRECOMPILED_DLLS, SHADERS, Victory, environment, game_exe, status, warm_archives,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum XgMode {
@@ -29,7 +33,18 @@ impl XgMode {
     }
 }
 
-/// Options of `anyxboxx run`; the PowerShell names (`--GameDir`…) are accepted as aliases.
+/// A `KEY=VALUE` pair of `--override`; the key must be a VICTORY_* name.
+fn parse_override(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got {text:?}"))?;
+    if !key.starts_with("VICTORY_") {
+        return Err(format!("--override takes VICTORY_* names only: {key:?}"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Options of `anyxboxx run`; the PowerShell names (`--GameDir`...) are accepted as aliases.
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
     /// Folder of the game package (kept outside this repository); must hold game_scarlett_master.exe.
@@ -38,13 +53,31 @@ pub struct RunArgs {
     /// Passed unchanged to VICTORY_SKIP_PIPELINES.
     #[arg(long, alias = "SkipPipelines")]
     pub skip_pipelines: Option<String>,
-    /// Do not set the tuned variables (only VICTORY_GAME_DIR is set).
+    /// Do not set the tuned variables (VICTORY_GAME_DIR, VICTORY_DISCORD and VICTORY_OCEAN_READBACK stay set).
     #[arg(long, alias = "NoTunedSettings")]
     pub no_tuned_settings: bool,
-    /// Turn on device-removed data (VICTORY_D3D12_DRED); slows each frame.
+    /// Picture first: windows and buffers read fresh each frame (about half the frame rate).
+    #[arg(long, alias = "Quality")]
+    pub quality: bool,
+    /// KEY=VALUE VICTORY_* variables set after the tuned set and --quality, for A/B runs. Repeatable.
+    #[arg(long = "override", alias = "Override", value_parser = parse_override)]
+    pub overrides: Vec<(String, String)>,
+    /// Taps A through the start screens for 150 s (VICTORY_AUTO_A=150).
+    #[arg(long, alias = "AutoA")]
+    pub auto_a: bool,
+    /// Writes frametime.csv into the cache folder, one row a second (VICTORY_FRAMETIME_DUMP=1).
+    #[arg(long, alias = "FrametimeDump")]
+    pub frametime_dump: bool,
+    /// Build and run the diag profile with the diagnostics feature instead of the release build.
+    #[arg(long, alias = "Diag")]
+    pub diag: bool,
+    /// Turn on device-removed data (VICTORY_D3D12_DRED); needs the diagnostics build, so implies --diag.
     #[arg(long, alias = "Dred")]
     pub dred: bool,
-    /// Translate shaders.rpf, the game and its two DLLs into the cache before the game.
+    /// Run `victory warm` on the game folder's own .rpf archives before the game (about 7 min the first time).
+    #[arg(long, alias = "Warm")]
+    pub warm: bool,
+    /// Warm shaders.rpf, the game executable and its two DLLs before the game.
     #[arg(long, alias = "Precompile")]
     pub precompile: bool,
     /// Your own copy of the GDK's offline PC xg_xs.dll (never in this repository).
@@ -67,24 +100,33 @@ pub struct RunArgs {
     pub repo: Option<PathBuf>,
 }
 
+impl RunArgs {
+    /// The diag profile serves `--diag`, and `--dred` (which needs its diagnostics).
+    pub fn uses_diag(&self) -> bool {
+        self.diag || self.dred
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     #[error("third_party/victory/Cargo.toml is missing: this copy of AnyXboxX is incomplete.")]
     NoVictory,
-    #[error("victory.exe not found: '{0}'.")]
+    #[error("victory.exe not found: {0:?}.")]
     NoVictoryExe(String),
     #[error("repository not found (pass --repo or set ANYXBOXX_REPO).")]
     NoRepo,
-    #[error("game_scarlett_master.exe not found in '{0}'.")]
+    #[error("game_scarlett_master.exe not found in {0:?}.")]
     NoGame(String),
     #[error("cargo build failed (exit code {0}).")]
     BuildFailed(i32),
-    #[error("xg_xs.dll not found: '{0}'.")]
+    #[error("xg_xs.dll not found: {0:?}.")]
     NoXgDll(String),
-    #[error("--precompile needs '{0}'.")]
+    #[error("--precompile needs {0:?}.")]
     PrecompileInput(String),
-    #[error("victory translate failed (exit code {0}).")]
-    TranslateFailed(i32),
+    #[error("--warm found no .rpf archive in {0:?}.")]
+    NoArchive(String),
+    #[error("victory warm failed (exit code {0}).")]
+    WarmFailed(i32),
     #[error("cannot start {0}: {1}")]
     Spawn(String, std::io::Error),
 }
@@ -94,29 +136,44 @@ pub enum RunError {
 pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
     let victory = match (&args.victory_exe, repo) {
         (Some(exe), _) => Victory::prebuilt(exe)?,
-        (None, Some(repo)) => Victory::locate(repo)?,
+        (None, Some(repo)) => Victory::locate(repo, args.uses_diag())?,
         (None, None) => return Err(RunError::NoRepo),
     };
     game_exe(&args.game_dir)?;
     if let Some(mut build) = victory.build_command() {
-        println!("Building VIctory (diag profile, diagnostics feature)...");
+        let profile = if args.uses_diag() {
+            "diag profile, diagnostics feature"
+        } else {
+            "release"
+        };
+        println!("Building VIctory ({profile})...");
         let code = status(&mut build, "cargo")?;
         if code != 0 {
             return Err(RunError::BuildFailed(code));
         }
     }
     let env = environment(args)?;
-    if args.precompile {
-        let mut translate = victory.translate_command(&args.game_dir, &env)?;
+    if args.warm {
+        let archives = warm_archives(&args.game_dir)?;
         println!(
-            "Precompiling shaders and pipelines into the cache (several minutes the first time)..."
+            "Warming the shader cache from the game's archives (about 7 minutes the first time)..."
         );
-        match status(&mut translate, "victory")? {
-            0 => {}
-            code => return Err(RunError::TranslateFailed(code)),
-        }
+        warm_or_fail(&mut victory.warm_command(&archives, &env))?;
+    }
+    if args.precompile {
+        println!(
+            "Precompiling the shaders of shaders.rpf, the game and its DLLs into the cache..."
+        );
+        warm_or_fail(&mut victory.precompile_command(&args.game_dir, &env)?)?;
     }
     status(&mut victory.game_command(&args.game_dir, &env), "victory")
+}
+
+fn warm_or_fail(command: &mut Command) -> Result<(), RunError> {
+    match status(command, "victory")? {
+        0 => Ok(()),
+        code => Err(RunError::WarmFailed(code)),
+    }
 }
 
 /// Repository root: `--repo`, `ANYXBOXX_REPO`, then the first folder above the binary or the

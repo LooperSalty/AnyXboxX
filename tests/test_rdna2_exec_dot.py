@@ -14,7 +14,7 @@ import test_rdna2_hlsl_wave64 as wave64
 
 VOP3P_PREFIX = 0x33 << 26
 VOP3P_OPCODES = {"v_dot2_i32_i16": 0x14, "v_dot2_u32_u16": 0x15, "v_dot4_i32_i8": 0x16, "v_dot4_u32_u8": 0x17,
-                 "v_dot8_i32_i4": 0x18, "v_dot8_u32_u4": 0x19, "v_dot2_f32_f16": 0x13, "v_pk_add_u16": 0x0A}
+                 "v_dot8_i32_i4": 0x18, "v_dot8_u32_u4": 0x19, "v_dot2_f32_f16": 0x13, "v_pk_add_f16": 0x0F}
 LITERAL, MINUS_ONE = 255, 193
 gpu = pytest.mark.skipif(not rdna2_gpu.available(), reason="dxc ou anyxboxx_gpu_run.exe absent")
 
@@ -72,7 +72,7 @@ def test_undocumented_modifiers_are_refused_by_name(modifiers, named):
 
 
 def test_f16_and_packed_forms_stay_named():
-    for name in ("v_dot2_f32_f16", "v_pk_add_u16"):
+    for name in ("v_dot2_f32_f16", "v_pk_add_f16"):
         assert not rdna2_exec.executable("VOP3P", name)
         with pytest.raises(rdna2_exec.Untranslated, match=name):
             run(*vop3p(name, 2, V + 0, V + 0))

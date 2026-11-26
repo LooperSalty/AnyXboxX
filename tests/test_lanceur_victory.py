@@ -11,10 +11,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VICTORY = ROOT / "third_party" / "victory"
 SETTINGS = ROOT / "crates" / "anyxboxx" / "src" / "run" / "settings.rs"
-TUNED = (
-    "VICTORY_SHADER_LOOP_LIMIT", "VICTORY_LATE_WAIT", "VICTORY_WIDE_BACK",
-    "VICTORY_CARD_BUFFERS_MIN_MB", "VICTORY_CARD_BUFFERS_MB", "VICTORY_DSTORAGE_NOTIFY",
-)
+GOLDEN = ROOT / "tests" / "fixtures" / "lancer_victory_neptune.ps1"
+# The tuned set of main's script (Neptune base), read from its golden copy.
+TUNED = tuple(re.findall(r"(VICTORY_[A-Z0-9_]+)\s*=\s*'",
+                         GOLDEN.read_text(encoding="utf-8").split("$tuned = [ordered]@{")[1].split("\n    }")[0]))
 # Absent from VIctory's code at the pinned commit: setting them changes nothing.
 ABSENT = (
     "VICTORY_RT_MISS", "VICTORY_WAVE32_READFIRSTLANE", "VICTORY_WAVE32_CROSSLANE", "VICTORY_SKIP_BVH_BUILDER",
@@ -54,12 +54,12 @@ def test_the_tuned_settings_are_the_measured_ones():
     assert set(re.findall(r'"(VICTORY_[A-Z0-9_]+)"', table)) == set(TUNED)
 
 
-def test_the_relay_dred_and_xg_are_never_tuned():
-    # Fork issue #89: the relay hides the characters' skin and overlaps the subtitles. DRED and the XG
-    # library are opt-in (--dred, --xg-dll).
+def test_dred_and_xg_are_never_tuned():
+    # DRED and the XG library are opt-in (--dred, --xg-dll). The relay is part of main's golden set
+    # (VICTORY_RELAY=2), not a switch of ours.
     table = _tuned_table()
-    assert "RELAY" not in table and "DRED" not in table and "XG" not in table
-    assert "VICTORY_RELAY" not in _variables_set()
+    assert "DRED" not in table and "XG" not in table
+    assert ("VICTORY_RELAY", "2") in re.findall(r'\("(VICTORY_[A-Z0-9_]+)", "([^"]*)"\)', table)
 
 
 def test_no_variable_victory_does_not_read():

@@ -8,7 +8,7 @@ référence emu/rdna2_exec*, contre lequel la traduction est vérifiée.
 """
 import re
 
-from emu.rdna2_exec_ops import SOPP_NO_EFFECT, float_bits, signed
+from emu.rdna2_exec_ops import SOPK_NO_EFFECT, SOPP_NO_EFFECT, float_bits, signed
 from emu.rdna2_hlsl_helpers import HELPERS  # noqa: F401  (réexporté : rdna2_hlsl, graphics, wave64)
 
 NULL, VCC, EXEC, OFF = 125, 106, 126, 0x7D
@@ -112,6 +112,9 @@ SCALAR = {
     "s_absdiff_i32": "{{ uint x = {a} - {b}; uint r = asint(x) < 0 ? 0u - x : x; scc = r != 0u; {d} = r; }}",
     "s_mul_hi_u32": "{d} = MulHiU32({a}, {b});",
     "s_mul_hi_i32": "{d} = MulHiI32({a}, {b});",
+    "s_pack_ll_b32_b16": "{d} = ({b} << 16) | ({a} & 0xFFFFu);",
+    "s_pack_lh_b32_b16": "{d} = ({b} & 0xFFFF0000u) | ({a} & 0xFFFFu);",
+    "s_pack_hh_b32_b16": "{d} = ({b} & 0xFFFF0000u) | ({a} >> 16);",
     "s_bcnt0_i32_b32": "{{ uint r = 32u - countbits({a}); scc = r != 0u; {d} = r; }}",
     "s_ff0_i32_b32": "{d} = firstbitlow(~{a});",
     "s_flbit_i32": "{d} = LeadingSignsI32({a});",
@@ -136,7 +139,7 @@ for _op in ("andn1", "andn2"):
 for _name in ("s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt",
               "s_waitcnt_lgkmcnt", "s_barrier", "s_sleep", "s_setprio", "s_ttracedata",
               "s_dcache_inv", "s_gl1_inv", "buffer_gl0_inv", "buffer_gl1_inv", "s_clause",
-              "s_inst_prefetch", *SOPP_NO_EFFECT):
+              "s_inst_prefetch", *SOPP_NO_EFFECT, *SOPK_NO_EFFECT):
     SCALAR[_name] = ""
 COMPARE_OPERATORS = {"eq": "==", "lg": "!=", "ne": "!=", "neq": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}
 for _op, _symbol in COMPARE_OPERATORS.items():
@@ -169,10 +172,10 @@ def scalar_statement(name, fields, literal):
 # --- Vectorielles : expressions uint de {a}, {b}, {c} (sources) et {d} (destination) --------
 VECTOR = {
     "v_mov_b32": "{a}",
-    "v_add_f32": "asuint(asfloat({a}) + asfloat({b}))",
-    "v_sub_f32": "asuint(asfloat({a}) - asfloat({b}))",
-    "v_subrev_f32": "asuint(asfloat({b}) - asfloat({a}))",
-    "v_mul_f32": "asuint(asfloat({a}) * asfloat({b}))",
+    "v_add_f32": "F32Add({a}, {b})",
+    "v_sub_f32": "F32Sub({a}, {b})",
+    "v_subrev_f32": "F32Sub({b}, {a})",
+    "v_mul_f32": "F32Mul({a}, {b})",
     "v_mul_legacy_f32": "MulLegacyF32({a}, {b})",
     "v_min_f32": "asuint(min(asfloat({a}), asfloat({b})))",
     "v_max_f32": "asuint(max(asfloat({a}), asfloat({b})))",
@@ -193,7 +196,7 @@ VECTOR = {
     "v_floor_f32": "asuint(floor(asfloat({a})))",
     "v_ceil_f32": "asuint(ceil(asfloat({a})))",
     "v_trunc_f32": "asuint(trunc(asfloat({a})))",
-    "v_rndne_f32": "asuint(round(asfloat({a})))",
+    "v_rndne_f32": "RndneF32({a})",
     # frac(-1e-20) rend 1.0 sur RTX 4060, 0x3F7FFFFF sur WARP et Intel UHD : borné comme rdna2_exec_ops._fract
     "v_fract_f32": "(frac(asfloat({a})) >= 1.0f ? 0x3F7FFFFFu : asuint(frac(asfloat({a}))))",
     "v_ldexp_f32": "asuint(ldexp(asfloat({a}), (float)asint({b})))",
@@ -283,7 +286,7 @@ VECTOR = {
     "v_cubema_f32": "asuint(Cube({a}, {b}, {c}).w)",
 }
 COMPARE = re.compile(r"^v_cmp(x?)_(f|lt|eq|le|gt|lg|ge|ne|neq|t|tru|o|u|nge|nlg|ngt|nle|nlt|class)"
-                     r"_(f32|u32|i32)$")
+                     r"_(f32|u32|i32|u16|i16)$")
 CONSTANT_TESTS = {"f": "false", "t": "true", "tru": "true"}
 # Tests flottants non ordonnés (vrais si une source est NaN) : négation du test ordonné.
 # NaN testé à part : sans cela, le pilote AMD RDNA 2 confond comparaisons ordonnées et non ordonnées (#134).
@@ -297,6 +300,9 @@ UNORDERED_F32 = {
 }
 
 
+HALF_CASTS = {"u16": "(({x}) & 0xFFFFu)", "i16": "(asint(({x}) << 16u) >> 16)"}
+
+
 def compare_condition(name, a, b):
     found = COMPARE.match(name)
     operation, kind = found.group(2), found.group(3)
@@ -306,8 +312,10 @@ def compare_condition(name, a, b):
         if kind != "f32":
             raise Untranslatable(f"non traduite en HLSL : {name}")
         return UNORDERED_F32[operation].format(a=a, b=b)
-    cast = {"f32": "asfloat", "u32": "", "i32": "asint"}[kind]
     symbol = COMPARE_OPERATORS[operation]
+    if kind in HALF_CASTS:                             # S0[15:0] vs S1[15:0] (emu/rdna2_exec_cmp16.py)
+        return f"{HALF_CASTS[kind].format(x=a)} {symbol} {HALF_CASTS[kind].format(x=b)}"
+    cast = {"f32": "asfloat", "u32": "", "i32": "asint"}[kind]
     if operation == "lg" and kind == "f32":            # ordonné et différent
         return f"(!IsNanF32({a}) && !IsNanF32({b}) && ({cast}({a}) < {cast}({b}) || {cast}({a}) > {cast}({b})))"
     if kind == "f32" and operation in ("lt", "le", "gt", "ge"):

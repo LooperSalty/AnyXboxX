@@ -8,8 +8,8 @@
 //! arguments stay the title's, and each rectangle arrives here as one
 //! triangle.
 //!
-//! Which vertex is the corner between the other two varies: Grand Theft
-//! Auto VI's full-screen rectangles come as top left, bottom left, bottom
+//! Which vertex is the corner between the other two varies:
+//! the title's full-screen rectangles come as top left, bottom left, bottom
 //! right (the second), its tiled lighting as top left, bottom left, top
 //! right (the first). The corner is the vertex that shares x with one of
 //! the others and y with the other; the fourth vertex lies opposite it,
@@ -87,6 +87,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    super::container::one_mode_per_register(&mut outputs, false);
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,

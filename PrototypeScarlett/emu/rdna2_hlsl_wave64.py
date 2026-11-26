@@ -13,10 +13,15 @@ contre l'interpréteur de référence en wave64 (`rdna2_exec.Wave(lanes=64)`).
 """
 import re
 
-from emu import (rdna2, rdna2_hlsl, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_format,
-                 rdna2_hlsl_image, rdna2_hlsl_sad, rdna2_hlsl_wide)
+from emu import (rdna2, rdna2_hlsl, rdna2_hlsl_cmpf16, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_f16,
+                 rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_int16, rdna2_hlsl_sad, rdna2_hlsl_wide)
+from emu.rdna2_exec_cmp16 import check_vop3
+from emu.rdna2_exec_cmpf16 import COMPAREF16
+from emu.rdna2_exec_memory import ADD_TID, LDS_ADD_TID
 from emu.rdna2_exec_vop3 import Fields, float_inputs
-from emu.rdna2_hlsl import CARRY, SCALAR_FAMILIES, _fields, _literal, _words, modified
+from emu.rdna2_hlsl_clamp import CARRY, carry_write, refuse_integer_clamp
+from emu.rdna2_hlsl_memory import memory_statements
+from emu.rdna2_hlsl import SCALAR_FAMILIES, _fields, _literal, _words, modified
 from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, NULL, Untranslatable, compare_condition,
                                 is_compare, scalar_target, source, source_high)
 
@@ -106,12 +111,12 @@ def _compare(name, a, b, code):
     return [_ballot(target, f"({ACTIVE}) && ({compare_condition(name, a, b)})")]
 
 
-def _carry(name, a, b, carry_in, vdst, carry_out):
+def _carry(name, a, b, carry_in, vdst, carry_out, clamp=0):
     result, carry = CARRY[name]
     k = f"({_bit(carry_in)} ? 1u : 0u)" if name.endswith("_ci_u32") else "0u"
     low, high = _pair(carry_out)
     return [f"{{ uint x = {a}, y = {b}, k = {k}, r = 0u; bool o = false; "
-            f"if ({ACTIVE}) {{ r = {result}; o = {carry}; v[{vdst}] = r; }} "
+            f"if ({ACTIVE}) {{ r = {result}; o = {carry}; v[{vdst}] = {carry_write(name, clamp)}; }} "
             f"uint2 m = Ballot64(lane, o); {low} = m.x; {high} = m.y; }}"]
 
 
@@ -128,6 +133,7 @@ def _mad64(name, a, b, fields):
     code = fields.sources[2]
     if code == 255:
         raise Untranslatable(f"non traduite en HLSL : {name} avec littéral 64 bits")
+    refuse_integer_clamp(name, fields.clamp)
     if name == "v_mad_i64_i32" and fields.sdst != NULL:
         raise Untranslatable("v_mad_i64_i32 : retenue signée dans SDST non vérifiée")
     high_product = "MulHiI32(x, y)" if name == "v_mad_i64_i32" else "MulHiU32(x, y)"
@@ -144,6 +150,10 @@ def _vector(name, fields, literal):
     b = f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u"
     if name == "v_readfirstlane_b32":
         return [f"{scalar_target(fields['vdst'])} = ReadLane64(lane, {a}, FirstLane64(s[126], s[127]));"]
+    if name in COMPAREF16:
+        target = EXEC if name.startswith("v_cmpx") else VCC
+        condition = rdna2_hlsl_cmpf16.condition(name, *rdna2_hlsl_cmpf16.vopc_sources(name, fields, literal))
+        return [_ballot(target, f"({ACTIVE}) && ({condition})")]
     if is_compare(name):
         return _compare(name, a, b, VCC)
     if name in CARRY:
@@ -155,11 +165,16 @@ def _vector(name, fields, literal):
 
 def _vop3(name, opcode, fields, literal):
     """VOP3 dépendant de la taille du wave ; None pour les autres."""
+    if name in COMPAREF16:
+        target = EXEC if name.startswith("v_cmpx") else fields.vdst
+        condition = rdna2_hlsl_cmpf16.condition(name, *rdna2_hlsl_cmpf16.vop3_sources(name, fields, literal))
+        return [_ballot(target, f"({ACTIVE}) && ({condition})")]
     a, b, _ = (modified(code, i, fields, literal, float_inputs(name)) for i, code in enumerate(fields.sources))
     if opcode < COMPARE_END and is_compare(name):
+        check_vop3(name, fields.op_sel, Untranslatable)
         return _compare(name, a, b, fields.vdst)
     if name in CARRY:
-        return _carry(name, a, b, fields.sources[2], fields.vdst, fields.sdst)
+        return _carry(name, a, b, fields.sources[2], fields.vdst, fields.sdst, fields.clamp)
     if name in ("v_mad_u64_u32", "v_mad_i64_i32"):
         return _mad64(name, a, b, fields)
     if name == "v_readlane_b32":
@@ -171,6 +186,7 @@ def _vop3(name, opcode, fields, literal):
     if name in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
         return _mbcnt(name, a, b, fields.vdst)
     if name == "v_cndmask_b32":
+        refuse_integer_clamp(name, fields.clamp)
         if (fields.abs | fields.neg) >> 2 & 1:
             raise Untranslatable("non traduite en HLSL (wave64) : v_cndmask_b32 avec modificateur sur le masque")
         return [f"if ({ACTIVE}) v[{fields.vdst}] = {_bit(fields.sources[2])} ? {b} : {a};"]
@@ -196,6 +212,8 @@ def _specific(data, instruction, name):
         return _vop3(name, instruction.opcode, Fields(pair), _literal(data, instruction, 2))
     if family == "DS" and name == "ds_bpermute_b32":
         return _bpermute(pair)
+    if family == "GLOBAL" and name in ADD_TID or family == "DS" and name in LDS_ADD_TID:
+        return memory_statements(family, name, pair, ACTIVE)    # lane = SV_GroupIndex 0-63: the TID in the wave64
     return None
 
 
@@ -215,7 +233,7 @@ def translate(data, sgprs=None):
     """Texte HLSL d'un programme RDNA 2 wave64 ; `sgprs` : valeurs initiales {numéro: valeur}."""
     helpers = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
                          rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS,
-                         rdna2_hlsl_sad.HELPERS))
+                         rdna2_hlsl_sad.HELPERS, rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS, rdna2_hlsl_int16.HELPERS))
     prelude = PRELUDE.replace("[numthreads", helpers + "\n[numthreads", 1)
     lines = rdna2_hlsl.body(data, sgprs, branches=BRANCHES64, translate_one=statements)
     return "\n".join([prelude.rstrip("\n"), *lines, "}", ""])

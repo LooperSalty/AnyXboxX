@@ -4,14 +4,14 @@ Chaque invocation est un wave d'une ligne : `lane` vaut 0, EXEC vaut 1 et les op
 lignes (ballot, readlane) se réduisent à la ligne elle-même. La LDS (DS) n'existe pas dans
 ces étages : une instruction DS lève Untranslatable, comme tout export non pris en charge.
 """
-from emu import (rdna2, rdna2_graphics as graphics, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_format,
-                 rdna2_hlsl_image, rdna2_hlsl_sad, rdna2_hlsl_wide)
+from emu import (rdna2, rdna2_graphics as graphics, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_f16, rdna2_hlsl_format,
+                 rdna2_hlsl_image, rdna2_hlsl_int16, rdna2_hlsl_sad, rdna2_hlsl_wide)
 from emu.rdna2_hlsl import body
 from emu.rdna2_hlsl_ops import HELPERS as ALU_HELPERS, Untranslatable
 
 HELPERS = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
                      rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS,
-                     rdna2_hlsl_sad.HELPERS))
+                     rdna2_hlsl_sad.HELPERS, rdna2_hlsl_f16.HELPERS, rdna2_hlsl_int16.HELPERS))
 ACTIVE = "((s[126] >> lane) & 1u) != 0"
 FINISH = "pc = END_PC; break;"
 
@@ -56,7 +56,9 @@ MULTI_LANE_REGISTERS = """  uint lane = WaveGetLaneIndex() & 31u;
   for (uint j = 0; j < 256; ++j) v[j] = 0u;
   s[126] = WaveBallot32(true);"""
 CROSS_LANE_OPS = frozenset({"v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32",
-                            "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_wqm_b32"})
+                            "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_wqm_b32",
+                            "global_load_dword_addtid", "global_store_dword_addtid",     # lane id in the address
+                            "ds_read_addtid_b32", "ds_write_addtid_b32"})
 
 
 def _uses_wave_ops(data):

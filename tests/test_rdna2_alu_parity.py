@@ -1,12 +1,14 @@
 """Parity between the RDNA 2 reference interpreter and HLSL recompiler for 32-bit ALU, VOP3,
 carry, v_mul_legacy_f32, and v_perm_b32 instructions."""
 import math
+import struct
 
 import pytest
 
 from emu import rdna2_exec, rdna2_exec_ops, rdna2_exec_vop3, rdna2_gpu, rdna2_hlsl
 from emu.rdna2_exec_ops import bits_float, float_bits
 from test_rdna2_exec import OPCODES, V, const, program, sop1, sop2, sopc, vop1, vop2, vop3
+from test_rdna2_exec_memory import INPUT, global_
 from test_rdna2_hlsl import compare, store_lane, with_lane_offset
 
 LITERAL = 255
@@ -234,4 +236,35 @@ def test_extended_alu_matches_interpreter_on_gpu():
         *store_lane(30, 24),
     )
     expected, actual = compare(code)
+    assert actual == expected
+
+
+@gpu
+def test_v_rndne_f32_ties_to_even_and_specials_on_gpu():
+    """Ties-to-even (including across a barrier where NVIDIA 621.xx mis-folds DXIL Round_ne, #227),
+    signed zeros, subnormals, infinities, and quiet/signalling NaNs."""
+    values = [
+        float_bits(-3.5), float_bits(-2.5), float_bits(-1.5), float_bits(-0.5),
+        float_bits(-0.0), float_bits(0.0), float_bits(0.5), float_bits(1.5),
+        float_bits(2.5), float_bits(3.5), float_bits(4.5), float_bits(8388607.5),
+        float_bits(8388608.0), 0x0000_0001, 0x8000_0001, 0x3EFF_FFFF,
+        0x3F00_0001, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000,
+        0x7FC0_0001, 0xFFC0_0000, 0x7F80_0001, 0xFF80_0001,
+    ] + [0] * 8
+    memory = bytearray(INPUT + 128)
+    memory[INPUT:INPUT + 128] = struct.pack("<32I", *values)
+    code = with_lane_offset(
+        *global_("global_load_dword", addr=31, vdst=1, saddr=0),
+        vop1("v_mov_b32", 2, LITERAL), float_bits(2.5),
+        vop1("v_mov_b32", 3, LITERAL), float_bits(-2.5),
+        vop1("v_mov_b32", 4, LITERAL), float_bits(0.5),
+        *vop3("v_subrev_co_u32", 5, const(10), V + 0, 0, sdst=12),   # Ballot barrier before v_rndne_f32
+        vop1("v_rndne_f32", 6, V + 1),
+        vop1("v_rndne_f32", 7, V + 2),
+        vop1("v_rndne_f32", 8, V + 3),
+        vop1("v_rndne_f32", 9, V + 4),
+        *store_lane(6, 0), *store_lane(7, 1), *store_lane(8, 2), *store_lane(9, 3),
+    )
+    assert "uint RndneF32(" in rdna2_hlsl.translate(code)
+    expected, actual = compare(code, memory=bytes(memory))
     assert actual == expected

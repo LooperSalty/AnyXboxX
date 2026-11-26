@@ -26,6 +26,8 @@ Conversions en lecture (valeur 32 bits écrite dans le VGPR) :
 UINT sature la valeur 32 bits à 2^n - 1, SINT la borne à [-2^(n-1), 2^(n-1) - 1] (Leonida, mesuré
 sur gfx1036). Les écritures UNORM, SNORM, SCALED et FLOAT 16 bits (arrondi non vérifié ici) et
 les formats flottants 11/10 bits (10_11_11_FLOAT, 11_11_10_FLOAT) sont refusés en les nommant.
+
+The _d16 forms (16 bits per component) narrow and widen these values: emu/rdna2_buffer_d16.py.
 """
 import re
 from typing import NamedTuple
@@ -51,7 +53,7 @@ DWORD_BITS = 32
 # Champs de l'instruction (MUBUFe_gfx10 et MTBUFe_gfx10 de LLVM, BUFInstructions.td).
 OFFSET_MASK, OFFEN_BIT, IDXEN_BIT, MUBUF_LDS_BIT = 0xFFF, 12, 13, 16
 MTBUF_FORMAT_SHIFT, TFE_BIT = 19, 55
-PATTERN = re.compile(r"^(t?)buffer_(load|store)_format_(x|xy|xyz|xyzw)$")
+PATTERN = re.compile(r"^(t?)buffer_(load|store)_format_(d16_)?(hi_)?(x|xy|xyz|xyzw)$")
 
 
 class FormatError(ValueError):
@@ -74,6 +76,16 @@ class Format(NamedTuple):
     def storable(self):
         return self.kind in INTEGER_KINDS or (self.kind == FLOAT and set(self.widths) == {DWORD_BITS})
 
+    @property
+    def d16_loadable(self):
+        """d16 load: 32-bit integer formats refused (truncated or clamped to 16 bits: not documented)."""
+        return not (self.kind in INTEGER_KINDS and self.widths[0] == DWORD_BITS)
+
+    @property
+    def d16_storable(self):
+        """d16 store: integer and FLOAT formats (float16 → float32 is exact, a 16-bit FLOAT field is copied)."""
+        return self.kind in INTEGER_KINDS or self.kind == FLOAT
+
 
 def _parse(code, full_name):
     found = NAME_PATTERN.match(full_name)
@@ -92,12 +104,15 @@ FORMATS = {code: found for code, name in rdna2_image.FORMAT_NAMES.items() if cod
            for found in [_parse(code, name)] if found is not None}
 
 
-def format_for(code, store):
-    """Format pris en charge (FormatError sinon), pour une lecture ou une écriture."""
+def format_for(code, store, d16=False):
+    """Format pris en charge (FormatError sinon), pour une lecture ou une écriture (d16 : 16 bits par composante)."""
     found = FORMATS.get(code)
     if found is None:
         raise FormatError(f"format {rdna2_image.FORMAT_NAMES.get(code, code)} non pris en charge")
-    if store and not found.storable:
+    if d16 and not (found.d16_storable if store else found.d16_loadable):
+        raise FormatError(f"d16 {'store' if store else 'load'} with format {found.name} not supported "
+                          "(16-bit conversion not documented)")
+    if store and not d16 and not found.storable:
         raise FormatError(f"écriture au format {found.name} non prise en charge (conversion non vérifiée)")
     return found
 
@@ -116,6 +131,8 @@ class Access(NamedTuple):
     srsrc: int          # premier SGPR du V#
     soffset: int
     fixed: int          # format de l'instruction (MTBUF), sinon None
+    d16: bool = False   # 16 bits par composante, deux par VGPR (emu/rdna2_buffer_d16.py)
+    high: bool = False  # _d16_hi_x : moitié haute du VGPR
 
 
 def supports(name):
@@ -131,9 +148,9 @@ def access(name, word):
     if word >> TFE_BIT & 1:
         raise FormatError(f"{name} avec tfe non pris en charge")
     fixed = (word >> MTBUF_FORMAT_SHIFT) & FORMAT_MASK if typed else None
-    return Access(typed, found.group(2) == "store", len(found.group(3)), word & OFFSET_MASK,
+    return Access(typed, found.group(2) == "store", len(found.group(5)), word & OFFSET_MASK,
                   word >> OFFEN_BIT & 1, word >> IDXEN_BIT & 1, (word >> 32) & 0xFF, (word >> 40) & 0xFF,
-                  ((word >> 48) & 0x1F) * 4, (word >> 56) & 0xFF, fixed)
+                  ((word >> 48) & 0x1F) * 4, (word >> 56) & 0xFF, fixed, bool(found.group(3)), bool(found.group(4)))
 
 
 # --- Descripteur V# ----------------------------------------------------------------------
@@ -225,18 +242,25 @@ def _component(fmt, field, width):
     return field                                # UINT, FLOAT 32 bits
 
 
+def fields(fmt, data):
+    """(champ, largeur) de chaque composante d'un élément de `fmt.size` octets."""
+    packed, position, found = int.from_bytes(data, "little"), 0, []
+    for width in fmt.widths:
+        found.append(((packed >> position) & ((1 << width) - 1), width))
+        position += width
+    return found
+
+
 def decode(fmt, data):
     """Composantes (valeurs 32 bits) d'un élément de `fmt.size` octets."""
-    packed, position, values = int.from_bytes(data, "little"), 0, []
-    for width in fmt.widths:
-        values.append(_component(fmt, (packed >> position) & ((1 << width) - 1), width))
-        position += width
-    return values
+    return [_component(fmt, field, width) for field, width in fields(fmt, data)]
 
 
 def _field(fmt, value, width):
     if width == DWORD_BITS:
         return value
+    if fmt.kind == FLOAT:                       # float16 d'une écriture d16 (emu/rdna2_buffer_d16.py)
+        return value & ((1 << width) - 1)
     if fmt.kind == UINT:
         return min(value, (1 << width) - 1)
     low, high = -(1 << (width - 1)), (1 << (width - 1)) - 1

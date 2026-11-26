@@ -75,7 +75,7 @@ Un seul espace Cargo à la racine du dépôt (`Cargo.toml`), les crates dans `cr
 | `anyxboxx-rdna2-ref` | lib | `rdna2_exec*.py`, `rdna2_operands*.py`, `rdna2_image.py`, `rdna2_buffer_format.py` | décodeur de TomBox via `anyxboxx-rdna2` ; tables générées depuis LLVM |
 | `anyxboxx-gpu-run` | bin | `runtime/gpu_runner` | code de périphérique de `victory-gpu`, crate `windows` |
 | `anyxboxx-texture`, `anyxboxx-audio`, `anyxboxx-rdna2` | lib + bin | quittent `rust/` | puis fusion dans `victory-formats` là où il couvre déjà le format |
-| `anyxboxx` | bin | `scarlett.py`, l'ancien `tools/lancer_victory.ps1` | `clap`, tout ce qui précède, `apps/victory` pour lancer le jeu |
+| `anyxboxx` | bin | `scarlett.py`, l'ancien `anyxboxx run` | `clap`, tout ce qui précède, `apps/victory` pour lancer le jeu |
 | `xtask` | bin | générateurs et vérifications de `tools/*.py` | les mêmes fichiers de test de LLVM (téléchargés en local, jamais committés) |
 
 Ce qui **n'est pas** porté, parce que VIctory le fait déjà : le recompilateur HLSL
@@ -203,7 +203,7 @@ Finie quand : `emu/loader.py`, `modules.py`, `report.py`, `status_map.py`, `tran
 - [ ] Les tests pytest du runtime passent avec `ANYXBOXX_RUNTIME` pointant vers les DLL Rust.
 - [ ] Les modules de `victory-hle` appellent `anyxboxx-gdk` là où AnyXboxX avait le meilleur
       comportement.
-- [ ] **Objectif de performance :** avec l'ancien `tools/lancer_victory.ps1` et le compteur d'images
+- [ ] **Objectif de performance :** avec l'ancien `anyxboxx run` et le compteur d'images
       (`ANYXBOXX_FPS_CSV`, `emu/perf.py`), le temps moyen par image et le 1 % bas sur la même scène
       ne sont pas pires qu'avant la bascule, mesurés deux fois (cache chaud), carte et pilote
       notés. Le coût des appels HLE (appels par image × durée d'un appel, d'après le build de
@@ -226,7 +226,7 @@ n'installe plus de chaîne C++.
 - [ ] `rdna2_hlsl*.py` est retiré quand `victory-shader` couvre les mêmes instructions (comptes de
       `rdna2_coverage.py`, puis de son portage Rust).
 - [ ] **Objectif de performance :** temps de traduction par pipeline et blocage de la première
-      image mesurés avec l'étape `translate --cache --pipelines` de l'ancien `tools/lancer_victory.ps1` ;
+      image mesurés avec l'étape `translate --cache --pipelines` de l'ancien `anyxboxx run` ;
       aucune régression, et l'interpréteur Python ne figure dans aucun chemin mesuré.
 
 Finie quand : `PrototypeScarlett/emu/rdna2*.py`, `third_party/leonida`, `third_party/xbox2windows`
@@ -263,7 +263,7 @@ Finie quand : `git ls-files '*.py' '*.cpp' '*.h' '*.ps1'` ne liste rien hors de 
   `anyxboxx-gdk` séparée, sauf si une cdylib a besoin de code partagé avec VIctory ; seul ce code
   passe alors dans une petite crate.
 - **D4 : un seul lanceur.** `apps/victory`, piloté par `anyxboxx run` (qui remplace
-  l'ancien `tools/lancer_victory.ps1`) ; `anyxboxx.exe` est supprimé en phase 3.
+  l'ancien `anyxboxx run`) ; `anyxboxx.exe` est supprimé en phase 3.
 - **Chaîne d'outils : la racine épingle Rust 1.98.1**, comme VIctory (`rust-toolchain.toml`).
 
 Les paragraphes ci-dessous gardent les options telles qu'elles ont été pesées.

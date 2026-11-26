@@ -74,6 +74,12 @@ fn display_card(app: &mut App, ui: &mut Ui) {
         }
         ui.add_space(theme::SP_S);
         pills(ui, &mut options.window, &WindowMode::ALL, WindowMode::label);
+        ui.add_space(theme::SP_S);
+        toggle_row(
+            ui,
+            "Stats overlay (F10 shows and hides it)",
+            &mut options.overlay,
+        );
         ui.label(
             RichText::new("The size is what the console reports to the game.")
                 .color(theme::TEXT_MUTED),
@@ -111,8 +117,18 @@ fn performance_card(app: &mut App, ui: &mut Ui) {
         );
         toggle_row(
             ui,
-            "Warm the shaders before the game starts",
+            "Also preload shaders.rpf and the game DLLs before the game",
             &mut settings.options.warm_first,
+        );
+        toggle_row(
+            ui,
+            "Always re-warm before launch (otherwise only when the cache is stale)",
+            &mut settings.always_rewarm,
+        );
+        toggle_row(
+            ui,
+            "Tap A through the start screens for 150 seconds",
+            &mut settings.options.auto_a,
         );
     });
 }
@@ -137,6 +153,16 @@ fn diagnostics_card(app: &mut App, ui: &mut Ui) {
         ui.label(
             RichText::new("Only if you are sure no game runs (hosts without tasklist).")
                 .color(theme::TEXT_MUTED),
+        );
+        toggle_row(
+            ui,
+            "Write a frame-time CSV into the cache folder",
+            &mut settings.options.frametime_dump,
+        );
+        toggle_row(
+            ui,
+            "Keep the launcher open after the game starts",
+            &mut settings.keep_open_after_launch,
         );
     });
 }

@@ -18,9 +18,9 @@ uint MulHiI32(uint a, uint b) {
 uint BfeI32(uint v, uint off, uint w) {
   w &= 31u;
   if (w == 0u) return 0u;
-  uint field = (v >> (off & 31u)) & ((1u << w) - 1u);
+  int field = asint(v) >> (off & 31u);
   uint shift = 32u - w;
-  return asuint((asint(field) << shift) >> shift);
+  return asuint((field << shift) >> shift);
 }
 uint SatF32ToI32(uint a) {
   float x = asfloat(a);
@@ -117,9 +117,39 @@ uint AlignBit(uint hi, uint lo, uint s) {
 uint SadU32(uint a, uint b, uint c) {
   return (a > b ? (a - b) : (b - a)) + c;
 }
+// Opérations f32 dans des fonctions `precise` (dxc ne replie plus x + 0, x - x ni 0 × x). Le pilote AMD
+// (RX 9070 XT) replie pourtant fadd x, 0.0 et fsub x, x, et Intel fsub 0.0, x : le signe d'un résultat
+// exactement nul et x - x sont donc fixés en entier.
+uint F32Add(uint a, uint b) {
+  precise float r = asfloat(a) + asfloat(b);
+  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & b & 0x80000000u : asuint(r);    // -0 seulement pour -0 + -0
+}
+uint F32Sub(uint a, uint b) {
+  if (a == b)                                     // NaN : lui-même, rendu silencieux ; ±infini : NaN par défaut
+    return (a & 0x7FFFFFFFu) > 0x7F800000u ? a | 0x400000u : (a & 0x7F800000u) == 0x7F800000u ? 0xFFC00000u : 0u;
+  precise float r = asfloat(a) - asfloat(b);
+  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & ~b & 0x80000000u : asuint(r);
+}
+uint F32Mul(uint a, uint b) {
+  precise float r = asfloat(a) * asfloat(b);
+  return asuint(r);
+}
 uint MulLegacyF32(uint a, uint b) {
   float x = asfloat(a), y = asfloat(b);
   return (x == 0.0f || y == 0.0f) ? 0u : asuint(x * y);
+}
+uint RndneF32(uint a) {
+  // Arrondi au pair en entier : le pilote NVIDIA 621.xx (RTX 4060, RTX 5070 Ti, #227) replie
+  // Round_ne(2.5) en 3.0 après une barrière ; en entier le résultat suit IEEE 754 (signe de ±0, NaN).
+  uint sign_bit = a & 0x80000000u, mag = a & 0x7FFFFFFFu;
+  if (mag >= 0x4B000000u) return mag > 0x7F800000u ? (a | 0x400000u) : a;
+  if (mag <= 0x3F000000u) return sign_bit;
+  if (mag < 0x3F800000u) return sign_bit | 0x3F800000u;
+  uint shift = 150u - (mag >> 23);
+  uint mask = (1u << shift) - 1u, half_bit = 1u << (shift - 1u);
+  uint rem = mag & mask, rounded = mag & ~mask;
+  if (rem > half_bit || (rem == half_bit && (rounded & (1u << shift)) != 0u)) rounded += 1u << shift;
+  return sign_bit | rounded;
 }
 uint PermB32(uint a, uint b, uint c) {
   uint r = 0u;

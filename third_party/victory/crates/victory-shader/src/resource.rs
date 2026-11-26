@@ -164,8 +164,8 @@ pub enum BvhNodes {
     /// A buffer of the host: the descriptor is loaded from a table (it is
     /// among [`Resources::descriptors`]), and node pointers count from the
     /// buffer's start. Its flags are not known to the shader: boxes are
-    /// sorted and triangles return barycentrics, as every descriptor Grand
-    /// Theft Auto VI builds asks.
+    /// sorted and triangles return barycentrics, as every descriptor
+    /// the title builds asks.
     Resource,
     /// Title memory by address: the code makes the descriptor from numbers
     /// (the title: the whole address space, or one structure's address in
@@ -718,7 +718,7 @@ impl<'a> Tracer<'a> {
     /// For a join `v` whose every incoming value adds to an `s_getpc_b64` low
     /// dword: the first of those (one level of joins only). The paths may add
     /// to different ones: two tables in the code, one picked by control flow
-    /// (Grand Theft Auto VI's fog reconstruction reads its sample offsets from
+    /// (the title's fog reconstruction reads its sample offsets from
     /// one of two tables, by the sample's number; refused, the lit frame was
     /// multiplied by a fog transmittance nothing had written).
     fn code_join(&self, v: Value) -> Option<Value> {
@@ -1209,7 +1209,7 @@ impl<'a> Tracer<'a> {
     /// other: the console compiler loads a descriptor (or clears an
     /// address's high half) inside a branch that skips code when no lane
     /// is left for it, and uses it after the join, where only lanes that
-    /// ran the branch are left (Grand Theft Auto VI's
+    /// ran the branch are left (the title's
     /// `CS_Alpha_Schedule`: the registers' values from before the branch,
     /// which the join also sees, are what a wave with no such lane holds).
     /// None at loop headers and without the lanes' paths.
@@ -2331,8 +2331,22 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // s_bfm_b32 d, width, offset: `width` ones from bit `offset` (the
+    // console compiler builds sampler words this way).
+    if inst.name() == "s_bfm_b32" {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let width = constant(src.first()?)? & 31;
+        let offset = constant(src.get(1)?)? & 31;
+        return Some(Moved::Const(((1u32 << width) - 1) << offset));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
+        // A 32-bit literal of a 64-bit integer move is zero-extended.
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
@@ -3062,7 +3076,7 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
-    /// The console compiler's waterfall (Grand Theft Auto VI's ray-tracing
+    /// The console compiler's waterfall (the title's ray-tracing
     /// resolve and others): each lane holds its entry's byte offset in the
     /// table at s0 (v7 = (lane & 1) * 32); the loop reads the first active
     /// lane's offset, narrows EXEC to the lanes with the same one

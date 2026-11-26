@@ -3,6 +3,8 @@ for VOP1, VOP2, and VOPC instructions in the reference interpreter (#21).
 
 Semantics follow AMD's public RDNA 2 ISA specification (sections 6.5 SDWA and 6.6 DPP).
 """
+import re
+
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS, VECTOR, VECTOR_COMPARE, bits_float, float_bits
 from emu.rdna2_operands_ext import BOUND_CTRL_BIT, CLAMP_BIT, DPP8, DPP8_FI, DPP16, FI_BIT, OMOD_SHIFT, SDWA
 
@@ -17,14 +19,22 @@ def is_ext(family, src0):
     return family in ("VOP1", "VOP2", "VOPC") and src0 in EXT_CODES
 
 
-def _operand_float_flags(name):
-    """Return (src_is_f32, dst_is_f32) from the instruction's operand types."""
-    if name.startswith("v_cvt_"):            # v_cvt_[mode_]<destination>_<source>
-        parts = name.split("_")
+def _is_type(part):
+    return re.fullmatch(r"[fiub]\d+|ubyte\d", part) is not None
+
+
+def operand_float_flags(name):
+    """Return (src_is_f32, dst_is_f32) from the operand types written in the mnemonic.
+
+    When the mnemonic names two types, the destination type comes first (v_cvt_flr_i32_f32,
+    v_cvt_off_f32_i4, v_frexp_exp_i32_f32, v_cvt_f32_ubyte0); otherwise one type covers both.
+    SDWA applies neg/abs to f32 sources and sext to the others, and omod/clamp to f32 results;
+    DPP16 applies neg/abs to f32 sources. Shared by the interpreter and the HLSL recompiler (#205).
+    """
+    parts = name.split("_")
+    if len(parts) >= 4 and _is_type(parts[-1]) and _is_type(parts[-2]):
         return parts[-1] == "f32", parts[-2] == "f32"
-    if name == "v_frexp_exp_i32_f32":
-        return True, False
-    is_f32 = name.endswith("_f32")
+    is_f32 = parts[-1] == "f32"
     return is_f32, is_f32
 
 
@@ -108,7 +118,7 @@ def _exec_sdwa(wave, family, name, fields, ext):
     if name in SIXTEEN_BIT_RESULTS:
         raise Untranslated(f"{name} en SDWA : résultat 16 bits sous dst_sel non vérifié")
 
-    src_is_float, dst_is_float = _operand_float_flags(name)
+    src_is_float, dst_is_float = operand_float_flags(name)
     s0_code = ext & 0xFF
     s0_scalar = (ext >> 23) & 1
     s0_sel, s0_sext, s0_neg, s0_abs = (ext >> 16) & 7, (ext >> 19) & 1, (ext >> 20) & 1, (ext >> 21) & 1
@@ -142,8 +152,8 @@ def _exec_sdwa(wave, family, name, fields, ext):
     dst_unused = (ext >> 11) & 3
     clamp = (ext >> CLAMP_BIT) & 1
     omod = (ext >> OMOD_SHIFT) & 3
-    if not dst_is_float and clamp:
-        raise Untranslated(f"SDWA clamp non pris en charge sur opération entière : {name}")
+    if not dst_is_float and (clamp or omod):
+        raise Untranslated(f"SDWA clamp/omod not supported on an integer result: {name}")
     destination = wave.v[fields["vdst"]]
     for lane in wave.active():
         a = read_src(s0_code, s0_scalar, s0_sel, s0_sext, s0_neg, s0_abs, lane)
@@ -160,7 +170,7 @@ def _exec_dpp16(wave, name, fields, ext):
     ctrl = (ext >> 8) & 0x1FF
     if _dpp16_source_lane(0, ctrl)[0] is None:
         raise Untranslated(f"dpp_ctrl réservé : 0x{ctrl:X}")
-    src_is_float, _ = _operand_float_flags(name)
+    src_is_float, _ = operand_float_flags(name)
     src0_reg = ext & 0xFF
     src0_snap = list(wave.v[src0_reg])
     src1_snap = list(wave.v[fields["vsrc1"]]) if "vsrc1" in fields else None

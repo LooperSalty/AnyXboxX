@@ -11,12 +11,14 @@ from pathlib import Path
 import struct
 import sys
 
-from emu import (rdna2, rdna2_exec_div, rdna2_exec_wide, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext,
-                 rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_movrel, rdna2_hlsl_pc, rdna2_hlsl_sad,
-                 rdna2_hlsl_scalar64, rdna2_hlsl_wide)
+from emu import (rdna2, rdna2_exec_cmp16, rdna2_exec_div, rdna2_exec_wide, rdna2_hlsl_cmpf16, rdna2_hlsl_div,
+                 rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_f16, rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_int16,
+                 rdna2_hlsl_movrel, rdna2_hlsl_pc, rdna2_hlsl_sad, rdna2_hlsl_scalar64, rdna2_hlsl_wide)
+from emu.rdna2_exec_cmpf16 import COMPAREF16
 from emu.rdna2_exec_ops import signed
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS, VECTOR_NO_OPERATION
 from emu.rdna2_exec_vop3 import MAD64, Fields, float_inputs, float_result
+from emu.rdna2_hlsl_clamp import CARRY, carry_write, integer_template, refuse_integer_clamp
 from emu.rdna2_hlsl_memory import memory_statements
 from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, SCALAR, VECTOR, Untranslatable, source_high,
                                 compare_condition, hexa, is_compare, scalar_statement, scalar_target,
@@ -26,14 +28,6 @@ from emu.rdna2_operands import FIELDS
 ACTIVE = "((s[126] >> lane) & 1u) != 0"
 SCALAR_FAMILIES = ("SOP1", "SOP2", "SOPC", "SOPK", "SOPP")
 MEMORY_FAMILIES = ("SMEM", "DS", "MUBUF", "MTBUF", "FLAT", "GLOBAL", "SCRATCH")
-CARRY = {
-    "v_add_co_u32": ("x + y", "r < x"),
-    "v_sub_co_u32": ("x - y", "x < y"),
-    "v_subrev_co_u32": ("y - x", "y < x"),
-    "v_add_co_ci_u32": ("x + y + k", "(r < x) || (k != 0 && r == x)"),
-    "v_sub_co_ci_u32": ("x - y - k", "(x < y) || (k != 0 && x == y)"),
-    "v_subrev_co_ci_u32": ("y - x - k", "(y < x) || (k != 0 && y == x)"),
-}
 OUTPUT_SCALE = {1: "2.0f", 2: "4.0f", 3: "0.5f"}
 WAVE_SIZES = (32, 64)
 
@@ -113,6 +107,10 @@ def branch_target(data, instruction):
 
 
 def _vector(name, fields, literal, active=ACTIVE):
+    if name in COMPAREF16:
+        target = "s[126]" if name.startswith("v_cmpx") else "s[106]"
+        condition = rdna2_hlsl_cmpf16.condition(name, *rdna2_hlsl_cmpf16.vopc_sources(name, fields, literal))
+        return [f"{{ bool t = ({active}) && ({condition}); {target} = Ballot(lane, t); }}"]
     a = source(fields["src0"], literal)
     values = {"a": a, "b": f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u", "c": "s[106]",
               "d": f"v[{fields.get('vdst', 0)}]", "k": hexa(literal or 0)}
@@ -135,16 +133,17 @@ def _vector(name, fields, literal, active=ACTIVE):
     return [f"if ({active}) v[{fields['vdst']}] = {VECTOR[name].format(**values)};"]
 
 
-def _carry(name, a, b, carry_in, vdst, carry_out):
+def _carry(name, a, b, carry_in, vdst, carry_out, clamp=0):
     result, carry = CARRY[name]
     return [f"{{ uint x = {a}, y = {b}, k = ({carry_in} >> lane) & 1u, r = 0u; bool o = false; "
-            f"if ({ACTIVE}) {{ r = {result}; o = {carry}; v[{vdst}] = r; }} "
+            f"if ({ACTIVE}) {{ r = {result}; o = {carry}; v[{vdst}] = {carry_write(name, clamp)}; }} "
             f"{carry_out} = Ballot(lane, o); }}"]
 
 
 def _mad64(name, a, b, fields):
     """S0 × S1 + S2 sur 64 bits ; v_mad_i64_i32 corrige le produit non signé par les signes."""
     code = fields.sources[2]
+    refuse_integer_clamp(name, fields.clamp)
     if code == 255:
         raise Untranslatable(f"non traduite en HLSL : {name} avec littéral 64 bits")
     low, high = source(code), source_high(code)
@@ -170,13 +169,22 @@ def modified(code, index, fields, literal, is_float):
 
 
 def _vop3(name, opcode, fields, literal, active=ACTIVE):
+    if name in rdna2_hlsl_f16.TEMPLATES:
+        return rdna2_hlsl_f16.vop3(name, fields, literal, active)
+    if name in COMPAREF16:
+        target = "s[126]" if name.startswith("v_cmpx") else scalar_target(fields.vdst)
+        condition = rdna2_hlsl_cmpf16.condition(name, *rdna2_hlsl_cmpf16.vop3_sources(name, fields, literal))
+        return [f"{{ bool t = ({active}) && ({condition}); {target} = Ballot(lane, t); }}"]
+    if name in rdna2_hlsl_int16.TRANSLATED:
+        return rdna2_hlsl_int16.vop3(name, fields, literal, active)
     is_float = float_result(name)
     a, b, c = (modified(code, i, fields, literal, float_inputs(name)) for i, code in enumerate(fields.sources))
     if opcode < 0x100 and is_compare(name):
+        rdna2_exec_cmp16.check_vop3(name, fields.op_sel, Untranslatable)
         target = "s[126]" if name.startswith("v_cmpx") else scalar_target(fields.vdst)
         return [f"{{ bool t = ({active}) && ({compare_condition(name, a, b)}); {target} = Ballot(lane, t); }}"]
     if name in CARRY:
-        return _carry(name, a, b, c, fields.vdst, scalar_target(fields.sdst))
+        return _carry(name, a, b, c, fields.vdst, scalar_target(fields.sdst), fields.clamp)
     if name == "v_readlane_b32":
         return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, {b});"]
     if name == "v_readfirstlane_b32":
@@ -202,7 +210,8 @@ def _vop3(name, opcode, fields, literal, active=ACTIVE):
         raise Untranslatable(f"non traduite en HLSL : {name} (VOP3)")
     if name in SIXTEEN_BIT_RESULTS and (fields.op_sel or fields.clamp):
         raise Untranslatable(f"non traduite en HLSL : {name} avec op_sel/clamp (VOP3, résultat 16 bits)")
-    expression =VECTOR[name].format(a=a, b=b, c=c, d=f"v[{fields.vdst}]", k=hexa(literal or 0))
+    template = VECTOR[name] if is_float else integer_template(name, fields.clamp, VECTOR[name])
+    expression = template.format(a=a, b=b, c=c, d=f"v[{fields.vdst}]", k=hexa(literal or 0))
     if is_float and (fields.clamp or fields.omod):
         scaled = f"asfloat({expression}) * {OUTPUT_SCALE.get(fields.omod, '1.0f')}"
         expression = f"asuint({'saturate(' + scaled + ')' if fields.clamp else scaled})"
@@ -237,12 +246,18 @@ def statements(data, instruction, finish="return;", special=None, active=ACTIVE)
     if family in ("VOP1", "VOP2", "VOPC"):
         fields = _fields(family, first)
         lit = _literal(data, instruction, 1)
+        if name in rdna2_hlsl_f16.TEMPLATES:        # avant is_ext : les formes SDWA/DPP du f16 sont refusées par rdna2_hlsl_f16
+            return rdna2_hlsl_f16.vector(name, fields, lit, active)
+        if name in COMPAREF16:                      # before is_ext: SDWA/DPP refused by rdna2_hlsl_cmpf16
+            return _vector(name, fields, lit, active)
         if rdna2_hlsl_ext.is_ext(family, fields.get("src0")):
             return rdna2_hlsl_ext.statements(family, name, fields, lit or 0, active)
         return _vector(name, fields, lit, active)
     if family == "VOP3":
         return _vop3(name, opcode, Fields(pair), _literal(data, instruction, 2), active)
     if family == "VOP3P":
+        if name in rdna2_hlsl_int16.TRANSLATED:
+            return rdna2_hlsl_int16.packed(name, pair, _literal(data, instruction, 2), active)
         return rdna2_hlsl_dot.statements(name, pair, _literal(data, instruction, 2), active)
     if family in MEMORY_FAMILIES:
         return memory_statements(family, name, pair, active)
@@ -273,7 +288,8 @@ def translate(data, sgprs=None, wave_size=32):
         from emu import rdna2_hlsl_wave64
         return rdna2_hlsl_wave64.translate(data, sgprs)
     helpers = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
-                         rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS, rdna2_hlsl_sad.HELPERS))
+                         rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS, rdna2_hlsl_sad.HELPERS,
+                         rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS, rdna2_hlsl_int16.HELPERS))
     prelude = PRELUDE.replace("[numthreads", helpers + "\n[numthreads", 1)
     return "\n".join([prelude.rstrip("\n"), *body(data, sgprs), "}", ""])
 
@@ -376,6 +392,8 @@ def coverage_names():
             | set(rdna2_hlsl_scalar64.SCALAR64)
             | rdna2_hlsl_wide.TRANSLATED | rdna2_hlsl_div.TRANSLATED | rdna2_hlsl_movrel.TRANSLATED
             | rdna2_hlsl_dot.TRANSLATED | rdna2_hlsl_sad.TRANSLATED | rdna2_hlsl_pc.TRANSLATED
+            | rdna2_hlsl_int16.TRANSLATED
+            | set(rdna2_hlsl_f16.TEMPLATES)
             | {"s_endpgm", "v_readlane_b32", "v_writelane_b32", "v_readfirstlane_b32"})
 
 

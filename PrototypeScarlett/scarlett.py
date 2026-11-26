@@ -12,7 +12,7 @@ import pefile  # noqa: E402
 from unicorn import UcError  # noqa: E402
 
 from emu import launch  # noqa: E402
-from emu.config import MANIFEST  # noqa: E402
+from emu.config import manifest_path  # noqa: E402
 from emu.machine import Machine  # noqa: E402
 from emu.report import analyse  # noqa: E402
 
@@ -72,7 +72,7 @@ class Window:
         root.bind("<KeyPress>", lambda event: self.keys.add(event.keysym))
         root.bind("<KeyRelease>", lambda event: self.keys.discard(event.keysym))
         root.bind("<FocusOut>", lambda event: self.keys.clear())
-        if (folder / MANIFEST).is_file():
+        if manifest_path(folder).is_file():
             self.open_package(folder)
 
     def write(self, text):
@@ -205,7 +205,7 @@ def print_map(package, svg_path):
 def find_package_folder():
     start = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
     return next((c for c in (start, start.parent, start.parent.parent)
-                 if (c / MANIFEST).is_file()), start)
+                 if manifest_path(c).is_file()), start)
 
 
 def run_rdna2(data):

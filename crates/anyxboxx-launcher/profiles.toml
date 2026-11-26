@@ -7,41 +7,68 @@
 # status:
 #   "measured"   values measured by the maintainer or a contributor on the stated setup (see note);
 #   "unmeasured" VIctory's own defaults, nothing measured with this profile.
-# pending: keys whose values are waiting for the maintainer's confirmation on Windows. They are
-#   listed in the launcher so nobody mistakes them for measured settings.
 # Overrides typed in the launcher's advanced panel always win over [profile.env].
 #
-# Every variable named here is read by third_party/victory (checked on 2026-11-25). Values "0"
-# turn the switch off, as VIctory reads them: `is_none_or(|v| v != "0")` for the PR #199 switches.
+# Every variable named here is read by third_party/victory (checked by the launcher's tests). Values "0"
+# turn the switch off, as VIctory reads them.
 
 # ---------------------------------------------------------------------------------------------
-# Windows + NVIDIA: the maintainer's working set (VICTORY_SHADER_LOOP_LIMIT and the five others
-# equal anyxboxx::run::TUNED, which the former tools/lancer_victory.ps1 also sets).
+# Windows + NVIDIA: main's default set, the one `anyxboxx run` and main's tools/lancer_victory.ps1
+# give VIctory (the golden copy is tests/fixtures/lancer_victory_neptune.ps1). The launcher's
+# base adds VICTORY_GAME_DIR, VICTORY_DISCORD=0 and VICTORY_OCEAN_READBACK=1; a test checks this
+# table against anyxboxx::run::TUNED.
 #
-# Measured by the maintainer on 2026-11-25: 2-3 fps on main after PR #199, 5-7 fps on the fork at
-# 80d58f8. Turning PR #199's switches off (all at "0") did not change the main figure, so this
-# profile leaves them at VIctory's defaults.
+# Measured by the maintainer on 2026-11-25 (RTX 4070 SUPER, i7-13700KF, Series X 4K, release build,
+# after warm): median about 13.8 fps in the world, 72.5 ms a frame.
 # ---------------------------------------------------------------------------------------------
 [[profile]]
 id = "windows-nvidia"
-name = "Windows + NVIDIA (maintainer's working set)"
+name = "Windows + NVIDIA (Fast, measured set)"
 os = "windows"
 gpu = "nvidia"
 status = "measured"
-note = "Measured: 2-3 fps on main after PR #199; 5-7 fps on fork 80d58f8 (RTX 4070 Super). PR #199 switches at VIctory defaults."
+note = "Neptune base, 2026-11-25 measurement: median about 13.8 fps in the world on an RTX 4070 SUPER."
 
 [profile.env]
-# Translated shader loops stop after 256 iterations.
-VICTORY_SHADER_LOOP_LIMIT = "256"
-# Host pipeline wait setting from the fork's pull request #1.
-VICTORY_LATE_WAIT = "3"
-# Wide back-end option of the fork.
-VICTORY_WIDE_BACK = "1"
-# Card buffer sizing: minimum and total, in MB.
-VICTORY_CARD_BUFFERS_MIN_MB = "1"
-VICTORY_CARD_BUFFERS_MB = "1024"
-# DirectStorage writes are reported to the GPU side (fork commits e49864a and bf870de).
-VICTORY_DSTORAGE_NOTIFY = "1"
+VICTORY_CARD_WINDOWS_MB = "1536"
+VICTORY_BAKE_TEXTURES_MS = "10000"
+VICTORY_EARLY_TEXTURES_MS = "40"
+VICTORY_WIDE_MERGE = "1"
+VICTORY_RELAY_OWN_QUEUE = "1"
+VICTORY_UNDER_WRITES_WORDS = "1"
+VICTORY_UNDER_WRITES_RUNS = "100000"
+VICTORY_UNDER_WRITES_MASKS = "1"
+VICTORY_RELAY = "2"
+VICTORY_WIDE_REFRESH = "1"
+VICTORY_ASK_ONCE = "1"
+VICTORY_TEXTURE_NO_WAIT = "1"
+VICTORY_CARD_REHASH_RUNS = "1"
+VICTORY_JOIN_COPIES = "1"
+VICTORY_D3D12_BACKGROUND = "0"
+VICTORY_LATE_WAIT_LISTS = "1024"
+VICTORY_WINDOW_TAILS = "1"
+VICTORY_TEXTURE_STAGE_MB = "512"
+VICTORY_CARD_BUFFERS_MIN_KB = "64"
+VICTORY_ASK_QUIET = "8"
+VICTORY_COPY_CHANGED = "1"
+VICTORY_QUIET_BACK = "1"
+VICTORY_LIST_POOL_MOST = "2048"
+VICTORY_LIST_POOL_MB = "512"
+VICTORY_WIDE_THREADS = "12"
+VICTORY_UNDER_WRITES_MASKS_LEAST = "1"
+VICTORY_INDIRECT_RAW = "2"
+VICTORY_TEXTURE_HASH_EVERY = "32"
+VICTORY_LEVELS_ON_DEMAND = "1"
+VICTORY_WINDOW_KB = "1024"
+VICTORY_CARD_BUFFERS_MB = "1536"
+VICTORY_CARD_WINDOW_UPLOAD = "1"
+VICTORY_DROP_DXIL = "1"
+VICTORY_DESC_DATA = "1"
+VICTORY_VRAM_IDLE_MS = "8000,2000,1000"
+VICTORY_PIPELINE_WAIT_MS = "2500"
+VICTORY_TEXTURE_ROOM_PERCENT = "93"
+VICTORY_HEAP_PASS_DIRTY = "1"
+VICTORY_COPY_COALESCE = "256"
 
 # ---------------------------------------------------------------------------------------------
 # Linux (Proton) + AMD: the settings of PR #199's measured Linux run (Exorion1er, Fedora 44,

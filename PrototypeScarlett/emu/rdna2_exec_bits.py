@@ -1,7 +1,7 @@
 """Instructions scalaires RDNA 2 de manipulation de bits, de champs et de masques d'EXEC.
 
 Complète la table SCALAR d'emu/rdna2_exec_ops.py : s_bfe_*, s_lshl{1-4}_add_u32, s_mul_hi_*,
-s_absdiff_i32, opérations 64 bits, s_wqm/s_quadmask/s_bitreplicate, s_bitset*, s_ff0/s_flbit
+s_absdiff_i32, s_pack_*_b32_b16, opérations 64 bits, s_wqm/s_quadmask/s_bitreplicate, s_bitset*, s_ff0/s_flbit
 signés et les variantes saveexec/wrexec restantes. Sémantique : documentation publique d'AMD
 « RDNA 2 Instruction Set Architecture », chapitre 5 (SOP2, SOPC, SOP1).
 
@@ -12,6 +12,8 @@ MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 NO_BIT = MASK32                              # « aucun bit trouvé » : -1 sur 32 bits
 WIDTH_SHIFT, WIDTH_MASK = 16, 0x7F           # largeur d'un s_bfe : S1[22:16]
 QUAD = 4
+HALF = 0xFFFF                                # one 16-bit half of a dword
+LITERAL = 255
 
 
 def _signed(value, bits):
@@ -91,18 +93,40 @@ def _value(function):
     return lambda a, w: (function(a), None)
 
 
+def signed_literal_s0(execute):
+    """S0 is a signed 64-bit integer: a 32-bit literal there is sign-extended, not zero-extended.
+
+    AMD "RDNA 2" ISA (November 2020), section 6.2.1, "Literal Expansion to 64 bits" (p. 43): "64-bit
+    unsigned integer: zero extended to 64 bits; 64-bit signed integer: sign extended to 64 bits". The
+    unsigned and bitwise 64-bit sources (s_bfe_u64, s_*_b64…) keep zero-extending. S1 of these
+    instructions is 32 bits and only its low 23 bits are read, so sharing the literal with it is harmless.
+    """
+    def run(wave, f, literal):
+        if f["ssrc0"] == LITERAL and literal is not None:
+            literal = _signed(literal, 32) & MASK64
+        return execute(wave, f, literal)
+    return run
+
+
 def scalar_operations(sop1, sop2, logic, saveexec, compare):
     """{mnémonique: exécution} des instructions scalaires de ce module."""
     table = {
         "s_bfe_u32": sop2(lambda a, b, w: (r := bfe(a, b, 32, False), r != 0)),
         "s_bfe_i32": sop2(lambda a, b, w: (r := bfe(a, b, 32, True), r != 0)),
         "s_bfe_u64": sop2(lambda a, b, w: (r := bfe(a, b, 64, False), r != 0), 2, 1),
-        "s_bfe_i64": sop2(lambda a, b, w: (r := bfe(a, b, 64, True), r != 0), 2, 1),
+        "s_bfe_i64": signed_literal_s0(sop2(lambda a, b, w: (r := bfe(a, b, 64, True), r != 0), 2, 1)),
         "s_bfm_b64": sop2(lambda a, b, w: (((1 << (a & 63)) - 1) << (b & 63), None), 2, 1, 1),
-        "s_ashr_i64": sop2(lambda a, b, w: (r := _signed(a, 64) >> (b & 63), r != 0), 2, 1),
+        "s_ashr_i64": signed_literal_s0(sop2(lambda a, b, w: (r := _signed(a, 64) >> (b & 63), r != 0), 2, 1)),
         "s_absdiff_i32": sop2(lambda a, b, w: (r := absdiff(a, b), r != 0)),
         "s_mul_hi_u32": sop2(lambda a, b, w: (a * b >> 32, None)),
         "s_mul_hi_i32": sop2(lambda a, b, w: (_signed(a, 32) * _signed(b, 32) >> 32, None)),
+        # D = {S1 half, S0 half}, SCC unchanged (ISA section 12.1, SOP2 opcodes 50-52, p. 106). An inline
+        # float source is its float32 pattern, as for every SOP2 source: LLVM 20.1.8 declares the packs
+        # SOP2_32, and on gfx1036 16-bit integer VALU sources read the float32 bits (emu/rdna2_exec_cmp16.py).
+        # Assumed for s_pack (not measured directly: PortBridge issue #83).
+        "s_pack_ll_b32_b16": sop2(lambda a, b, w: ((b & HALF) << 16 | a & HALF, None)),
+        "s_pack_lh_b32_b16": sop2(lambda a, b, w: (b & ~HALF & MASK32 | a & HALF, None)),
+        "s_pack_hh_b32_b16": sop2(lambda a, b, w: (b & ~HALF & MASK32 | a >> 16, None)),
         "s_orn2_b64": logic(lambda a, b: a | ~b, 2), "s_nand_b64": logic(lambda a, b: ~(a & b), 2),
         "s_nor_b64": logic(lambda a, b: ~(a | b), 2), "s_xnor_b64": logic(lambda a, b: ~(a ^ b), 2),
         "s_bitcmp0_b64": compare(lambda a, b: not a >> (b & 63) & 1, 2, second_width=1),
@@ -146,7 +170,7 @@ def _wide_source_operations(sop1):
         "s_ff0_i32_b64": from64(lambda a: first_one(~a & MASK64)),
         "s_ff1_i32_b64": from64(first_one),
         "s_flbit_i32_b64": from64(lambda a: leading_zeros(a, 64)),
-        "s_flbit_i32_i64": from64(lambda a: leading_signs(a, 64)),
+        "s_flbit_i32_i64": signed_literal_s0(from64(lambda a: leading_signs(a, 64))),
         "s_bitreplicate_b64_b32": to64(bitreplicate),
     }
 

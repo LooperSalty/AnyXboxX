@@ -43,9 +43,18 @@ LDS_HALVES = {
     **{f"ds_write_{kind}_d16_hi": ("write", kind, True) for kind in ("b8", "b16")},
 }
 HALF_BITS, HALF_MASK = 16, 0xFFFF
+# No VGPR address: LDS[LDS_BASE + {OFFSET1,OFFSET0} + M0[15:0] + TID*4] (ISA section 12.13, DS opcodes 176-177,
+# p. 204). {name: direction}
+LDS_ADD_TID = {"ds_write_addtid_b32": "write", "ds_read_addtid_b32": "read"}
+M0 = 124
+# s_atc_probe(_buffer): "Probe or prefetch an address into the SQC data cache" (ISA section 12.6, opcodes
+# 38-39, p. 130): a hint that writes no register, like the cache invalidations.
 CACHE_CONTROL = frozenset({"s_dcache_inv", "s_gl1_inv", "s_dcache_wb", "buffer_gl0_inv", "buffer_gl1_inv",
-                           "ds_nop"})
+                           "ds_nop", "s_atc_probe", "s_atc_probe_buffer"})
 OTHER = frozenset({"s_memtime", "s_memrealtime", *rdna2_exec_lanes.NAMES})
+# No VGPR address: memory_Addr = sgpr_addr(64) + inst_offset(12) + tid*4 (ISA section 12.18.3, opcodes 22-23,
+# p. 230). The ISA gives no address without SADDR: SADDR = off is refused. {name: plain access}
+ADD_TID = {"global_load_dword_addtid": "global_load_dword", "global_store_dword_addtid": "global_store_dword"}
 
 
 class Memory:
@@ -80,9 +89,9 @@ class Memory:
 def supports(name):
     """Vrai si l'interpréteur exécute cette instruction mémoire."""
     vector = VECTOR_PATTERN.match(name)
-    return bool(name in CACHE_CONTROL or name in OTHER or vector and vector.group(3) in WIDTHS
+    return bool(name in CACHE_CONTROL or name in OTHER or name in ADD_TID or vector and vector.group(3) in WIDTHS
                 or VECTOR_ATOMIC.match(name) or SCALAR_PATTERN.match(name)
-                or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES
+                or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES or name in LDS_ADD_TID
                 or rdna2_exec_atomic.vector(name) or rdna2_exec_atomic.lds(name)
                 or rdna2_exec_atomic.lds_exchange2(name) or rdna2_exec_smem.supports(name))
 
@@ -165,6 +174,8 @@ def _lds(wave, name, word):
     if name in rdna2_exec_lanes.NAMES:
         rdna2_exec_lanes.execute(wave, name, addr, data0, vdst, offset1 << 8 | offset0)
         return
+    if name in LDS_ADD_TID:
+        return _lds_add_tid(wave, name, offset1 << 8 | offset0, data0, vdst)
     atomic = LDS_ATOMIC.match(name)
     found = LDS_PATTERN.match(name)
     extended, exchange2 = rdna2_exec_atomic.lds(name), rdna2_exec_atomic.lds_exchange2(name)
@@ -194,6 +205,16 @@ def _lds(wave, name, word):
                 wave.lds[address:address + size] = _store_bytes(wave, source, lane, size)
             else:
                 _load_into(wave, target, lane, bytes(wave.lds[address:address + size]), found.group(3))
+
+
+def _lds_add_tid(wave, name, offset, data0, vdst):
+    base = (wave.s[M0] & HALF_MASK) + offset
+    for lane in wave.active():
+        address = (base + lane * DWORD) % LDS_SIZE
+        if LDS_ADD_TID[name] == "write":
+            wave.lds[address:address + DWORD] = _store_bytes(wave, data0, lane, DWORD)
+        else:
+            _load_into(wave, vdst, lane, bytes(wave.lds[address:address + DWORD]), "b32")
 
 
 def _lds_half(wave, name, address, data0, vdst, lane):
@@ -258,15 +279,44 @@ def _lds_exchange2(wave, spec, base, offsets, sources, vdst, lane):
 
 # --- FLAT / GLOBAL et MUBUF : mémoire vectorielle ------------------------------------------
 
+FLAT_OFFSET_SIGN = 0x800
+
+
+def flat_offset(family, word):
+    """Byte offset of a FLAT, GLOBAL or SCRATCH instruction, or None when it is not defined.
+
+    ISA section 9.1 (p. 83): "Scratch, Global: 12-bit signed byte offset. Flat: must be positive."; llvm-mc 20
+    (gfx1030) only accepts an 11-bit unsigned offset on FLAT and disassembles bit 11 as +2048. What the
+    hardware does with bit 11 set on FLAT is not documented, so the callers refuse it by name.
+    """
+    if family == "FLAT":
+        return None if word & FLAT_OFFSET_SIGN else word & (FLAT_OFFSET_SIGN - 1)
+    return signed(word & 0xFFF, 12)
+
+
 def _flat(wave, family, name, word):
-    offset = signed(word & 0xFFF, 12)
+    offset = flat_offset(family, word)
+    if offset is None:
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"{name}: FLAT offset with bit 11 set (the ISA requires a positive offset)")
     addr, data, saddr, vdst = (word >> 32) & 0xFF, (word >> 40) & 0xFF, (word >> 48) & 0x7F, (word >> 56) & 0xFF
+    if name in ADD_TID:
+        return _add_tid(wave, name, offset, data, saddr, vdst)
     for lane in wave.active():
         if family == "GLOBAL" and saddr != OFF:
             address = (wave.s[saddr] | wave.s[saddr + 1] << 32) + wave.v[addr][lane]
         else:
             address = wave.v[addr][lane] | wave.v[addr + 1][lane] << 32
         _access(wave, name, address + offset, data, vdst, lane, returns=(word >> 16) & 1)
+
+
+def _add_tid(wave, name, offset, data, saddr, vdst):
+    if saddr == OFF:
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"{name} with SADDR off: address not given by the RDNA 2 ISA")
+    base = wave.s[saddr] | wave.s[saddr + 1] << 32
+    for lane in wave.active():
+        _access(wave, ADD_TID[name], base + offset + lane * DWORD, data, vdst, lane)
 
 
 def _buffer(wave, name, word):

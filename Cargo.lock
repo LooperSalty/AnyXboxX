@@ -3891,20 +3891,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "miniz_oxide 0.9.1",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
  "windows",
  "windows-sys 0.61.2",
+ "zlib-rs",
 ]
 
 [[package]]
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
- "miniz_oxide 0.9.1",
  "opus-pure",
  "tracing",
  "victory-formats",
@@ -3914,6 +3914,7 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys 0.61.2",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3943,7 +3944,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "tempfile",
  "tracing",
  "victory-core",
 ]
@@ -3952,10 +3952,9 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "blake3",
- "miniz_oxide 0.9.1",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
+ "zlib-rs",
 ]
 
 [[package]]

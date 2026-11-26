@@ -1,6 +1,7 @@
 """HLSL recompilation of RDNA 2 SDWA (0xF9), DPP16 (0xFA), and DPP8 (0xE9/0xEA)
 forms for VOP1, VOP2, and VOPC instructions (#21).
 """
+from emu.rdna2_exec_ext import operand_float_flags
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS
 from emu.rdna2_hlsl_ops import VECTOR, Untranslatable, compare_condition, is_compare, scalar_target, source
 from emu.rdna2_operands_ext import BOUND_CTRL_BIT, CLAMP_BIT, DPP8, DPP8_FI, DPP16, FI_BIT, OMOD_SHIFT, SDWA
@@ -12,15 +13,6 @@ _OUTPUT_SCALE = {1: "2.0f", 2: "4.0f", 3: "0.5f"}
 
 def is_ext(family, src0):
     return family in ("VOP1", "VOP2", "VOPC") and src0 in EXT_CODES
-
-
-def _operand_float_flags(name):
-    """Return (src_is_f32, dst_is_f32) from the instruction's operand types."""
-    if name.startswith("v_cvt_"):
-        parts = name.split("_")
-        return len(parts) >= 4 and parts[3] == "f32", len(parts) >= 3 and parts[2] == "f32"
-    is_f32 = name.endswith("_f32")
-    return is_f32, is_f32
 
 
 def _hlsl_extract(expr, sel, sext):
@@ -64,7 +56,7 @@ def _hlsl_place_dst(expr, old_expr, dst_sel, dst_unused):
 def _hlsl_sdwa(family, name, fields, ext, active):
     if name in SIXTEEN_BIT_RESULTS:
         raise Untranslatable(f"non traduite en HLSL (SDWA) : {name}, résultat 16 bits sous dst_sel non vérifié")
-    src_is_float, dst_is_float = _operand_float_flags(name)
+    src_is_float, dst_is_float = operand_float_flags(name)
     s0_code, s0_scalar = ext & 0xFF, (ext >> 23) & 1
     s0_sel, s0_sext, s0_neg, s0_abs = (ext >> 16) & 7, (ext >> 19) & 1, (ext >> 20) & 1, (ext >> 21) & 1
     s1_code, s1_scalar = fields.get("vsrc1", 0), (ext >> 31) & 1
@@ -97,8 +89,8 @@ def _hlsl_sdwa(family, name, fields, ext, active):
     vdst = f"v[{fields['vdst']}]"
     expr = VECTOR[name].format(a=a, b=b, c="s[106]", d=vdst, k="0u")
     omod, clamp = (ext >> OMOD_SHIFT) & 3, (ext >> CLAMP_BIT) & 1
-    if not dst_is_float and clamp:
-        raise Untranslatable(f"SDWA clamp non pris en charge sur opération entière : {name}")
+    if not dst_is_float and (clamp or omod):
+        raise Untranslatable(f"SDWA clamp/omod not supported on an integer result: {name}")
     if dst_is_float and (omod or clamp):
         scaled = f"asfloat({expr}) * {_OUTPUT_SCALE.get(omod, '1.0f')}"
         expr = f"asuint({'saturate(' + scaled + ')' if clamp else scaled})"
@@ -143,7 +135,7 @@ def _hlsl_dpp16(name, fields, ext, active):
     s1_neg, s1_abs = (ext >> 22) & 1, (ext >> 23) & 1
     bank_mask = (ext >> 24) & 0xF
     row_mask = (ext >> 28) & 0xF
-    src_is_float, _ = _operand_float_flags(name)
+    src_is_float, _ = operand_float_flags(name)
     vdst = f"v[{fields['vdst']}]"
     b = f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u"
     a_val = "dpp_a"

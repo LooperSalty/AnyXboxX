@@ -13,6 +13,7 @@ from fractions import Fraction
 import pytest
 
 from emu import rdna2_exec, rdna2_gpu
+from emu.rdna2_exec_ops import bits_float, float_bits
 from test_rdna2_exec import LITERAL, V, const, program, sop1, sop2, sopc, sopp, vop1, vop2, vop3
 from test_rdna2_exec_memory import INPUT, OUTPUT, global_
 from test_rdna2_hlsl import compare, store_lane, with_lane_offset
@@ -269,3 +270,12 @@ def test_gpu_matches_interpreter_when_dxc_folds_literal_operands():
     for index, (a, b, c, result, _) in enumerate(DIRECTED[:16]):
         slots = struct.unpack_from("<192I", actual, OUTPUT + 8 * 128 * index)[0:192:32]
         assert slots == (result,) * 5 + (legacy(a, b, c),), DIRECTED[index][4]
+
+
+@pytest.mark.parametrize("bits, quiet", [
+    (0x7F80_0001, 0x7FC0_0001), (0xFFA0_0000, 0xFFE0_0000), (0x7FBF_FFFF, 0x7FFF_FFFF),
+    (0x7FC1_2345, 0x7FC1_2345), (0x7F80_0000, 0x7F80_0000), (0xFF80_0000, 0xFF80_0000), (0x3F80_0000, 0x3F80_0000),
+])
+def test_signalling_nan_operands_come_back_quiet_on_every_python(bits, quiet):
+    """CPython 3.14 keeps the signalling bit through struct ("<f"); 3.12 and 3.13 cleared it."""
+    assert float_bits(bits_float(bits)) == quiet

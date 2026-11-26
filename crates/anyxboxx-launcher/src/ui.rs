@@ -22,6 +22,9 @@ const CACHE_CHECK_EVERY: f64 = 2.0;
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if std::mem::take(&mut self.close_requested) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.is_busy() {
             ctx.request_repaint_after(BUSY_REPAINT);
         }

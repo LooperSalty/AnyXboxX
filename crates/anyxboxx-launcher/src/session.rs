@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 
 use anyxboxx::run::XgMode;
 
+use crate::detached;
 use crate::env::{self, EnvError, Xg};
 use crate::launch::Plan;
 use crate::options::LaunchOptions;
 use crate::processes::{self, GuardError, ProcessSource};
 use crate::profile::Profile;
+use crate::warm_state;
+use anyxboxx::run::Victory;
 
 /// The window's fields, as typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +29,10 @@ pub struct Settings {
     pub skip_process_check: bool,
     /// The Play page's launch options.
     pub options: LaunchOptions,
+    /// Keep the launcher open after the game started (off: it closes once the game is up).
+    pub keep_open_after_launch: bool,
+    /// "Always re-warm before launch": the shader warm runs even when the marker is current.
+    pub always_rewarm: bool,
 }
 
 impl Default for Settings {
@@ -38,6 +45,8 @@ impl Default for Settings {
             jobs: 0,
             skip_process_check: false,
             options: LaunchOptions::default(),
+            keep_open_after_launch: false,
+            always_rewarm: false,
         }
     }
 }
@@ -78,12 +87,33 @@ pub fn make_plan(
         mode: settings.xg_mode,
     });
     let env = env::build_env(&game_dir, profile, &overrides, xg.as_ref())?;
+    let warm = Victory::locate(repo, false).ok().and_then(|victory| {
+        let marker = warm_state::marker_path(std::env::var_os("LOCALAPPDATA").as_deref());
+        crate::launch::warm_check(
+            &victory.exe,
+            &env,
+            &game_dir,
+            settings.always_rewarm,
+            marker,
+        )
+    });
+    let game_log = detached::log_dir(std::env::var_os("LOCALAPPDATA").as_deref())
+        .map(|dir| detached::game_log_path(&dir, unix_now()));
     Ok(Plan {
         repo: repo.to_path_buf(),
         game_dir,
         env,
         jobs: settings.jobs_limit(),
+        game_log,
+        warm,
     })
+}
+
+/// Seconds since the Unix epoch, for the log file name of one launch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The one-game guard, unless the user skips it in the advanced panel.
@@ -145,11 +175,7 @@ mod tests {
         let plan = make_plan(&settings, Path::new("repo"), &profile()).expect("plan");
         assert_eq!(plan.jobs, Some(6));
         assert_eq!(plan.game_dir, dir.path());
-        assert!(
-            plan.env
-                .iter()
-                .any(|(k, _)| k == "VICTORY_SHADER_LOOP_LIMIT")
-        );
+        assert!(plan.env.iter().any(|(k, _)| k == "VICTORY_CARD_WINDOWS_MB"));
     }
 
     #[test]

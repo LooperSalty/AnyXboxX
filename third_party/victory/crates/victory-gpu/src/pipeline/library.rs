@@ -363,13 +363,16 @@ pub(crate) fn removal_note() -> String {
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
-    const QUIET_MS: u64 = 10_000;
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
-        || crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + QUIET_MS
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
+    {
+        return;
+    }
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;
@@ -439,7 +442,6 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            null_library();
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -448,16 +450,6 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
-}
-
-/// `VICTORY_L6_NULL_LIBRARY` (on unless `0`): see [`open`]; logged once.
-fn null_library() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_L6_NULL_LIBRARY").is_none_or(|v| v != "0");
-        tracing::info!(on, "VICTORY_L6_NULL_LIBRARY: an empty host pipeline library is made from a null blob (Wine, upstream PR #1722)");
-        on
-    })
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -495,31 +487,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    // `VICTORY_L6_NULL_LIBRARY` (on unless `0`; upstream PR #1722): an
-    // empty library is asked for with a null blob. An empty Rust slice has
-    // a dangling, non-null pointer; Windows only looks at the length, but
-    // vkd3d-proton (Wine) refuses a non-null blob of length 0 with
-    // E_INVALIDARG, and no pipeline was ever kept there ("the host makes no
-    // empty pipeline library"). Off: the slice, as before.
-    let empty = || -> windows::core::Result<ID3D12PipelineLibrary1> {
-        let mut out = std::ptr::null_mut();
-        // SAFETY: the method's own arguments; a null blob of length 0 makes
-        // an empty library, whose reference `out` then holds.
-        unsafe {
-            (Interface::vtable(device).CreatePipelineLibrary)(
-                Interface::as_raw(device),
-                std::ptr::null(),
-                0,
-                &ID3D12PipelineLibrary::IID,
-                &mut out,
-            )
-            .ok()?;
-            ID3D12PipelineLibrary::from_raw(out).cast()
-        }
-    };
-    let library = if null_library() { empty() } else { make(&[]) }
-        .inspect_err(|e| tracing::warn!(error = %e, "the host makes no empty pipeline library"))
-        .ok()?;
+    let library = make(&[]).ok()?;
     Some(Library {
         library,
         _blob: Blob::None,
@@ -601,7 +569,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let Some(dir) = DIR.get() else { return };
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -613,21 +581,6 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    // Without a library (vkd3d-proton under Proton made none) the early
-    // list is still kept: without it every start made all its pipelines
-    // on first use, and the world's first frames dropped thousands of
-    // draws a frame as "being made", different ones on each start.
-    let Some(library) = library() else {
-        if USED_CHANGED.swap(false, Ordering::Relaxed) {
-            // With what earlier runs listed, as below.
-            let used: Vec<String> = used().iter().flatten().cloned().collect();
-            match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
-                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
-                Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
-            }
-        }
-        return;
-    };
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
@@ -747,11 +700,6 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
-/// Open the early list before a cache save that has no title draws.
-pub(crate) fn keep_early_list() {
-    drop(used());
-}
-
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
 }

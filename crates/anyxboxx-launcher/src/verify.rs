@@ -1,13 +1,11 @@
-//! Checks the game folder: the files VIctory needs are present and structurally whole, and every
-//! file it verified gets a SHA-256 line of a manifest. Only the folder's own top-level files are
-//! read, never its parents. The launcher ships no expected hashes or sizes: a manifest is a record
-//! to compare by eye or against a later check, not a proof that the game is the right build.
+//! The quick check of the game folder: the files VIctory needs are present and structurally whole.
+//! Only the first kilobytes of each file are read (PE headers and section bounds, the RPF7 header
+//! and tables), so it ends in a moment even when the archives weigh 130 GB. The hashes are a
+//! separate, optional job (`manifest`). The launcher ships no expected hashes or sizes.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-
-use sha2::{Digest, Sha256};
 
 use crate::format::{self, HEAD_BYTES};
 
@@ -15,8 +13,6 @@ pub const GAME_EXE: &str = "game_scarlett_master.exe";
 pub const SHADERS_RPF: &str = "shaders.rpf";
 /// The DLLs `--precompile` translates with the game (see anyxboxx::run::PRECOMPILED_DLLS).
 pub const PRECOMPILE_DLLS: [&str; 2] = ["XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll"];
-
-const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Files the launcher needs in the game folder, with the reason for each.
 pub fn required_files() -> Vec<(&'static str, &'static str)> {
@@ -40,35 +36,17 @@ pub enum Problem {
     Unreadable(String),
 }
 
-/// One line of the manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub name: String,
-    pub size: u64,
-    pub sha256: String,
-}
-
-/// The result of a check.
+/// The result of the quick check.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// Required files with their problem, in `required_files` order.
     pub problems: Vec<(String, Problem)>,
-    /// Hashes of the required files that are present, and of the top-level `.rpf` archives.
-    pub manifest: Vec<Entry>,
 }
 
 impl Report {
     /// True when every required file is present and whole.
     pub fn is_ok(&self) -> bool {
         self.problems.is_empty()
-    }
-
-    /// The manifest in `sha256sum` layout: `<sha256>  <size>  <name>`, one file per line.
-    pub fn manifest_text(&self) -> String {
-        self.manifest
-            .iter()
-            .map(|e| format!("{}  {:>14}  {}\n", e.sha256, e.size, e.name))
-            .collect()
     }
 }
 
@@ -82,23 +60,15 @@ pub fn verify_folder(dir: &Path) -> io::Result<Report> {
     }
     let mut report = Report::default();
     for (name, _) in required_files() {
-        match check_file(&dir.join(name), name) {
-            Ok(entry) => report.manifest.push(entry),
-            Err(problem) => report.problems.push((name.to_string(), problem)),
+        if let Err(problem) = check_file(&dir.join(name), name) {
+            report.problems.push((name.to_string(), problem));
         }
     }
-    for name in top_level_rpfs(dir)? {
-        let known = report.manifest.iter().any(|e| e.name == name);
-        if !known && let Ok(entry) = hash_file(&dir.join(&name), &name) {
-            report.manifest.push(entry);
-        }
-    }
-    report.manifest.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(report)
 }
 
-/// Checks one required file and hashes it when it is whole.
-fn check_file(path: &Path, name: &str) -> Result<Entry, Problem> {
+/// Checks one required file by its size and its first bytes.
+fn check_file(path: &Path, name: &str) -> Result<(), Problem> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => meta,
         Ok(_) | Err(_) => return Err(Problem::Missing),
@@ -114,21 +84,7 @@ fn check_file(path: &Path, name: &str) -> Result<Entry, Problem> {
     } else {
         Ok(())
     };
-    structure.map_err(Problem::Corrupted)?;
-    hash_file(path, name).map_err(|e| Problem::Unreadable(e.to_string()))
-}
-
-fn top_level_rpfs(dir: &Path) -> io::Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type()?.is_file() && is_ext(&name, "rpf") {
-            names.push(name);
-        }
-    }
-    names.sort();
-    Ok(names)
+    structure.map_err(Problem::Corrupted)
 }
 
 fn is_ext(name: &str, ext: &str) -> bool {
@@ -143,27 +99,6 @@ fn read_head(path: &Path) -> io::Result<Vec<u8>> {
         .take(HEAD_BYTES as u64)
         .read_to_end(&mut head)?;
     Ok(head)
-}
-
-fn hash_file(path: &Path, name: &str) -> io::Result<Entry> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
-    let mut size = 0u64;
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        size += read as u64;
-        hasher.update(&buffer[..read]);
-    }
-    let digest = hasher.finalize();
-    Ok(Entry {
-        name: name.to_string(),
-        size,
-        sha256: digest.iter().map(|b| format!("{b:02x}")).collect(),
-    })
 }
 
 #[cfg(test)]
@@ -206,14 +141,44 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_folder_is_ok_and_hashed() {
+    fn a_complete_folder_passes_the_quick_check() {
         let dir = tempfile::tempdir().expect("tempdir");
         game_folder(dir.path());
         let report = verify_folder(dir.path()).expect("folder");
         assert!(report.is_ok(), "{:?}", report.problems);
-        let names: Vec<&str> = report.manifest.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&GAME_EXE) && names.contains(&"audio.rpf"));
-        assert!(report.manifest.iter().all(|e| e.sha256.len() == 64));
+    }
+
+    #[test]
+    fn a_missing_executable_is_the_first_problem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        game_folder(dir.path());
+        std::fs::remove_file(dir.path().join(GAME_EXE)).expect("remove");
+        let report = verify_folder(dir.path()).expect("folder");
+        assert_eq!(
+            report.problems,
+            vec![(GAME_EXE.to_string(), Problem::Missing)]
+        );
+    }
+
+    #[test]
+    fn a_truncated_pe_is_corrupted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        game_folder(dir.path());
+        let mut cut = good_pe();
+        cut.truncate(0x90);
+        std::fs::write(dir.path().join(GAME_EXE), cut).expect("write");
+        let report = verify_folder(dir.path()).expect("folder");
+        assert_eq!(report.problems.len(), 1);
+        assert!(matches!(&report.problems[0].1, Problem::Corrupted(_)));
+    }
+
+    #[test]
+    fn an_archive_with_only_its_header_passes_without_reading_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        game_folder(dir.path());
+        // The header alone is enough for the quick check: nothing else is read.
+        std::fs::write(dir.path().join(SHADERS_RPF), good_rpf()).expect("write");
+        assert!(verify_folder(dir.path()).expect("folder").is_ok());
     }
 
     #[test]
@@ -255,14 +220,5 @@ mod tests {
     fn a_folder_that_does_not_exist_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(verify_folder(&dir.path().join("nope")).is_err());
-    }
-
-    #[test]
-    fn manifest_text_has_one_line_per_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        game_folder(dir.path());
-        let text = verify_folder(dir.path()).expect("folder").manifest_text();
-        assert_eq!(text.lines().count(), required_files().len() + 1);
-        assert!(text.contains("audio.rpf"));
     }
 }

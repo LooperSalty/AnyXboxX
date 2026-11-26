@@ -8,7 +8,7 @@ traités à part.
 import math
 import struct
 
-from emu import rdna2_exec_bits
+from emu import rdna2_exec_bits, rdna2_exec_cmp16
 
 MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 EXEC = 126                                  # exec_lo ; exec_hi en 127
@@ -25,8 +25,21 @@ def float_bits(value):
         return POSITIVE_INFINITY if value > 0 else NEGATIVE_INFINITY
 
 
+EXPONENT_F32, MANTISSA_F32, QUIET_F32 = 0x7F80_0000, 0x007F_FFFF, 0x0040_0000
+
+
 def bits_float(bits):
-    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+    """Flottant d'un motif f32 ; un NaN signalant revient silencieux (bit 22 posé).
+
+    CPython 3.12 et 3.13 le rendaient silencieux en convertissant le float en double ; CPython 3.14 garde
+    le bit signalant (struct.unpack("<f") de 0x7F800001 puis struct.pack("<f") redonne 0x7F800001 au lieu
+    de 0x7FC00001, mesuré sur 3.12.13, 3.13.13 et 3.14.10). Le bit est posé ici pour que toutes les
+    versions suivent la même règle (celle de _first_nan et des tests de NaN).
+    """
+    bits &= MASK32
+    if bits & EXPONENT_F32 == EXPONENT_F32 and bits & MANTISSA_F32:
+        bits |= QUIET_F32
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
 def signed(value, bits=32):
@@ -164,9 +177,11 @@ COMPARISONS = {"eq": lambda a, b: a == b, "lg": lambda a, b: a != b, "gt": lambd
 # invalidation du cache d'instructions, compteurs de performance, trace, attentes sur les compteurs.
 SOPP_NO_EFFECT = ("s_icache_inv", "s_incperflevel", "s_decperflevel", "s_ttracedata_imm", "s_wait_idle",
                   "s_waitcnt_depctr")
+# s_version (SOPK) : « Do nothing. Argument is ignored by hardware » (ISA RDNA 2, §12.2, opcode 1, p. 106).
+SOPK_NO_EFFECT = ("s_version",)
 NO_OPERATION = ("s_nop", "s_waitcnt", "s_barrier", "s_sleep", "s_setprio", "s_clause", "s_inst_prefetch",
                 "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_ttracedata",
-                *SOPP_NO_EFFECT)
+                *SOPP_NO_EFFECT, *SOPK_NO_EFFECT)
 
 SCALAR = {
     "s_add_u32": _sop2(lambda a, b, w: (a + b, (a + b) >> 32 != 0)),
@@ -434,3 +449,4 @@ for _prefix, _writes_exec in (("v_cmp", False), ("v_cmpx", True)):
     for _name, _test in INTEGER_TESTS.items():
         VECTOR_COMPARE[f"{_prefix}_{_name}_u32"] = (lambda a, b, t=_test: t(a, b), _writes_exec)
         VECTOR_COMPARE[f"{_prefix}_{_name}_i32"] = (lambda a, b, t=_test: t(signed(a), signed(b)), _writes_exec)
+VECTOR_COMPARE.update(rdna2_exec_cmp16.COMPARE16)       # i16/u16: S0[15:0] vs S1[15:0]

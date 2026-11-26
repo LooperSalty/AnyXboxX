@@ -2,6 +2,12 @@
 
 French version: [fr/rust-full-status.md](fr/rust-full-status.md). Plan: [architecture-rust.md](architecture-rust.md).
 
+## Base: main (Neptune VIctory)
+
+This branch now contains `origin/main` (merge of PR #277 and everything before it): `third_party/victory` is main's Neptune tree, with two of our patches re-applied on top (VICTORY_KEYBOARD and VICTORY_WINDOW_MODE=borderless, commit b27dbae4) and the rust/full changes to xmem (EraFields) and xasync (commit following it). `anyxboxx run` gives VIctory main's launcher set: the release build, the Neptune switch set (39 variables, measured on 2026-11-25), `-Quality` (`--quality`), `--override`, `--auto-a`, `--frametime-dump`, `--warm`, `--precompile`, `--diag`/`--dred`. The golden copy of main's script is `tests/fixtures/lancer_victory_neptune.ps1`; `tests/test_anyxboxx_run.py` and `tests/test_lanceur_victory.py` check the Rust settings against it. The graphical launcher starts the game detached (its log under `%LOCALAPPDATA%AnyXboxXogs`), closes once the game is up unless "Keep the launcher open" is on, and warms the shader cache automatically when the marker of this build and environment is missing or stale (`warm-state.txt`).
+
+Open after the merge: `anyxboxx-rdna2-ref` parity tests (`tests/test_rdna2_ref_parity.py`, 5 tests) fail: main's Python model now executes forms the Rust interpreter still refuses as untranslated (VOP3P, VOPC SDWA/DPP, typed buffer accesses). They must be ported to `crates/anyxboxx-rdna2-ref` before this branch can be merged.
+
 ## Test it locally (Windows)
 
 ```powershell
@@ -70,7 +76,7 @@ Profiles (`crates/anyxboxx-launcher/profiles.toml`, one test each):
 
 | Component (before) | Now on `rust/full` | Parity check | Old code |
 | --- | --- | --- | --- |
-| `tools/lancer_victory.ps1` (PowerShell) | `anyxboxx run` (`crates/anyxboxx`) | same calls, `VICTORY_*` environment and exit codes as the script, with a fake cargo and victory.exe | **deleted**; `tests/test_anyxboxx_run.py` keeps the expectations |
+| `anyxboxx run` (PowerShell) | `anyxboxx run` (`crates/anyxboxx`) | same calls, `VICTORY_*` environment and exit codes as the script, with a fake cargo and victory.exe | **deleted**; `tests/test_anyxboxx_run.py` keeps the expectations |
 | `emu/loader.py` (PE loader) | `crates/anyxboxx-pe` (on `victory-pe`) | `tests/test_rust_pe_parity.py`: 13 images, same JSON and page protections | kept (the Python sandbox still uses it) |
 | `--rapport` (`emu/report.py`, `config.py`) | `anyxboxx rapport` (`crates/anyxboxx-report`) | `tests/test_rust_rapport_parity.py`: same text on 7 targets, same refusals on 5 | kept (used by the Python CLI and tools) |
 | `--traduction` | `anyxboxx traduction` | `tests/test_rust_traduction_parity.py`: same table, byte-identical SVG on 6 setups | kept |

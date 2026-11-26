@@ -6,6 +6,34 @@ Ce guide explique comment installer et lancer le projet, et tout ce qu'il faut i
 
 Le lancement passe par [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 ou ultérieure), copié dans ce dépôt sous `third_party/victory`, où il est notre code : rien n'est synchronisé ni épinglé. La copie part de la branche `anyxboxx/fork-7b0-lot9-murs` du fork du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), puis a reçu 57 commits pour Proton et les cartes AMD (voir plus bas). Cette branche assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) au commit `7b0f736`, huit de ses pull requests précédentes, sept nouvelles, le portage de la précompilation hors ligne de #282 et des commits à nous (disposition `xg_xs.dll` servie comme la bibliothèque de Microsoft, voir plus bas), au commit `80d58f8`. Le script `anyxboxx run` le compile et le lance sur votre dossier du jeu.
 
+## Base Neptune (25 novembre, soir)
+
+`third_party/victory` contient désormais la source correspondante de Neptune (VIctory Edit.) 2026-11-25c (GPL-3.0-or-later ; elle repose sur `fxceless/victory-fork`, `myokex/victory-amd`, `soldsawn/victory-nvidia-8gb`, ShakiraRED-dt, `ZSlayerHQ/victory-world-runtime`, `JoshuuDev/victory-amd` et d'autres, voir [THIRD_PARTY.md](../../THIRD_PARTY.md)), plus nos quatre commits `xg:` (la `xg_xs.dll` de Microsoft comme oracle, `-XgDll`) et la Rich Presence Discord éteinte sauf `VICTORY_DISCORD=1`. Les sections suivantes décrivent la base précédente `80d58f8` et ses 57 commits Proton/AMD, qui ne sont pas repris.
+
+```powershell
+.\tools\lancer_victory.ps1 -GameDir <dossier du jeu> -Warm   # la première fois : environ 7 min de traduction des shaders, puis le jeu
+.\tools\lancer_victory.ps1 -GameDir <dossier du jeu>         # ensuite
+```
+
+Le lanceur compile le profil release (`-Diag` ou `-Dred` pour la build de diagnostic) et pose le jeu de réglages du `play.ps1` de Neptune pour le chemin Series X (carte de 16 Go : baisser `VICTORY_CARD_WINDOWS_MB` et `VICTORY_CARD_BUFFERS_MB` sur une carte plus petite). `-Warm` lance `victory.exe warm` sur les seuls fichiers `.rpf` du dossier du jeu. `-AutoA` appuie sur A pendant les écrans de démarrage, `-FrametimeDump` écrit un CSV des temps d'image dans le dossier du cache. En jeu, F10 masque les chiffres du coin et F12 enregistre une image dans Images.
+
+Le lanceur pose aussi `VICTORY_OCEAN_READBACK=1`, avec ou sans `-NoTunedSettings`. Les passes de vagues du titre écrivent les cartes de hauteur de l'océan sur le GPU (256x256, une carte de hauteur R32_FLOAT et une carte de déplacement R32G32_FLOAT, disposition linéaire) et son CPU les lit pour faire flotter les bateaux ; sur la console les deux partagent la mémoire, ici les texels restent dans la copie de l'hôte tant qu'ils ne sont pas recopiés (`texback.rs`, portage par Neptune de Geckomacabre/vx-layer et MiamiGame/XTP, éteint par défaut). Sans lui les bateaux reposent sur le fond. Mesuré sous Linux (RX 9070 XT, GE-Proton11-12, build release, lancement de 20 minutes) : environ 14 de ces textures recopiées par image, le bateau de la première mission du chapitre flotte et la mission continue ; pas mesuré sous Windows. `VICTORY_TEXTURE_BACK_MODES` reste non posée (dispositions linéaires seulement) : d'après les notes de Neptune, recopier les modes de swizzle XOR 2 et 27 transformait l'eau en écume avec des taches noires.
+
+Mesuré par le mainteneur le 25 novembre (RTX 4070 SUPER, i7-13700KF, chemin Series X en 4K, monde, après `warm`, build release) : médiane d'environ 12,5 fps, environ 15 fps sur la dernière minute, pointes à 30, environ 7 500 draws par image, sans plantage ; la base précédente tournait à environ 5 fps au même endroit. Problèmes connus (notes de Neptune) : objets et vêtements noirs un instant pendant le remplacement de leurs textures, parties du monde absentes derrière certaines portes et sur certains toits, pas d'animation faciale, sauts du temps d'image pendant le streaming ; la lumière intérieure est une lumière ambiante uniforme à la place de l'éclairage en lancer de rayons.
+
+### Sous Linux (Proton, AMD)
+
+La base Neptune ne reprend pas les 57 commits Proton/AMD de la base précédente (section suivante) : `main` a besoin de quatre choses sous Proton. `anyxboxx run` ne tourne que sous Windows : posez ces réglages à la main autour de `wine victory.exe run <dossier du jeu>\game_scarlett_master.exe --execute`, avec les mêmes variables que le lanceur.
+
+| Quoi | Pourquoi |
+| --- | --- |
+| La `d3dcompiler_47.dll` de Microsoft à côté de `victory.exe`, et `WINEDLLOVERRIDES` avec `d3dcompiler_47=n` | VIctory compile ses propres shaders d'appoint (bornage des arguments indirects, comparaison sur la carte, passe des plans de profondeur) avec `D3DCompile`. Le compilateur intégré de Wine les refuse (`'InterlockedMax' is not defined on type 'RWByteAddressBuffer'`) : sans le bornage, tous les draws indirects sont abandonnés et seule l'interface s'affiche sur un monde noir. Neptune n'a pas de repli DXC, donc `VICTORY_DXC` n'aide pas. La DLL vient de votre propre installation de Windows ou du Windows SDK ; ne la committez jamais. |
+| `VKD3D_CONFIG=descriptor_heap` | Le titre demande 1 245 184 vues, plus que la limite par défaut de vkd3d-proton. |
+| `VICTORY_LATE_WAIT=0` | Le jeu de réglages de Neptune allume le relais (`VICTORY_RELAY=2`), et avec le relais un `VICTORY_LATE_WAIT` non posé vaut l'étape 3. Sous RADV, le périphérique a alors été perdu après environ 80 s et 105 s (`0x887A0005`, le noyau signalant une faute de page GPU sur des lectures de données d'un shader) ; avec `0`, quatre lancements de 2,6 à 20 minutes n'en ont perdu aucun. |
+| Pas de `warm` | `victory.exe warm` a traduit tous les shaders et créé les pipelines de calcul, puis s'est figé sous Proton (aucun temps CPU, tous les threads en attente). Laissez-le de côté : le jeu traduit ce dont il a besoin au premier lancement. |
+
+Mesuré sous Linux seulement (Fedora 44, RX 9070 XT 16 Go, RADV via vkd3d-proton, GE-Proton11-12 avec le wineserver view-tree, build release de `main` avec le jeu de réglages du lanceur et `VICTORY_OCEAN_READBACK=1`) : le monde s'affiche, un lancement de 20 minutes dans le chapitre 1 s'est terminé à la fermeture de la fenêtre. Deux pertes sans lui, quatre lancements sans perte avec lui : `VICTORY_LATE_WAIT=0` est mesuré, pas prouvé. Pas mesuré : d'autres pilotes AMD, NVIDIA sous Proton.
+
 ## Correctifs Proton et AMD (25 novembre)
 
 `third_party/victory` n'est plus un sous-module : il contient une copie de VIctory à l'épinglage précédent `80d58f8` (section suivante, inchangée), suivie dans l'historique de ce dépôt de 57 commits pour Proton et les cartes AMD (`git log -- third_party/victory`). Chaque commit nomme sa source ; un commit repris de quelqu'un d'autre se termine par les lignes `Source:` et `Co-authored-by:`. Chaque dépôt d'origine est listé dans [THIRD_PARTY.md](../../THIRD_PARTY.md).
@@ -18,7 +46,7 @@ Remove-Item -Recurse -Force third_party\victory, .git\modules\third_party\victor
 git pull
 ```
 
-Sous Linux, `rm -rf third_party/victory .git/modules/third_party/victory` remplace `Remove-Item`. Cela supprime aussi `third_party/victory/target` : la première compilation repart de zéro. La clé du cache des shaders dépend de la source du traducteur : un cache rempli avec `--precompile` sur `80d58f8` est rempli de nouveau.
+Sous Linux, `rm -rf third_party/victory .git/modules/third_party/victory` remplace `Remove-Item`. Cela supprime aussi `third_party/victory/target` : la première compilation repart de zéro. La clé du cache des shaders dépend de la source du traducteur : un cache rempli avec `-Precompile` sur `80d58f8` est rempli de nouveau.
 
 Ce qu'apportent les 57 commits :
 
@@ -76,8 +104,8 @@ Non mesuré : Windows. Les valeurs Windows du lanceur (`VICTORY_LATE_WAIT=3`, `V
 
 Depuis `80d58f8` (branche `anyxboxx/fork-7b0-lot9-murs`), l'épinglage porte aussi deux commits de Yorivel venus du fork (`e49864a`, `bf870de`, issue #62 du fork) : les écritures DirectStorage dans des pages physiques sont signalées au côté GPU quand `VICTORY_DSTORAGE_NOTIFY=1`, que le lanceur pose. Mesuré par le mainteneur (journal VIctory, 25 novembre, vers 02:41 à 02:50, avec les réglages du lanceur ci-dessus) : d'une sauvegarde neuve jusque dans le monde en environ 9 minutes, 5,3 à 6,9 fps, 4 200 à 6 300 draws par image, pas de perte du périphérique ; cinématiques entières, jugé « incroyable » (observé) ; des graphismes manquent encore par endroits. La plupart des draws abandonnés viennent du constructeur des structures de ray tracing, coupé (14 943 sur 15 444 dans un journal ; mesuré).
 
-- Trois commits à nous, `xg:` (`1f0fe1d`, puis les versions reprises des commits `4466d2e` et `a16f040` du fork) : le HLE de `xg_xs.dll` répond maintenant exactement comme la DLL de Microsoft (mips de queue en mode parent avec position ; tuilage 64 Kio indexé par sous-ressource, mips empaquetés à zéro, compte = mips standard dans la place donnée). Un test de `victory-hle` compare 54 descriptions avec la vraie DLL quand `VICTORY_XG_DLL` est posé. Mesuré en jeu par le mainteneur : 0 écart avec la DLL. La DLL n'est donc plus nécessaire pour ce gain ; le lanceur garde `--xg-dll` comme oracle.
-- Précompilation hors ligne, portage de la pull request #282 de `fxceless/victory-fork` (t4l03) : `victory translate --cache --pipelines [--used-pipelines] <shaders.rpf> <exe> <dlls>` traduit les shaders et construit les pipelines avant le jeu. La clé du cache ne dépend plus de l'exécutable. Un commit d'adaptation à nous retire `shader_opt` de la clé (le commit `1684989` du fork n'est pas dans notre base). Le lanceur la lance avec `--precompile`.
+- Trois commits à nous, `xg:` (`1f0fe1d`, puis les versions reprises des commits `4466d2e` et `a16f040` du fork) : le HLE de `xg_xs.dll` répond maintenant exactement comme la DLL de Microsoft (mips de queue en mode parent avec position ; tuilage 64 Kio indexé par sous-ressource, mips empaquetés à zéro, compte = mips standard dans la place donnée). Un test de `victory-hle` compare 54 descriptions avec la vraie DLL quand `VICTORY_XG_DLL` est posé. Mesuré en jeu par le mainteneur : 0 écart avec la DLL. La DLL n'est donc plus nécessaire pour ce gain ; le lanceur garde `-XgDll` comme oracle.
+- Précompilation hors ligne, portage de la pull request #282 de `fxceless/victory-fork` (t4l03) : `victory translate --cache --pipelines [--used-pipelines] <shaders.rpf> <exe> <dlls>` traduit les shaders et construit les pipelines avant le jeu. La clé du cache ne dépend plus de l'exécutable. Un commit d'adaptation à nous retire `shader_opt` de la clé (le commit `1684989` du fork n'est pas dans notre base). Le lanceur la lance avec `-Precompile`.
 - Sept pull requests du fork, reprises avec `cherry-pick -x` (auteurs dans [THIRD_PARTY.md](../../THIRD_PARTY.md)) : #349, #355, #396, #386, #358 (2 commits), #353, #374, plus un commit d'adaptation des tests de #353.
 
 | Pull request du fork | Auteur | Effet |
@@ -92,7 +120,7 @@ Depuis `80d58f8` (branche `anyxboxx/fork-7b0-lot9-murs`), l'épinglage porte aus
 
 Mesuré ou observé par le mainteneur (Windows 11, RTX 4070 Super, journaux VIctory, nuit du 24 au 25 novembre), réglages du lanceur de `main` :
 
-- `--xg-dll` en mode `compare` avec le nouveau HLE : 0 écart avec la DLL de Microsoft. Mesuré.
+- `-XgDll` en mode `compare` avec le nouveau HLE : 0 écart avec la DLL de Microsoft. Mesuré.
 - Précompilation (`victory translate --cache --pipelines`) : 25 689 shaders traduits en environ 4,5 min, 296 refusés, cache de 13 Go dans `%LOCALAPPDATA%\victory\cache`. Mesuré.
 - Monde : 4,8 à 5,1 fps, environ 12,7 % des draws abandonnés par image (11 à 14 % avant). Mesuré. La cinématique est jugée meilleure par le mainteneur, rien de pire en jeu. Observé.
 - Analyse de Codex (lue dans les diffs) : #374 (BC7) et #349 (`0/x` donnait l'infini) sont les meilleures pistes pour les carrés corrompus et l'exposition. Pas encore vérifié en jeu.
@@ -107,8 +135,8 @@ Le jeu demande à la bibliothèque de disposition des textures de la console (`x
 
 Mesuré ou observé par le mainteneur (Windows 11, RTX 4070 Super, journaux VIctory, 25 novembre, vers 00:37 et 00:42), réglages du lanceur de `main` :
 
-- `--xg-mode compare` (dispositions de VIctory, chaque écart journalisé une fois) : 84 descriptions de textures diffèrent, toutes des textures 64 Kio D (`layout` `0x10a`, quelques `0x105`). La bibliothèque annonce les mips de queue dans le mode parent (10) avec une position dans la queue ; VIctory annonce `256B_D` (2) sans position. Tailles, offsets et pas identiques. Le tuilage 64 Kio liste toutes les tranches d'un tableau avec queue de mips (VIctory s'arrête à deux). Aucun écart sur les modes suggérés ni sur les octets tuilés des copies CPU. Mesuré.
-- `--xg-mode real` (par défaut avec `--xg-dll`) : 5,4 à 7,1 fps en fin d'essai contre 5,1 à 5,6, environ 6 080 draws par image, pas de perte du périphérique en environ 3 min 40 ; jugé par le mainteneur comme le meilleur essai à ce jour. Mesuré, puis observé.
+- `-XgMode compare` (dispositions de VIctory, chaque écart journalisé une fois) : 84 descriptions de textures diffèrent, toutes des textures 64 Kio D (`layout` `0x10a`, quelques `0x105`). La bibliothèque annonce les mips de queue dans le mode parent (10) avec une position dans la queue ; VIctory annonce `256B_D` (2) sans position. Tailles, offsets et pas identiques. Le tuilage 64 Kio liste toutes les tranches d'un tableau avec queue de mips (VIctory s'arrête à deux). Aucun écart sur les modes suggérés ni sur les octets tuilés des copies CPU. Mesuré.
+- `-XgMode real` (par défaut avec `-XgDll`) : 5,4 à 7,1 fps en fin d'essai contre 5,1 à 5,6, environ 6 080 draws par image, pas de perte du périphérique en environ 3 min 40 ; jugé par le mainteneur comme le meilleur essai à ce jour. Mesuré, puis observé.
 
 ## Épinglage précédent : lot 5 plus une pull request (25 novembre)
 
@@ -176,7 +204,7 @@ Le monde est atteint et affiché. Rien ici ne vient de la lecture du code du jeu
 
 **Premier lancement à froid.** Le premier lancement avec un cache vide a planté au chargement (compilation des pipelines, puis le plantage interne du jeu suivi sous VIctory #1464). Le deuxième lancement, avec le cache rempli, a tenu. Si le premier plante, relancez.
 
-Les réglages de l'essai réussi sont maintenant ceux par défaut de `anyxboxx run` (tableau de la section Lancement), sauf cinq variables que le code épinglé ne lit jamais et DRED, devenu optionnel (voir Lancement). Ils demandent la compilation `diag` (`--profile diag --features diagnostics`). Passez `--no-tuned-settings` pour les désactiver.
+Les réglages de l'essai réussi sont maintenant ceux par défaut de `anyxboxx run` (tableau de la section Lancement), sauf cinq variables que le code épinglé ne lit jamais et DRED, devenu optionnel (voir Lancement). Ils demandent la compilation `diag` (`--profile diag --features diagnostics`). Passez `-NoTunedSettings` pour les désactiver.
 
 ## Ce que vous obtenez aujourd'hui
 
@@ -273,10 +301,10 @@ Le profil `diag` est nécessaire pour les touches scriptées, les captures d'ima
 ## Lancement
 
 ```powershell
-.\target\release\anyxboxx.exe run --game-dir <dossier du jeu>
+.\tools\lancer_victory.ps1 -GameDir <dossier du jeu>
 ```
 
-`anyxboxx run` règle les variables ci-dessous (sauf avec `--no-tuned-settings`, qui ne garde que `VICTORY_GAME_DIR`) puis exécute `victory.exe run <dossier du jeu>\game_scarlett_master.exe --execute` :
+Le script règle les variables ci-dessous (sauf avec `-NoTunedSettings`, qui ne garde que `VICTORY_GAME_DIR`) puis exécute `victory.exe run <dossier du jeu>\game_scarlett_master.exe --execute` :
 
 | Variable | Valeur | Pourquoi |
 | --- | --- | --- |
@@ -287,20 +315,27 @@ Le profil `diag` est nécessaire pour les touches scriptées, les captures d'ima
 | `VICTORY_RELAY` | non posé | Option du fork, plus posée par défaut (issue n°89 du fork : la peau disparaît, les sous-titres se superposent) ; `2` était actif dans les essais mesurés de `7b0f736` et du lot 4. |
 | `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Dimensionnement des tampons de carte, en Mo. |
 | `VICTORY_DSTORAGE_NOTIFY` | `1` | Les écritures DirectStorage dans des pages physiques sont signalées au côté GPU (commits du fork `e49864a` et `bf870de` de Yorivel, issue #62 du fork) : sans elle, les murs de la première pièce peuvent lire des copies périmées et paraître transparents. |
+| `VICTORY_STAGING_POOL_MB` | `1024` | Les tampons d'envoi des textures choisies par index sont gardés pour resservir, jusqu'à ce nombre de Mo, au lieu d'un tampon créé et mappé à chaque envoi (`0` n'en garde aucun). Mesuré sur une RTX 5080 (pilote 621.01, journaux de VIctory, deux lancements dans chaque cas, 25 novembre) : à l'entrée dans le monde, le passage sous 2,5 i/s dure environ 40 s au lieu d'environ 80 s, et la passe des textures des 100 premières secondes prend 190 ms par image au lieu de 560 à 730 ms ; rien ne change une fois la file vide (3,4 à 3,5 i/s dans les deux cas). |
 
 Les anciennes valeurs par défaut `VICTORY_RT_MISS`, `VICTORY_WAVE32_READFIRSTLANE`, `VICTORY_WAVE32_CROSSLANE`, `VICTORY_SKIP_BVH_BUILDER` et `VICTORY_CAPPED_DYNAMIC` sont retirées : aucun fichier du commit épinglé ne les lit (le constructeur BVH est coupé sauf avec `VICTORY_BVH_BUILDER=1`). `tests/test_lanceur_victory.py` vérifie maintenant que VIctory lit chaque variable posée par le lanceur.
 
 Ces valeurs ne changent pas depuis les 57 commits Proton et AMD : ce sont les réglages Windows du mainteneur, pas encore mesurés avec ces commits. Sous Linux avec RADV, `VICTORY_LATE_WAIT=3` fait perdre le périphérique (issue #184 du fork) ; les réglages du lancement Linux mesuré sont dans la section des correctifs Proton et AMD plus haut.
 
-`--dred` pose `VICTORY_D3D12_DRED=1` (données de périphérique perdu) pour diagnostiquer une perte du périphérique. Il est coupé par défaut : VIctory l'active dès que la variable existe, et il note chaque opération des listes de commandes, ce qui ralentit chaque image.
+`VICTORY_HEAP_PASS_DIRTY=1` (la passe du tas ne regarde que les emplacements marqués depuis sa passe précédente ; portée depuis [reddxd-byte/ShakiraRED-dt](https://github.com/reddxd-byte/ShakiraRED-dt)), `VICTORY_COPY_COALESCE=256` (les plages modifiées à 256 octets près au plus partent en une seule plage), `VICTORY_CARD_WINDOWS_MB=1536` (étaient 4096 : ce réglage était dimensionné pour une carte de 16 Go et faisait déborder la VRAM dans la RAM système sur une carte de 12 Go), `VICTORY_CARD_BUFFERS_MB=1536`, `VICTORY_TEXTURE_ROOM_PERCENT=93`, `VICTORY_VRAM_IDLE_MS=8000,2000,1000` (était 15000,2500,1000) et `VICTORY_LIST_POOL_MB=512` (était 2048) sont maintenant les valeurs par défaut du lanceur ; le tableau ci-dessus est remplacé là où elles diffèrent. Mesuré par des essais automatiques de 13 minutes en Series X le 25 novembre (journaux `main-neptune-2258` contre `auto-gpu-2319`, RTX 4070 SUPER) : médiane de 13,8 fps dans le monde (15,6 à 17,0 sur la dernière minute), 72,5 ms par image, 46,5 ms de préparation d'image, passes du tas de 9,6 ms contre 14 à 38 ms ; `main` avant : médiane de 10,9 fps (13,5 à 14,8 sur la dernière minute), 92 ms par image, 57 ms de préparation. `VICTORY_CARD_WINDOWS_MB=0` a été essayé et coûte environ 5 fps. `VICTORY_INPLACE=1` n'a placé qu'une seule fenêtre de 2 Mo et n'est pas activé. La RAM système reste à environ 22 Go privés (mémoire du titre et miroirs) : ces réglages ne la résolvent pas.
 
-`--xg-dll <chemin de xg_xs.dll>` pose `VICTORY_XG_DLL` : votre propre copie de la bibliothèque PC hors ligne de disposition des textures du GDK dispose les textures du jeu (voir la section du lot 8 et de la bibliothèque de disposition plus haut). `--xg-mode compare` (`VICTORY_XG_MODE`) garde à la place les dispositions de VIctory et journalise chaque écart avec la bibliothèque ; `real` est la valeur par défaut. Ne copiez jamais la DLL dans ce dépôt.
+`VICTORY_RELAY_WIDE_MERGE=1` (les morceaux reçus du relais fusionnés sur les threads conservés) est dans VIctory, désactivé par défaut, et n'a pas été mesuré.
 
-`--precompile` lance d'abord `victory.exe translate --cache --pipelines --used-pipelines <dossier du jeu>\shaders.rpf <dossier du jeu>\game_scarlett_master.exe <dossier du jeu>\XboxBvhBuilder.dll <dossier du jeu>\amd_fidelityfx_upscaler_xbox.dll` avec les mêmes variables d'environnement que le jeu (la clé du cache en dépend), puis démarre le jeu. Sur la machine du mainteneur, cela a pris environ 4,5 min et rempli 13 Go de cache (mesuré) ; les lancements suivants le réutilisent. Le lanceur s'arrête avec un message clair si l'un de ces fichiers manque.
+`-Quality` applique par-dessus les valeurs par défaut le jeu qui privilégie l'image : `VICTORY_CARD_WINDOWS_MB=0` (les fenêtres sont lues à chaque image au lieu d'être gardées en copies sur la carte), `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_LIST_POOL_MOST=256`, `VICTORY_LIST_POOL_MB=256` et `VICTORY_TEXTURE_STAGE_MB=192`. Il coûte environ la moitié de la fréquence d'image : environ 7 à 9 fps contre 14 à 17, avec 51 à 93 refus de textures contre 296 (journal auto-ram-2326, mesuré par le mainteneur ; l'image est jugée meilleure, éclairage, ombres et textures, observé). `-Override` garde le dernier mot.
+
+`-Dred` pose `VICTORY_D3D12_DRED=1` (données de périphérique perdu) pour diagnostiquer une perte du périphérique. Il est coupé par défaut : VIctory l'active dès que la variable existe, et il note chaque opération des listes de commandes, ce qui ralentit chaque image.
+
+`-XgDll <chemin de xg_xs.dll>` pose `VICTORY_XG_DLL` : votre propre copie de la bibliothèque PC hors ligne de disposition des textures du GDK dispose les textures du jeu (voir la section du lot 8 et de la bibliothèque de disposition plus haut). `-XgMode compare` (`VICTORY_XG_MODE`) garde à la place les dispositions de VIctory et journalise chaque écart avec la bibliothèque ; `real` est la valeur par défaut. Ne copiez jamais la DLL dans ce dépôt.
+
+`-Precompile` lance d'abord `victory.exe translate --cache --pipelines --used-pipelines <dossier du jeu>\shaders.rpf <dossier du jeu>\game_scarlett_master.exe <dossier du jeu>\XboxBvhBuilder.dll <dossier du jeu>\amd_fidelityfx_upscaler_xbox.dll` avec les mêmes variables d'environnement que le jeu (la clé du cache en dépend), puis démarre le jeu. Sur la machine du mainteneur, cela a pris environ 4,5 min et rempli 13 Go de cache (mesuré) ; les lancements suivants le réutilisent. Le lanceur s'arrête avec un message clair si l'un de ces fichiers manque.
 
 Le premier lancement à froid peut planter pendant la compilation des pipelines : relancez une fois le cache rempli.
 
-`--skip-pipelines <hash,...>` est transmis à `VICTORY_SKIP_PIPELINES` (voir plus bas).
+`-SkipPipelines <hash,...>` est transmis à `VICTORY_SKIP_PIPELINES` (voir plus bas).
 
 Où sont les choses :
 
@@ -350,7 +385,7 @@ Ils demandent le build `diag`.
 
 Pour arrêter le jeu : `taskkill /F /IM victory.exe`. La commande `timeout` de Git Bash ne tue pas l'exécutable.
 
-Pour mesurer un lancement, envoyez le journal de VIctory (stderr) dans un fichier, par exemple `.\target\release\anyxboxx.exe run --game-dir <dossier> 2> victory.log`, puis résumez-le avec `python tools/resume_journal_victory.py victory.log`. Le script garde les lignes d'images du monde (100 draws par image ou plus, `--draws-min` change le seuil) et donne la médiane et l'étendue de chaque partie de l'image (préparation, copies, textures, GPU, copie de retour, draws, draws perdus faute de pipeline hôte), ainsi que le nombre d'avertissements (shaders qui ne se traduisent pas, pipelines refusés, périphérique perdu). Avec deux journaux (`avant.log apres.log`), il compare les médianes colonne par colonne, pour juger un changement sur la partie de l'image qu'il vise. `--markdown` écrit des tableaux à coller dans une issue. Seuls des comptes et des temps sont écrits.
+Pour mesurer un lancement, envoyez le journal de VIctory (stderr) dans un fichier, par exemple `.\tools\lancer_victory.ps1 -GameDir <dossier> 2> victory.log`, puis résumez-le avec `python tools/resume_journal_victory.py victory.log`. Le script garde les lignes d'images du monde (100 draws par image ou plus, `--draws-min` change le seuil) et donne la médiane et l'étendue de chaque partie de l'image (préparation, copies, textures, GPU, copie de retour, draws, draws perdus faute de pipeline hôte), ainsi que le nombre d'avertissements (shaders qui ne se traduisent pas, pipelines refusés, périphérique perdu). Avec deux journaux (`avant.log apres.log`), il compare les médianes colonne par colonne, pour juger un changement sur la partie de l'image qu'il vise. `--markdown` écrit des tableaux à coller dans une issue. Seuls des comptes et des temps sont écrits.
 
 ## Anciennes branches
 

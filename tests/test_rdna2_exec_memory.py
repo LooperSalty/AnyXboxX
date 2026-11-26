@@ -1,5 +1,7 @@
 """Instructions mémoire de l'interpréteur RDNA 2 : de vrais petits shaders de calcul sur 32 lignes."""
-from emu import rdna2_exec
+import pytest
+
+from emu import rdna2_exec, rdna2_hlsl
 from emu.rdna2_exec_ops import bits_float, float_bits
 from emu.rdna2_ops import MNEMONICS
 from test_rdna2_exec import ONE, TWO, V, const, program, vop1, vop2, vop3
@@ -150,3 +152,29 @@ def test_lds_d16_hi_writes_take_the_high_half_of_the_data():
 def test_memory_instructions_raise_coverage():
     done, total = rdna2_exec.coverage()
     assert 500 <= done < total
+
+
+def flat(name, addr, vdst, offset):
+    """FLAT segment (SEG = 0): no SADDR; `offset` goes in bits 11:0 as given."""
+    return 0x37 << 26 | OPCODES["FLAT", name] << 18 | offset & 0xFFF, vdst << 24 | OFF << 16 | addr
+
+
+def flat_wave(*words):
+    wave = rdna2_exec.Wave()
+    wave.memory.write_words(INPUT, list(range(0x1000)))
+    for lane in range(32):
+        wave.v[1][lane], wave.v[2][lane] = INPUT + 0x800, 0
+    rdna2_exec.run(program(*words), wave)
+    return wave
+
+
+def test_flat_offset_is_unsigned_and_bit_11_is_refused():
+    """ISA section 9.1 (p. 83): "Scratch, Global: 12-bit signed byte offset. Flat: must be positive"."""
+    wave = flat_wave(*flat("flat_load_dword", 1, 3, 0x7FC))             # + 2044, not a negative offset
+    assert wave.v[3][0] == (0x800 + 0x7FC) // 4
+    with pytest.raises(rdna2_exec.Untranslated, match="bit 11"):
+        flat_wave(*flat("flat_load_dword", 1, 3, 0x800))
+    with pytest.raises(rdna2_hlsl.Untranslatable, match="bit 11"):
+        rdna2_hlsl.translate(program(*flat("flat_load_dword", 1, 3, 0x800)))
+    wave = flat_wave(*global_("global_load_dword", 1, vdst=3, offset=-4))  # GLOBAL stays signed
+    assert wave.v[3][0] == 0x800 // 4 - 1

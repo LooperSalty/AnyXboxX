@@ -1,12 +1,13 @@
 //! The launch steps, built on the shared pieces of `anyxboxx::run` (the same commands as
-//! `anyxboxx run` and the PowerShell script): build VIctory, optionally translate the shaders into
-//! the cache, then run the game. The environment is the same for the translate and the game.
+//! `anyxboxx run`): build VIctory, warm the shader cache when it is not ready (see `warm_state`),
+//! then run the game. The environment is the same for the warm and the game.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyxboxx::run::{Env, RunError, Victory};
+use anyxboxx::run::{Env, RunError, Victory, warm_archives};
 
 use crate::job::Step;
+use crate::warm_state;
 
 /// What a launch needs, decided by the window.
 #[derive(Debug, Clone)]
@@ -14,50 +15,114 @@ pub struct Plan {
     pub repo: PathBuf,
     pub game_dir: PathBuf,
     pub env: Env,
-    /// Worker threads of the translate step; `None` lets VIctory use every core.
+    /// Worker threads of the warm step; `None` lets VIctory use every core.
     pub jobs: Option<usize>,
+    /// The game's log file: when set, the game starts detached and writes its output there.
+    pub game_log: Option<PathBuf>,
+    /// The shader cache check of this launch; `None` when it could not be made.
+    pub warm: Option<WarmState>,
 }
 
-/// The steps of a launch, in order.
-pub fn play_steps(plan: &Plan, precompile: bool) -> Result<Vec<Step>, RunError> {
-    let victory = Victory::locate(&plan.repo)?;
+/// Whether the shader cache must be warmed before the game, and where the marker goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmState {
+    pub needed: bool,
+    pub marker: Option<PathBuf>,
+    pub fingerprint: String,
+}
+
+/// The steps of a launch, in order. `warm_first` also runs the shaders.rpf/exe/DLL preload.
+pub fn play_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> {
+    let victory = Victory::locate(&plan.repo, false)?;
     anyxboxx::run::game_exe(&plan.game_dir)?;
     let mut steps: Vec<Step> = build_step(&victory).into_iter().collect();
-    if precompile {
+    if let Some(warm) = plan.warm.as_ref().filter(|w| w.needed) {
+        steps.push(warm_step(&victory, plan, marker_of(warm))?);
+    }
+    if warm_first {
         steps.push(precompile_step(&victory, plan)?);
     }
-    steps.push(Step {
-        label: "Running the game".to_string(),
-        command: victory.game_command(&plan.game_dir, &plan.env),
+    let command = victory.game_command(&plan.game_dir, &plan.env);
+    steps.push(match &plan.game_log {
+        Some(log) => Step::detached("Running the game", command, log.clone()),
+        None => Step::new("Running the game", command),
     });
     Ok(steps)
 }
 
-/// The shader preloading alone (VIctory's translate into the cache).
+/// "Warm now": the full warm of the game's archives, whatever the marker says.
 pub fn precompile_steps(plan: &Plan) -> Result<Vec<Step>, RunError> {
-    let victory = Victory::locate(&plan.repo)?;
+    let victory = Victory::locate(&plan.repo, false)?;
     anyxboxx::run::game_exe(&plan.game_dir)?;
     let mut steps: Vec<Step> = build_step(&victory).into_iter().collect();
-    steps.push(precompile_step(&victory, plan)?);
+    let marker = plan.warm.as_ref().and_then(marker_of);
+    steps.push(warm_step(&victory, plan, marker)?);
     Ok(steps)
+}
+
+/// The marker path and the fingerprint to write once the warm succeeded.
+fn marker_of(warm: &WarmState) -> Option<(PathBuf, String)> {
+    warm.marker
+        .clone()
+        .map(|path| (path, warm.fingerprint.clone()))
 }
 
 /// The cargo build of VIctory; `None` for a `victory.exe` built beforehand.
 fn build_step(victory: &Victory) -> Option<Step> {
-    victory.build_command().map(|command| Step {
-        label: "Building VIctory".to_string(),
-        command,
-    })
+    victory
+        .build_command()
+        .map(|command| Step::new("Building VIctory", command))
 }
 
-fn precompile_step(victory: &Victory, plan: &Plan) -> Result<Step, RunError> {
-    let mut command = victory.translate_command(&plan.game_dir, &plan.env)?;
+/// `victory warm` on the game folder's own .rpf archives, with the game's environment. After a
+/// success the marker gets the fingerprint, so the next launch skips the warm while nothing changed.
+fn warm_step(
+    victory: &Victory,
+    plan: &Plan,
+    marker: Option<(PathBuf, String)>,
+) -> Result<Step, RunError> {
+    let archives = warm_archives(&plan.game_dir)?;
+    let mut command = victory.warm_command(&archives, &plan.env);
     if let Some(jobs) = plan.jobs {
         command.arg("--jobs").arg(jobs.to_string());
     }
-    Ok(Step {
-        label: "Preloading shaders".to_string(),
-        command,
+    let step = Step::new("Warming the shader cache", command);
+    Ok(match marker {
+        Some((path, fingerprint)) => step.with_after(Box::new(move || {
+            warm_state::write_marker(&path, &fingerprint)
+                .map_err(|e| format!("could not write {}: {e}", path.display()))
+        })),
+        None => step,
+    })
+}
+
+/// `victory warm` on shaders.rpf, the game and its DLLs (the `warm_first` option), as main's
+/// `-Precompile`. It does not mark the cache as complete: the archive warm does that.
+fn precompile_step(victory: &Victory, plan: &Plan) -> Result<Step, RunError> {
+    let mut command = victory.precompile_command(&plan.game_dir, &plan.env)?;
+    if let Some(jobs) = plan.jobs {
+        command.arg("--jobs").arg(jobs.to_string());
+    }
+    Ok(Step::new("Preloading shaders", command))
+}
+
+/// The fingerprint of this launch: the victory.exe identity, the environment, the archives.
+pub fn warm_check(
+    victory_exe: &Path,
+    env: &Env,
+    game_dir: &Path,
+    always: bool,
+    marker: Option<PathBuf>,
+) -> Option<WarmState> {
+    let archives = warm_archives(game_dir).ok()?;
+    let identities = warm_state::archive_identities(&archives);
+    let fingerprint = warm_state::fingerprint(&warm_state::build_id(victory_exe), env, &identities);
+    let stored = marker.as_deref().and_then(warm_state::read_marker);
+    let needed = warm_state::needs_warm(always, stored.as_deref(), &fingerprint);
+    Some(WarmState {
+        needed,
+        marker,
+        fingerprint,
     })
 }
 
@@ -102,6 +167,8 @@ mod tests {
         let plan = Plan {
             repo: repo.path().to_path_buf(),
             game_dir: game.path().to_path_buf(),
+            game_log: None,
+            warm: None,
             env: vec![("VICTORY_LATE_WAIT".to_string(), OsString::from("3"))],
             jobs: Some(4),
         };
@@ -124,7 +191,7 @@ mod tests {
         let (_repo, _game, plan) = fixture();
         let steps = precompile_steps(&plan).expect("steps");
         let args = args_of(&steps[1].command);
-        assert_eq!(args.first().map(String::as_str), Some("translate"));
+        assert_eq!(args.first().map(String::as_str), Some("warm"));
         let at = args
             .iter()
             .position(|a| a == "--jobs")

@@ -21,7 +21,7 @@ publish = false
 [workspace.dependencies]
 # Reused as is from VIctory (our code since #199): never re-implemented here.
 victory-pe = { path = "third_party/victory/crates/victory-pe" }
-# With `diagnostics`: VIctory is only built and run with it (the former tools/lancer_victory.ps1, anyxboxx run),
+# With `diagnostics`: VIctory is only built and run with it (the former tools/lancer_victory.ps1, now anyxboxx run),
 # and victory-gpu does not compile without it at this commit (`queue::presented` is gated).
 victory-hle = { path = "third_party/victory/crates/victory-hle", features = ["diagnostics"] }
 

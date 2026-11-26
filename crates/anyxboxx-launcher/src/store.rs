@@ -21,6 +21,9 @@ pub struct Stored {
     pub xg_mode: String,
     pub jobs: u32,
     pub skip_process_check: bool,
+    /// Keep the launcher open after the game started.
+    pub keep_open_after_launch: bool,
+    pub always_rewarm: bool,
     pub options: LaunchOptions,
 }
 
@@ -32,6 +35,8 @@ impl Stored {
             xg_mode: settings.xg_mode.as_str().to_string(),
             jobs: settings.jobs,
             skip_process_check: settings.skip_process_check,
+            keep_open_after_launch: settings.keep_open_after_launch,
+            always_rewarm: settings.always_rewarm,
             options: settings.options.clone(),
         }
     }
@@ -48,6 +53,8 @@ impl Stored {
             },
             jobs: self.jobs,
             skip_process_check: self.skip_process_check,
+            keep_open_after_launch: self.keep_open_after_launch,
+            always_rewarm: self.always_rewarm,
             options: self.options,
             ..Settings::default()
         }
@@ -95,6 +102,8 @@ mod tests {
             xg_mode: XgMode::Compare,
             jobs: 6,
             skip_process_check: true,
+            keep_open_after_launch: true,
+            always_rewarm: true,
             options: LaunchOptions {
                 preset: Preset::Quality,
                 resolution: Resolution::P1080,

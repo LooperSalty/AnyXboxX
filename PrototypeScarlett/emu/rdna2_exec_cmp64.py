@@ -19,7 +19,7 @@ INLINE_DOUBLES = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0,
                   248: 0.15915494309189532}       # 1/(2π) = 0x3FC45F306DC9C882, valeur exacte de l'ISA (§6.2)
 SIGN32, SIGN64 = 1 << 31, 1 << 63
 # (bits d'exposant, bits de mantisse) par largeur
-FORMATS = {32: (8, 23), 64: (11, 52)}
+FORMATS = {16: (5, 10), 32: (8, 23), 64: (11, 52)}
 
 
 def double(bits):

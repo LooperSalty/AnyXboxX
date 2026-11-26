@@ -119,6 +119,17 @@ def test_sdwa_vopc_custom_sdst():
     assert wave.s[8] == want
 
 
+def test_sdwa_vopc_sdst_s127_in_wave64_is_refused():
+    # v_cmp_eq_u32_sdwa s127, v0, v2 in wave64 (mask = lane 0 only): the 64-bit mask would need
+    # s[127:128], past the last SGPR. The model refuses it (as the Rust port's write_scalar does)
+    # before writing anything, so exec_hi keeps its value.
+    ext = (0 & 0xFF) | (127 << 8) | (1 << 15)
+    wave = rdna2_exec.Wave(lanes=64)
+    with pytest.raises(rdna2_exec.Untranslated, match="s127"):
+        rdna2_exec.run(program(vopc("v_cmp_eq_u32", SDWA, 2), ext), wave)
+    assert wave.s[rdna2_exec.EXEC_LO + 1] == 0xFFFF_FFFF
+
+
 def test_dpp16_quad_perm_row_ops_masks_and_bound_ctrl():
     lanes = list(range(32))
     # quad_perm:[3,2,1,0] reverses every 4-lane quad

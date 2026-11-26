@@ -9,7 +9,7 @@ import pytest
 
 from emu import rdna2_exec, rdna2_exec_ops, rdna2_exec_vop3, rdna2_gpu
 from emu.rdna2_exec_ops import float_bits
-from test_rdna2_exec import V, program, vop1, vop3
+from test_rdna2_exec import ONE as INLINE_ONE, V, const, program, vop1, vop2, vop3
 from test_rdna2_exec_memory import INPUT
 from test_rdna2_hlsl import compare, global_, store_lane, with_lane_offset
 
@@ -99,9 +99,37 @@ def rounding_program():
     return with_lane_offset(*words)
 
 
+SIGNED = [0x8000_0000, 0, ONE, ONE | 1 << 31, float_bits(3.0), float_bits(-3.0)]       # ±0, ±1, ±3
+
+
+def zero_folds_program():
+    """x + 0, 0 - x, x - x, 0 × x et fma(x, 1, 0) : sans `precise`, dxc et les pilotes simplifiaient ces
+    expressions (-0 au lieu de +0, ou 0 au lieu du NaN de ±infini - ±infini). v1 : ±0, ±1, ±3, ±infini ;
+    v2, pour 0 × x : ±0, ±1, ±3, ±0,5 (0 × ±infini donne un NaN dont le motif dépend du GPU)."""
+    words = [*global_("global_load_dword", addr=31, vdst=1, saddr=0),
+             *global_("global_load_dword", addr=31, vdst=2, saddr=0, offset=128)]
+    operations = [(vop2("v_add_f32", 10, const(0), 1),), vop3("v_add_f32", 10, V + 1, const(0)),
+                  (vop2("v_sub_f32", 10, const(0), 1),), vop3("v_subrev_f32", 10, V + 1, const(0)),
+                  (vop2("v_sub_f32", 10, V + 1, 1),), (vop2("v_mul_f32", 10, const(0), 2),),
+                  vop3("v_fma_f32", 10, V + 1, INLINE_ONE, const(0)),
+                  (vop1("v_mov_b32", 10, const(0)), vop2("v_fmac_f32", 10, INLINE_ONE, 1))]
+    for slot, operation in enumerate(operations):
+        words += [*operation, *store_lane(10, slot)]
+    return with_lane_offset(*words)
+
+
 @gpu
 def test_rounding_and_fract_match_on_gpu():
     memory = bytearray(INPUT + 128)
     memory[INPUT:] = struct.pack("<32I", *(ROUNDING_SOURCES * 2))
     expected, actual = compare(rounding_program(), memory=bytes(memory))
+    assert actual == expected
+
+
+@gpu
+def test_constant_zero_folds_match_on_gpu():
+    memory = bytearray(INPUT + 256)
+    struct.pack_into("<32I", memory, INPUT, *(SIGNED + [PLUS_INF, MINUS_INF]) * 4)
+    struct.pack_into("<32I", memory, INPUT + 128, *(SIGNED + [float_bits(0.5), float_bits(-0.5)]) * 4)
+    expected, actual = compare(zero_folds_program(), memory=bytes(memory))
     assert actual == expected
