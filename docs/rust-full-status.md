@@ -130,6 +130,8 @@ On 2026-11-26, `cargo build --release --workspace`, `cargo test --release --work
 
 On the xgameruntime shipping branch, the release workspace build and tests passed, as did the CMake Ninja build and 1,776 pytest cases with the Rust DLL. `tests/test_anyxboxx_run.py` was excluded because it executes a fake `victory.exe`, prohibited for this run. The Ninja outputs were copied to `runtime/build/bin`; TomBox test DLLs were copied from an existing local build. The default Visual Studio CMake generator did not find a C++ compiler in this environment.
 
+The C++ oracle's chunk-uninstall refusal is now tested separately. The task-queue interface still lacks `XTaskQueueRegisterWaiter` and `XTaskQueueUnregisterWaiter` (slots 20 and 21); matching exported DLL names does not establish interface-method parity. `XThreadAssertNotTimeSensitive` now breaks only for a time-sensitive thread with a debugger attached, as described by [Microsoft Learn](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xthread/functions/xthreadassertnottimesensitive); its debugger decision is covered by a Rust unit test.
+
 The `rdna2-ref`, 1251 pytest and 198 workspace figures above are from the earlier measure; the workspace and xgameruntime checks were rerun as noted.
 
 The runtime was built from this branch (cargo, then CMake). With `ANYXBOXX_REQUIRE_RUNTIME=1`, the TomBox DLL tests also need `python tools/build_tombox.py`.

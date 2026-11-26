@@ -130,6 +130,8 @@ Le 26-11-2026, `cargo build --release --workspace`, `cargo test --release --work
 
 Sur la branche de livraison de xgameruntime, la compilation et les tests du workspace en release ont réussi, ainsi que la compilation CMake avec Ninja et 1 776 tests pytest avec la DLL Rust. `tests/test_anyxboxx_run.py` a été exclu car il exécute un faux `victory.exe`, interdit pour cette exécution. Les fichiers produits par Ninja ont été copiés dans `runtime/build/bin` ; les DLL TomBox des tests proviennent d’une compilation locale existante. Le générateur CMake Visual Studio par défaut n’a pas trouvé de compilateur C++ dans cet environnement.
 
+Le refus de désinstallation de chunks par l’oracle C++ est désormais testé séparément. L’interface de file de tâches ne fournit pas encore `XTaskQueueRegisterWaiter` ni `XTaskQueueUnregisterWaiter` (positions 20 et 21) ; l’égalité des noms exportés par les DLL ne démontre pas la parité des méthodes d’interface. `XThreadAssertNotTimeSensitive` interrompt désormais seulement un thread sensible au temps lorsqu’un débogueur est attaché, conformément à [Microsoft Learn](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xthread/functions/xthreadassertnottimesensitive) ; la décision d’interruption est couverte par un test unitaire Rust.
+
 Les chiffres de `rdna2-ref`, 1251 tests pytest et 198 tests du workspace ci-dessus datent de la mesure précédente ; les contrôles du workspace et de xgameruntime ont été relancés comme indiqué.
 
 Le runtime a été compilé depuis cette branche (cargo, puis CMake). Avec `ANYXBOXX_REQUIRE_RUNTIME=1`, les tests des DLL de TomBox demandent aussi `python tools/build_tombox.py`.
