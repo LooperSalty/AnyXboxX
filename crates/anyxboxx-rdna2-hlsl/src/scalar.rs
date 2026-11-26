@@ -2,7 +2,7 @@
 
 use anyxboxx_rdna2_ref::scalar::fields;
 
-fn source(code: u32, literal: Option<u32>) -> Result<String, String> {
+pub(crate) fn source(code: u32, literal: Option<u32>) -> Result<String, String> {
     match code {
         125 => Ok("0u".into()),
         0..=127 => Ok(format!("s[{code}]")),
