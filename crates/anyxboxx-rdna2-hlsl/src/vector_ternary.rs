@@ -4,34 +4,36 @@ use anyxboxx_rdna2_ref::vop3::Fields;
 
 pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, String> {
     let f = Fields::new(word);
-    if !matches!(
-        name,
-        "v_add3_u32"
-            | "v_lshl_add_u32"
-            | "v_add_lshl_u32"
-            | "v_lshl_or_b32"
-            | "v_and_or_b32"
-            | "v_or3_b32"
-            | "v_bfe_u32"
-            | "v_bfe_i32"
-            | "v_bfi_b32"
-            | "v_bfm_b32"
-            | "v_alignbit_b32"
-            | "v_alignbyte_b32"
-            | "v_perm_b32"
-            | "v_min3_u32"
-            | "v_max3_u32"
-            | "v_med3_u32"
-            | "v_min3_i32"
-            | "v_max3_i32"
-            | "v_med3_i32"
-            | "v_mul_lo_u32"
-            | "v_mul_hi_u32"
-            | "v_mul_hi_i32"
-            | "v_mad_u32_u24"
-            | "v_mad_i32_i24"
-            | "v_bcnt_u32_b32"
-    ) || f.clamp
+    let is_float = matches!(name, "v_fma_f32" | "v_mad_f32" | "v_fma_legacy_f32");
+    if !is_float
+        && (!matches!(
+            name,
+            "v_add3_u32"
+                | "v_lshl_add_u32"
+                | "v_add_lshl_u32"
+                | "v_lshl_or_b32"
+                | "v_and_or_b32"
+                | "v_or3_b32"
+                | "v_bfe_u32"
+                | "v_bfe_i32"
+                | "v_bfi_b32"
+                | "v_bfm_b32"
+                | "v_alignbit_b32"
+                | "v_alignbyte_b32"
+                | "v_perm_b32"
+                | "v_min3_u32"
+                | "v_max3_u32"
+                | "v_med3_u32"
+                | "v_min3_i32"
+                | "v_max3_i32"
+                | "v_med3_i32"
+                | "v_mul_lo_u32"
+                | "v_mul_hi_u32"
+                | "v_mul_hi_i32"
+                | "v_mad_u32_u24"
+                | "v_mad_i32_i24"
+                | "v_bcnt_u32_b32"
+        ) || f.clamp)
     {
         return Err(format!("untranslated instruction: {name}"));
     }
@@ -43,8 +45,20 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         }
     };
     let [a, b, c] = f.sources.map(operand);
-    let (a, b, c) = (a?, b?, c?);
-    let expression = match name {
+    let modify = |mut value: String, index: u32| {
+        if is_float && f.abs >> index & 1u32 != 0u32 {
+            value = format!("({value} & 0x7FFFFFFFu)");
+        }
+        if is_float && f.neg >> index & 1u32 != 0u32 {
+            value = format!("({value} ^ 0x80000000u)");
+        }
+        value
+    };
+    let (a, b, c) = (modify(a?, 0), modify(b?, 1), modify(c?, 2));
+    let mut expression = match name {
+        "v_fma_f32" => format!("FmaF32({a}, {b}, {c})"),
+        "v_fma_legacy_f32" => format!("FmaLegacyF32({a}, {b}, {c})"),
+        "v_mad_f32" => format!("asuint(mad(asfloat({a}), asfloat({b}), asfloat({c})))"),
         "v_add3_u32" => format!("({a} + {b} + {c})"),
         "v_lshl_add_u32" => format!("(({a} << ({b} & 31u)) + {c})"),
         "v_add_lshl_u32" => format!("(({a} + {b}) << ({c} & 31u))"),
@@ -63,15 +77,33 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         "v_med3_u32" => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
         "v_min3_i32" => format!("asuint(min(min(asint({a}), asint({b})), asint({c})))"),
         "v_max3_i32" => format!("asuint(max(max(asint({a}), asint({b})), asint({c})))"),
-        "v_med3_i32" => format!("asuint(max(min(asint({a}), asint({b})), min(max(asint({a}), asint({b})), asint({c}))))"),
+        "v_med3_i32" => format!(
+            "asuint(max(min(asint({a}), asint({b})), min(max(asint({a}), asint({b})), asint({c}))))"
+        ),
         "v_mul_lo_u32" => format!("({a} * {b})"),
         "v_mul_hi_u32" => format!("MulHiU32({a}, {b})"),
         "v_mul_hi_i32" => format!("MulHiI32({a}, {b})"),
         "v_mad_u32_u24" => format!("(({a} & 0xFFFFFFu) * ({b} & 0xFFFFFFu) + {c})"),
-        "v_mad_i32_i24" => format!("asuint(((asint({a}) << 8) >> 8) * ((asint({b}) << 8) >> 8) + asint({c}))"),
+        "v_mad_i32_i24" => {
+            format!("asuint(((asint({a}) << 8) >> 8) * ((asint({b}) << 8) >> 8) + asint({c}))")
+        }
         "v_bcnt_u32_b32" => format!("(countbits({a}) + {b})"),
         _ => unreachable!(),
     };
+    if is_float && (f.clamp || f.omod != 0) {
+        let scale = match f.omod {
+            1 => "2.0f",
+            2 => "4.0f",
+            3 => "0.5f",
+            _ => "1.0f",
+        };
+        let scaled = format!("asfloat({expression}) * {scale}");
+        expression = if f.clamp {
+            format!("asuint(saturate({scaled}))")
+        } else {
+            format!("asuint({scaled})")
+        };
+    }
     Ok(format!(
         "if (((s[126] >> lane) & 1u) != 0) v[{}] = {expression};",
         f.vdst

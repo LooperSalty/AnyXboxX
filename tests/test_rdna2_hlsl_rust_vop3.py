@@ -34,3 +34,20 @@ def test_vop3_text_and_warp(name, mask, monkeypatch):
 def test_vop3_clamp_rejected_by_name():
     result = rust(program(*vop3("v_add3_u32", 1, V, V, V, clamp=1)))
     assert result.returncode != 0 and b"v_add3_u32" in result.stderr
+
+
+@pytest.mark.parametrize("name", ["v_fma_f32", "v_fma_legacy_f32", "v_mad_f32"])
+@pytest.mark.parametrize("abs_,neg,omod,clamp", [(0, 0, 0, 0), (5, 3, 2, 1)])
+def test_vop3_float_modifiers(name, abs_, neg, omod, clamp, monkeypatch):
+    data = program(vop1("v_mov_b32", 1, LITERAL), 0x3f400000,
+                   *vop3(name, 1, V + 1, 242, 242, abs_=abs_, neg=neg, omod=omod, clamp=clamp))
+    result = rust(data)
+    assert result.returncode == 0, result.stderr.decode()
+    hlsl = result.stdout.decode("utf-8")
+    assert hlsl == rdna2_hlsl.translate(data)
+    if not rdna2_gpu.available():
+        pytest.skip("dxc or GPU runner is unavailable")
+    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
+    wave = rdna2_exec.run(data)
+    hlsl = hlsl.replace("  return;\n", "  g_memory.Store(lane * 4u, v[1]);\n  return;\n")
+    assert rdna2_gpu.run(hlsl, bytes(128)) == struct.pack("<32I", *wave.v[1])
