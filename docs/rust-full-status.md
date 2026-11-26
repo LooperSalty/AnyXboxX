@@ -134,6 +134,8 @@ The C++ oracle's chunk-uninstall refusal is tested separately. The task-queue in
 
 One measured difference from the C++ oracle: when a waiter callback has already been queued before unregistering, C++ still invokes it on dispatch, whereas Rust suppresses it. A task-queue monitor established that the callback was queued before unregister in each DLL; the Rust behavior follows [Microsoft Learn's unregister contract](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueunregisterwaiter), and `test_unregister_suppresses_a_queued_waiter` covers it through the interface.
 
+The parity suite also runs the shared runtime, package and task-queue tests against `xgameruntime_cpp.dll`; only that documented queued-waiter difference is excluded from the C++ run. This includes the chunk-uninstall refusal and catches regressions in the oracle itself.
+
 The `rdna2-ref`, 1251 pytest and 198 workspace figures above are from the earlier measure; the workspace and xgameruntime checks were rerun as noted.
 
 The runtime was built from this branch (cargo, then CMake). With `ANYXBOXX_REQUIRE_RUNTIME=1`, the TomBox DLL tests also need `python tools/build_tombox.py`.

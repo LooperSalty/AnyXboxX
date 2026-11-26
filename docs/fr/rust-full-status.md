@@ -134,6 +134,8 @@ Le refus de désinstallation de chunks par l’oracle C++ est testé séparémen
 
 Une différence mesurée avec l’oracle C++ : lorsqu’un rappel d’attente est déjà dans la file avant la désinscription, C++ l’exécute encore lors du dispatch, tandis que Rust le supprime. Pour chaque DLL, un moniteur de file a confirmé la mise en file du rappel avant la désinscription ; le comportement Rust suit le [contrat de désinscription de Microsoft Learn](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueunregisterwaiter), et `test_unregister_suppresses_a_queued_waiter` le vérifie par l’interface.
 
+La suite de parité lance aussi les tests communs du runtime, des paquets et de la file de tâches avec `xgameruntime_cpp.dll` ; seule la différence documentée sur le rappel déjà en file est exclue de l’exécution C++. Cela couvre le refus de désinstallation de chunks et détecte les régressions de l’oracle lui-même.
+
 Les chiffres de `rdna2-ref`, 1251 tests pytest et 198 tests du workspace ci-dessus datent de la mesure précédente ; les contrôles du workspace et de xgameruntime ont été relancés comme indiqué.
 
 Le runtime a été compilé depuis cette branche (cargo, puis CMake). Avec `ANYXBOXX_REQUIRE_RUNTIME=1`, les tests des DLL de TomBox demandent aussi `python tools/build_tombox.py`.
