@@ -26,6 +26,7 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     };
     let count = match width {
         "dword" => 1,
+        "ubyte" | "sbyte" if !write => 1,
         "dwordx2" => 2,
         "dwordx3" => 3,
         "dwordx4" => 4,
@@ -68,12 +69,17 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     } else {
         String::new()
     };
+    let size = if matches!(width, "ubyte" | "sbyte") {
+        1
+    } else {
+        count * 4
+    };
     let inside = format!(
         "(((s[{}] >> 16) & 0x3FFFu) != 0u ? s[{}] != 0u : ({no_overflow}{byte_offset} <= s[{}] && {}u <= s[{}] - {byte_offset}))",
         resource + 1,
         resource + 2,
         resource + 2,
-        count * 4,
+        size,
         resource + 2
     );
     let address = format!("(s[{resource}]{extra} + {byte_offset})");
@@ -100,10 +106,22 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
             "AllMemoryBarrierWithGroupSync();".into(),
         ])
     } else {
-        let loads = (0..count)
-            .map(|i| format!("v[{}] = g_memory.Load(({address}) + {}u);", data + i, 4 * i))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let loads = if matches!(width, "ubyte" | "sbyte") {
+            let value = format!(
+                "((g_memory.Load(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & 0xFFu)"
+            );
+            let value = if width == "sbyte" {
+                format!("asuint((asint({value}) << 24) >> 24)")
+            } else {
+                value
+            };
+            format!("v[{data}] = {value};")
+        } else {
+            (0..count)
+                .map(|i| format!("v[{}] = g_memory.Load(({address}) + {}u);", data + i, 4 * i))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let zeros = (0..count)
             .map(|i| format!("v[{}] = 0u;", data + i))
             .collect::<Vec<_>>()
