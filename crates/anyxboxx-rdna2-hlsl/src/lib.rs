@@ -14,6 +14,7 @@ const PRELUDE: &str = concat!(
     include_str!("prelude0.hlsl"),
     include_str!("prelude1.hlsl"),
     include_str!("prelude2.hlsl"),
+    include_str!("prelude3.hlsl"),
 );
 
 /// Translate a straight-line wave32 program, rejecting unsupported instructions.

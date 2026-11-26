@@ -1,3 +1,33 @@
+  uint h = ImageHeight(t);
+  float fx = 0.0f;
+  float fy = 0.0f;
+  int2 xb = ImageBilinearAxis(s_bits, w, un, off.x, fx);
+  int2 yb = ImageBilinearAxis(t_bits, h, un, off.y, fy);
+  int cx0 = ImageClamp(xb.x, w, cx);
+  int cx1 = ImageClamp(xb.y, w, cx);
+  int cy0 = ImageClamp(yb.x, h, cy);
+  int cy1 = ImageClamp(yb.y, h, cy);
+  uint sel = (t.w >> (3u * channel)) & 7u;
+  return uint4(ImageSelect(ImageFetch(t, cx0, cy1, border), sel),
+               ImageSelect(ImageFetch(t, cx1, cy1, border), sel),
+               ImageSelect(ImageFetch(t, cx1, cy0, border), sel),
+               ImageSelect(ImageFetch(t, cx0, cy0, border), sel));
+}
+
+uint4 ImageLoad(uint4 t, uint x, uint y, uint mip) {
+  if (mip != 0u || x >= ImageWidth(t) || y >= ImageHeight(t)) return uint4(0u, 0u, 0u, 0u);
+  return ImageSwizzle(ImageTexel(t, int(x), int(y)), t.w);
+}
+
+uint ImageFloatToUnorm8(uint bits) {
+  if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) return 0u;
+  precise float f = asfloat(bits);
+  if (f <= 0.0f) return 0u;
+  if (f >= 1.0f) return 255u;
+  precise float scaled = f * 255.0f;
+  precise float rounded = floor(scaled + 0.5f);
+  return uint(rounded);
+}
 
 void ImageStore(uint4 t, uint x, uint y, uint mip, uint dmask, uint4 vals) {
   uint w = ImageWidth(t);
@@ -113,15 +143,44 @@ uint BufComponent(uint kind, uint field, uint n) {
   return field;
 }
 
-uint4 BufDecode(uint info, uint4 w) {
+// d16: p / q (p <= q < 2^16) rounded once to float16, nearest even, subnormals kept (half_from_ratio).
+uint BufHalfRatio(uint p, uint q) {
+  if (p == 0u) return 0u;
+  uint shift = firstbithigh(q) - firstbithigh(p);   // p << shift has q's top bit
+  if ((p << shift) < q) shift++;
+  uint e = min(shift, 14u), steps = e + 10u;
+  // floor(p * 2^steps / q) by long division: the remainder stays below q, so 2r fits easily.
+  uint s = p >= q ? 1u : 0u, r = p >= q ? p - q : p;
+  for (uint i = 0u; i < steps; i++) {
+    r <<= 1;
+    s <<= 1;
+    if (r >= q) { s |= 1u; r -= q; }
+  }
+  if (2u * r > q || (2u * r == q && (s & 1u) != 0u)) s += 1u;
+  return ((14u - e) << 10) + s;
+}
+
+// d16 UNORM/SNORM: the float32 of the exact quotient's float16 (normalized_half), which BufNarrow gives back.
+uint BufNormHalf(uint kind, uint field, uint n) {
+  if (kind == 1u) return BufHalf(BufHalfRatio(field, (1u << n) - 1u));
+  int x = asint(BufSigned(field, n));
+  int limit = int((1u << (n - 1u)) - 1u);
+  if (x <= -limit) return 0xBF800000u;
+  uint magnitude = BufHalf(BufHalfRatio(uint(abs(x)), uint(limit)));
+  return x < 0 ? magnitude | 0x80000000u : magnitude;
+}
+
+uint4 BufDecode(uint info, uint4 w, bool d16) {
   uint4 c = uint4(0u, 0u, 0u, 0u);
   uint position = 0u;
+  uint kind = info & 7u;
+  bool exact16 = d16 && (kind == 1u || kind == 2u);
   for (uint i = 0u; i < BufCount(info); i++) {
     uint n = BufWidth(info, i);
     uint word = w[position >> 5];
     // Champ par décalage à gauche puis à droite : avec (word >> p) & masque, le pilote AMD RDNA 2 perd le >> 16 des moitiés hautes.
     uint field = n >= 32u ? word : (word << (32u - n - (position & 31u))) >> (32u - n);
-    c[i] = BufComponent(info & 7u, field, n);
+    c[i] = exact16 ? BufNormHalf(kind, field, n) : BufComponent(kind, field, n);
     position += n;
   }
   return c;
@@ -146,6 +205,7 @@ uint BufSelect(uint4 c, uint info, uint sel) {
 
 uint BufField(uint kind, uint value, uint n) {
   if (n >= 32u) return value;
+  if (kind == 7u) return value & ((1u << n) - 1u);
   if (kind == 5u) return min(value, (1u << n) - 1u);
   int high = int((1u << (n - 1u)) - 1u);
   return uint(clamp(asint(value), -high - 1, high)) & ((1u << n) - 1u);
@@ -162,11 +222,54 @@ uint4 BufEncode(uint info, uint4 v) {
   return w;
 }
 
-bool BufStoreSelectsOk(uint info, uint word3, uint count) {
+bool BufStorable(uint info, bool d16) {
+  uint kind = info & 7u;
+  if (d16) return kind == 5u || kind == 6u || kind == 7u;
+  return ((info >> 11) & 1u) != 0u;
+}
+
+bool BufStoreSelectsOk(uint info, uint word3, uint count, bool d16) {
   uint n = BufCount(info);
-  if (((info >> 11) & 1u) == 0u || n != count) return false;
+  if (!BufStorable(info, d16) || n != count) return false;
   for (uint i = 0u; i < n; i++) if (((word3 >> (3u * i)) & 7u) != 4u + i) return false;
   return n != 2u || ((word3 >> 6) & 7u) <= 1u;
+}
+
+// d16 (emu/rdna2_buffer_d16.py) : 32-bit integer formats are not loaded as 16 bits.
+uint BufD16Info(uint info) {
+  uint kind = info & 7u;
+  return (kind == 5u || kind == 6u) && BufWidth(info, 0u) == 32u ? 0u : info;
+}
+
+// float32 -> float16, subnormals kept (half_from_float): round to nearest even with overflow to infinity,
+// or toward zero with finite values past the range giving 65504.
+uint BufHalfFromFloat(uint f, bool rtz) {
+  uint sign = (f >> 16) & 0x8000u, e = (f >> 23) & 0xFFu, m = f & 0x7FFFFFu;
+  if (e == 0xFFu) {
+    uint payload = m >> 13;
+    return sign | 0x7C00u | (m != 0u && payload == 0u ? 1u : payload);
+  }
+  if (e < 101u) return sign;
+  uint full = m | 0x800000u;
+  bool normal = e > 112u;
+  uint drop = normal ? 13u : 126u - e;
+  uint q = full >> drop, r = full & ((1u << drop) - 1u), half = 1u << (drop - 1u);
+  if (!rtz && (r > half || (r == half && (q & 1u) != 0u))) q += 1u;
+  uint bits = normal ? ((e - 113u) << 10) + q : q;
+  return sign | min(bits, rtz ? 31743u : 0x7C00u);
+}
+
+uint BufNarrow(uint info, uint value) {
+  uint kind = info & 7u;
+  if (kind == 5u || kind == 6u) return value & 0xFFFFu;
+  return BufHalfFromFloat(value, kind == 7u);
+}
+
+uint BufWiden(uint info, uint c, uint h) {
+  uint kind = info & 7u;
+  if (kind == 6u) return BufSigned(h, 16u);
+  if (kind == 7u && BufWidth(info, c) != 16u) return BufHalf(h);
+  return h;
 }
 
 void BufWrite(uint address, uint size, uint4 e) {
@@ -195,51 +298,3 @@ uint DotPacked(uint a, uint b, uint c, uint width, bool sgn) {
   [unroll] for (uint i = 0u; i < 32u; i += width) {
     uint x = (a >> i) & ((1u << width) - 1u), y = (b >> i) & ((1u << width) - 1u);
     if (sgn) {
-      x = asuint(asint(a << (32u - width - i)) >> (32u - width));
-      y = asuint(asint(b << (32u - width - i)) >> (32u - width));
-    }
-    r += x * y;
-  }
-  return r;
-}
-
-uint MsadU8(uint a, uint b) {
-  // v_msad_u8 : octets où la référence b vaut 0 exclus de la somme.
-  uint r = 0u;
-  // [loop] et non [unroll] : déroulée, cette boucle est mal compilée par le pilote AMD RDNA 2 (#151).
-  [loop] for (uint i = 0u; i < 32u; i += 8u) {
-    uint x = (a >> i) & 0xFFu, y = (b >> i) & 0xFFu;
-    if (y != 0u) r += x > y ? x - y : y - x;
-  }
-  return r;
-}
-uint SadWindow(uint lo, uint hi, uint k, uint b, bool masked) {
-  uint w = AlignBit(hi, lo, 8u * k);              // S0[8k+31:8k]
-  return masked ? MsadU8(w, b) : SadU8(w, b);
-}
-uint2 QsadPk(uint lo, uint hi, uint b, uint2 c, bool masked) {
-  uint r0 = (SadWindow(lo, hi, 0u, b, masked) + (c.x & 0xFFFFu)) & 0xFFFFu;
-  uint r1 = (SadWindow(lo, hi, 1u, b, masked) + (c.x >> 16)) & 0xFFFFu;
-  uint r2 = (SadWindow(lo, hi, 2u, b, masked) + (c.y & 0xFFFFu)) & 0xFFFFu;
-  uint r3 = (SadWindow(lo, hi, 3u, b, masked) + (c.y >> 16)) & 0xFFFFu;
-  return uint2(r0 | (r1 << 16), r2 | (r3 << 16));
-}
-uint4 MqsadU32(uint lo, uint hi, uint b, uint4 c) {
-  return uint4(SadWindow(lo, hi, 0u, b, true) + c.x, SadWindow(lo, hi, 1u, b, true) + c.y,
-               SadWindow(lo, hi, 2u, b, true) + c.z, SadWindow(lo, hi, 3u, b, true) + c.w);
-}
-
-[numthreads(32, 1, 1)]
-void main(uint lane : SV_GroupIndex) {
-  uint s[128];
-  uint v[256];
-  uint s_null = 0u;
-  bool scc = false;
-  // Dérouler l'initialisation scalaire évite un résultat incorrect sur WARP (#142).
-  [unroll] for (uint i = 0; i < 128; ++i) s[i] = 0u;
-  for (uint j = 0; j < 256; ++j) v[j] = 0u;
-  v[0] = lane;
-  s[126] = 0xFFFFFFFFu;
-  // La mémoire groupshared n'est pas remise à zéro par D3D12 : on la vide, comme l'interpréteur.
-  for (uint w = lane; w < 8128u; w += 32u) g_lds[w] = 0u;
-  GroupMemoryBarrierWithGroupSync();

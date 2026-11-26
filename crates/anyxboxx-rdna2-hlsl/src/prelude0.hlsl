@@ -47,9 +47,9 @@ uint MulHiI32(uint a, uint b) {
 uint BfeI32(uint v, uint off, uint w) {
   w &= 31u;
   if (w == 0u) return 0u;
-  uint field = (v >> (off & 31u)) & ((1u << w) - 1u);
+  int field = asint(v) >> (off & 31u);
   uint shift = 32u - w;
-  return asuint((asint(field) << shift) >> shift);
+  return asuint((field << shift) >> shift);
 }
 uint SatF32ToI32(uint a) {
   float x = asfloat(a);
@@ -146,9 +146,39 @@ uint AlignBit(uint hi, uint lo, uint s) {
 uint SadU32(uint a, uint b, uint c) {
   return (a > b ? (a - b) : (b - a)) + c;
 }
+// Opérations f32 dans des fonctions `precise` (dxc ne replie plus x + 0, x - x ni 0 × x). Le pilote AMD
+// (RX 9070 XT) replie pourtant fadd x, 0.0 et fsub x, x, et Intel fsub 0.0, x : le signe d'un résultat
+// exactement nul et x - x sont donc fixés en entier.
+uint F32Add(uint a, uint b) {
+  precise float r = asfloat(a) + asfloat(b);
+  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & b & 0x80000000u : asuint(r);    // -0 seulement pour -0 + -0
+}
+uint F32Sub(uint a, uint b) {
+  if (a == b)                                     // NaN : lui-même, rendu silencieux ; ±infini : NaN par défaut
+    return (a & 0x7FFFFFFFu) > 0x7F800000u ? a | 0x400000u : (a & 0x7F800000u) == 0x7F800000u ? 0xFFC00000u : 0u;
+  precise float r = asfloat(a) - asfloat(b);
+  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & ~b & 0x80000000u : asuint(r);
+}
+uint F32Mul(uint a, uint b) {
+  precise float r = asfloat(a) * asfloat(b);
+  return asuint(r);
+}
 uint MulLegacyF32(uint a, uint b) {
   float x = asfloat(a), y = asfloat(b);
   return (x == 0.0f || y == 0.0f) ? 0u : asuint(x * y);
+}
+uint RndneF32(uint a) {
+  // Arrondi au pair en entier : le pilote NVIDIA 621.xx (RTX 4060, RTX 5070 Ti, #227) replie
+  // Round_ne(2.5) en 3.0 après une barrière ; en entier le résultat suit IEEE 754 (signe de ±0, NaN).
+  uint sign_bit = a & 0x80000000u, mag = a & 0x7FFFFFFFu;
+  if (mag >= 0x4B000000u) return mag > 0x7F800000u ? (a | 0x400000u) : a;
+  if (mag <= 0x3F000000u) return sign_bit;
+  if (mag < 0x3F800000u) return sign_bit | 0x3F800000u;
+  uint shift = 150u - (mag >> 23);
+  uint mask = (1u << shift) - 1u, half_bit = 1u << (shift - 1u);
+  uint rem = mag & mask, rounded = mag & ~mask;
+  if (rem > half_bit || (rem == half_bit && (rounded & (1u << shift)) != 0u)) rounded += 1u << shift;
+  return sign_bit | rounded;
 }
 uint PermB32(uint a, uint b, uint c) {
   uint r = 0u;
@@ -268,33 +298,3 @@ double F32ToF64(uint a) {
   return asdouble(m << 29, s | ((e + 896u) << 20) | (m >> 3));
 }
 uint F64ToF32(double x) {
-  // Arrondi au plus près pair d'un double vers f32, dénormaux et dépassement compris.
-  uint lo, hi; asuint(x, lo, hi);
-  uint s = hi & 0x80000000u, ef = (hi >> 20) & 0x7FFu;
-  if (ef == 0u) return s;
-  int e = int(ef) - 1023;
-  uint sig = 0x80000000u | ((hi & 0xFFFFFu) << 11) | (lo >> 21);
-  bool sticky = (lo & 0x1FFFFFu) != 0u;
-  uint shift = e < -126 ? uint(8 + (-126 - e)) : 8u;
-  if (shift > 32u) return s;
-  uint kept = shift == 32u ? 0u : sig >> shift;
-  uint rest = shift == 32u ? sig : sig & ((1u << shift) - 1u);
-  uint half = 1u << (shift - 1u);
-  if (rest > half || (rest == half && (sticky || (kept & 1u) != 0u))) kept += 1u;
-  if (e < -126) return s | kept;
-  if (kept == 0x1000000u) { kept = 0x800000u; e += 1; }
-  if (e > 127) return s | 0x7F800000u;
-  return s | (uint(e + 127) << 23) | (kept & 0x7FFFFFu);
-}
-bool EqF32(uint a, uint b) {
-  return !IsNanF32(a) && !IsNanF32(b) && (a == b || ((a | b) & 0x7FFFFFFFu) == 0u);
-}
-uint ScaleF32(uint a) {
-  // ldexp(a, 64) ; infini et NaN inchangés.
-  return ((a >> 23) & 0xFFu) == 0xFFu ? a : F64ToF32(F32ToF64(a) * asdouble(0u, 0x43F00000u));
-}
-bool QuotientIsDenormalF32(uint n, uint d) {
-  // |n / d| arrondi est un dénormal non nul : 2^-150 < |n / d| < (2^24 - 1) × 2^-150 (produits exacts).
-  precise double x = F32ToF64(n & 0x7FFFFFFFu), y = F32ToF64(d & 0x7FFFFFFFu);
-  precise double low = y * asdouble(0u, 0x36900000u), high = y * ((double)0xFFFFFFu * asdouble(0u, 0x36900000u));
-  return x > low && x < high;

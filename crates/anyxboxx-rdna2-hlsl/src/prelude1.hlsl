@@ -1,3 +1,33 @@
+  // Arrondi au plus près pair d'un double vers f32, dénormaux et dépassement compris.
+  uint lo, hi; asuint(x, lo, hi);
+  uint s = hi & 0x80000000u, ef = (hi >> 20) & 0x7FFu;
+  if (ef == 0u) return s;
+  int e = int(ef) - 1023;
+  uint sig = 0x80000000u | ((hi & 0xFFFFFu) << 11) | (lo >> 21);
+  bool sticky = (lo & 0x1FFFFFu) != 0u;
+  uint shift = e < -126 ? uint(8 + (-126 - e)) : 8u;
+  if (shift > 32u) return s;
+  uint kept = shift == 32u ? 0u : sig >> shift;
+  uint rest = shift == 32u ? sig : sig & ((1u << shift) - 1u);
+  uint half = 1u << (shift - 1u);
+  if (rest > half || (rest == half && (sticky || (kept & 1u) != 0u))) kept += 1u;
+  if (e < -126) return s | kept;
+  if (kept == 0x1000000u) { kept = 0x800000u; e += 1; }
+  if (e > 127) return s | 0x7F800000u;
+  return s | (uint(e + 127) << 23) | (kept & 0x7FFFFFu);
+}
+bool EqF32(uint a, uint b) {
+  return !IsNanF32(a) && !IsNanF32(b) && (a == b || ((a | b) & 0x7FFFFFFFu) == 0u);
+}
+uint ScaleF32(uint a) {
+  // ldexp(a, 64) ; infini et NaN inchangés.
+  return ((a >> 23) & 0xFFu) == 0xFFu ? a : F64ToF32(F32ToF64(a) * asdouble(0u, 0x43F00000u));
+}
+bool QuotientIsDenormalF32(uint n, uint d) {
+  // |n / d| arrondi est un dénormal non nul : 2^-150 < |n / d| < (2^24 - 1) × 2^-150 (produits exacts).
+  precise double x = F32ToF64(n & 0x7FFFFFFFu), y = F32ToF64(d & 0x7FFFFFFFu);
+  precise double low = y * asdouble(0u, 0x36900000u), high = y * ((double)0xFFFFFFu * asdouble(0u, 0x36900000u));
+  return x > low && x < high;
 }
 uint DivScaleF32(uint s0, uint s1, uint s2, out bool vcc) {
   vcc = false;
@@ -268,33 +298,3 @@ uint4 ImageGather4(uint4 t, uint4 q, uint s_bits, uint t_bits, uint unorm_bit, u
   uint cy = (q.x >> 3) & 7u;
   uint border = (q.w >> 30) & 3u;
   uint w = ImageWidth(t);
-  uint h = ImageHeight(t);
-  float fx = 0.0f;
-  float fy = 0.0f;
-  int2 xb = ImageBilinearAxis(s_bits, w, un, off.x, fx);
-  int2 yb = ImageBilinearAxis(t_bits, h, un, off.y, fy);
-  int cx0 = ImageClamp(xb.x, w, cx);
-  int cx1 = ImageClamp(xb.y, w, cx);
-  int cy0 = ImageClamp(yb.x, h, cy);
-  int cy1 = ImageClamp(yb.y, h, cy);
-  uint sel = (t.w >> (3u * channel)) & 7u;
-  return uint4(ImageSelect(ImageFetch(t, cx0, cy1, border), sel),
-               ImageSelect(ImageFetch(t, cx1, cy1, border), sel),
-               ImageSelect(ImageFetch(t, cx1, cy0, border), sel),
-               ImageSelect(ImageFetch(t, cx0, cy0, border), sel));
-}
-
-uint4 ImageLoad(uint4 t, uint x, uint y, uint mip) {
-  if (mip != 0u || x >= ImageWidth(t) || y >= ImageHeight(t)) return uint4(0u, 0u, 0u, 0u);
-  return ImageSwizzle(ImageTexel(t, int(x), int(y)), t.w);
-}
-
-uint ImageFloatToUnorm8(uint bits) {
-  if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) return 0u;
-  precise float f = asfloat(bits);
-  if (f <= 0.0f) return 0u;
-  if (f >= 1.0f) return 255u;
-  precise float scaled = f * 255.0f;
-  precise float rounded = floor(scaled + 0.5f);
-  return uint(rounded);
-}
