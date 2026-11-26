@@ -1,8 +1,7 @@
 """Parity of the runtime DLLs ported to Rust (crates/anyxboxx-*) with the C++ ones (runtime/).
 
-For each ported DLL, a runtime folder is assembled from the C++ build with that one DLL replaced by
-the Rust cdylib, and the pytest files that check the C++ DLL run unchanged against it
-(ANYXBOXX_RUNTIME points at the mixed folder). The C++ DLL is deleted only once this passes.
+The packaged DLL must be the Rust cdylib, and its exports must match the separately built C++
+oracle. The runtime tests also run against a folder containing the release Rust DLL.
 """
 import os
 import re
@@ -69,11 +68,22 @@ def exports(path):
     return {(s.name, s.forwarder) for s in directory.symbols} if directory else set()
 
 
+def test_runtime_ships_the_rust_xgameruntime():
+    rust = RUST_RELEASE / "xgameruntime.dll"
+    shipped = RUNTIME_DIR / "xgameruntime.dll"
+    if not rust.is_file() or not shipped.is_file():
+        if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
+            pytest.fail(f"absent: {rust} or {shipped}")
+        pytest.skip("Rust DLL or runtime not built")
+    assert rust.read_bytes() == shipped.read_bytes()
+
+
 @pytest.mark.parametrize("name", sorted(PORTED))
 def test_rust_dll_exports_what_the_cpp_dll_exports(name):
     rust = RUST_RELEASE / PORTED[name][0]
-    if not rust.is_file() or not (RUNTIME_DIR / name).is_file():
+    oracle = RUNTIME_DIR / "xgameruntime_cpp.dll"
+    if not rust.is_file() or not oracle.is_file():
         if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
-            pytest.fail(f"absent: {rust} or {RUNTIME_DIR / name}")
+            pytest.fail(f"absent: {rust} or {oracle}")
         pytest.skip("Rust DLL or C++ runtime not built")
-    assert exports(rust) == exports(RUNTIME_DIR / name)
+    assert exports(rust) == exports(oracle)
