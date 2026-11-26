@@ -21,7 +21,8 @@ const CACHE_KEYS: &[&str] = &[
     // Cache location and cache-key mode (`victory-core/src/config.rs`, `shader_cache.rs`).
     "VICTORY_CACHE_DIR",
     "VICTORY_CONFIG",
-    "VICTORY_SHADER_CACHE_KEY",
+    "VICTORY_SHADER_KEY",
+    "VICTORY_SHADER_FRESH",
     // Compute pipelines kept or skipped during `victory warm` (`pipeline.rs`, `pipeline/make.rs`).
     "VICTORY_ACTIVATE_RAYS",
     "VICTORY_BVH_BUILDER",
@@ -50,6 +51,17 @@ const CACHE_KEYS: &[&str] = &[
     "VICTORY_WAVE_OWN_BITS",
     "VICTORY_WAVE_PAIRS",
     "VICTORY_WAVE_WIDE",
+    "VICTORY_BVH_BOUNDS",
+    "VICTORY_BVH_FENCES",
+    "VICTORY_HELPER_OWN",
+    "VICTORY_LDS_FLAGS",
+    "VICTORY_NAN_GUARD",
+    "VICTORY_PC_DXC",
+    "VICTORY_PORT_CBV",
+    "VICTORY_RDNA_FLOAT",
+    "VICTORY_THREAD_TICKET",
+    "VICTORY_WAVE_DUMP",
+    "VICTORY_WAVE_WIDE_ONLY",
 ];
 
 /// Whether `key` can change what `victory warm` writes into the shader or pipeline cache.
