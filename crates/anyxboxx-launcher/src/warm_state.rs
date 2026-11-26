@@ -60,7 +60,6 @@ const CACHE_KEYS: &[&str] = &[
     "VICTORY_PORT_CBV",
     "VICTORY_RDNA_FLOAT",
     "VICTORY_THREAD_TICKET",
-    "VICTORY_WAVE_DUMP",
     "VICTORY_WAVE_WIDE_ONLY",
 ];
 
@@ -370,6 +369,7 @@ mod tests {
                             name,
                             "VICTORY_SHADER_SOURCE_HASH"
                                 | "VICTORY_SHADER_SWITCHES"
+                                | "VICTORY_WAVE_DUMP"
                                 | "VICTORY_REF_VS"
                                 | "VICTORY_REF_PS"
                         );
