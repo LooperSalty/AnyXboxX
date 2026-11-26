@@ -313,7 +313,7 @@ pub(crate) fn log() {
          card copies {} MB (before twins {} MB); card (VRAM) {} MB in use of {} MB budget, shared {} MB in use; \
          host texture VRAM by kind: filled {} MB, filled placed {} MB, targets {} MB, depth {} MB, uav {} MB, twins {} MB, \
          filled idle but held {} MB, filled duplicates at one address {} MB; evicted under pressure {} {} MB; \
-         evicted with slots (VICTORY_SLOT_EVICT) {} textures {} MB, {} slots reset, {} came back ({} within 2 s, away {} ms in all), {} given up{}{}",
+         evicted with slots (VICTORY_SLOT_EVICT) {} textures {} MB, {} slots reset, {} came back ({} within 2 s, away {} ms in all), {} given up{}{}{}",
         mb(c.WorkingSetSize as u64),
         mb(c.PagefileUsage as u64),
         mb(m.ullAvailPhys),
@@ -368,9 +368,22 @@ pub(crate) fn log() {
         sev[4],
         sev[5] / 10,
         sev[6],
+        view_line(),
         upload_line(),
         rebar_line(),
     );
+}
+
+/// The view table part of the ram line, which shows whether it fills
+/// (`descriptor::view_table`): entries of views without a resource are what
+/// grew for the run once the shapes of placed views were full.
+fn view_line() -> String {
+    let [entries, free, ownerless, cap, freed, shapes, most] = crate::descriptor::view_table();
+    format!(
+        "; view table: {entries} entries ({free} free), {ownerless} of them owned by no resource (kept at most {cap}, \
+         0: all; VICTORY_OWNERLESS_VIEWS), {freed} of those freed under the cap so far; shapes of placed views {shapes} \
+         of {most} (past them every placed view is such an entry)"
+    )
 }
 
 /// (Neptune) The rebar window part of the ram line (`VICTORY_WINDOW_REBAR=1`), else nothing.
