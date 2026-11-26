@@ -55,3 +55,41 @@ def test_waiter_dispatch_and_unregister(runtime_dir):
     finally:
         close(queue)
         kernel.CloseHandle(event)
+
+
+@anyxboxx_only
+def test_manual_reset_waiter_can_unregister_itself(runtime_dir):
+    api = TaskQueueApi(runtime_dir)
+    ptr = ctypes.c_void_p
+    create = api.method(12, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ptr))
+    register = api.method(20, ctypes.c_uint32, ptr, ctypes.c_int, ptr, ptr, CALLBACK,
+                          ctypes.POINTER(ctypes.c_uint64))
+    unregister = api.method(21, None, ptr, ctypes.c_uint64)
+    dispatch = api.method(16, ctypes.c_bool, ptr, ctypes.c_int, ctypes.c_uint32)
+    close = api.method(17, None, ptr)
+    kernel = ctypes.windll.kernel32
+    kernel.CreateEventW.argtypes = (ptr, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p)
+    kernel.CreateEventW.restype = ptr
+    kernel.SetEvent.argtypes = (ptr,)
+    kernel.CloseHandle.argtypes = (ptr,)
+    queue = ptr()
+    assert create(MANUAL, MANUAL, ctypes.byref(queue)) == S_OK
+    event = kernel.CreateEventW(None, True, False, None)
+    assert event
+    token = ctypes.c_uint64()
+    calls = []
+
+    def callback_fn(context, canceled):
+        calls.append((context, canceled))
+        unregister(queue, token)
+
+    callback = CALLBACK(callback_fn)
+    try:
+        assert register(queue, WORK_PORT, event, 42, callback, ctypes.byref(token)) == S_OK
+        assert kernel.SetEvent(event)
+        assert dispatch(queue, WORK_PORT, 2000)
+        assert calls == [(42, False)]
+        assert not dispatch(queue, WORK_PORT, 100)
+    finally:
+        close(queue)
+        kernel.CloseHandle(event)
