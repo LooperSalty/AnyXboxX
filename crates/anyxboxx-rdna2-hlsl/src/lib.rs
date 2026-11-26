@@ -10,6 +10,7 @@ mod scalar_movrel;
 mod scalar_wide;
 mod vector_binary;
 mod vector_compare;
+mod vector_movrel;
 mod vector_unary;
 
 const PRELUDE: &str = concat!(

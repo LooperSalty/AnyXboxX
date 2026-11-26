@@ -1,6 +1,7 @@
 //! VOP1 wave32 moves, integer operations, and conversions.
 use crate::scalar::source;
 use crate::vector_compare::half_operand;
+use crate::vector_movrel;
 
 const ACTIVE: &str = "((s[126] >> lane) & 1u) != 0";
 
@@ -15,6 +16,9 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
         source(code, literal).map_err(|error| format!("{name}: {error}"))?
     };
     let d = (word >> 17) & 0xff;
+    if vector_movrel::supports(name) {
+        return vector_movrel::statement(name, d, code, &a).map(Some);
+    }
     if name == "v_readfirstlane_b32" {
         return Ok(Some(format!(
             "s[{d}] = ReadLane(lane, {a}, firstbitlow(s[126]));"
