@@ -914,6 +914,29 @@ pub static OBJECT: Object = Object::new("task queue", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, PROVIDER, &OBJECT)];
 
 type This = *const Object;
+/// IUnknown and the task-queue IID identify this static interface.
+extern "system" fn m_query_interface(
+    this: This,
+    iid: *const Guid,
+    out: *mut *const Object,
+) -> HRESULT {
+    const IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+    if out.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    // SAFETY: the caller supplies a writable output pointer and a valid IID or null.
+    unsafe {
+        out.write(std::ptr::null());
+        if iid
+            .as_ref()
+            .is_some_and(|id| *id == IUNKNOWN || *id == PROVIDER)
+        {
+            out.write(this);
+            return S_OK;
+        }
+    }
+    0x8000_4002_u32 as i32 // E_NOINTERFACE
+}
 extern "system" fn m_get_status(_: This, b: *mut AsyncBlock, wait: u8) -> HRESULT {
     XAsyncGetStatus(b, wait != 0)
 }
@@ -1113,7 +1136,7 @@ const UNREGISTER_WAITER: *const () = m_unregister_waiter as *const ();
 const UNREGISTER_WAITER: *const () = missing::<21> as *const ();
 
 static VTABLE: Methods<31> = Methods([
-    missing::<0> as *const (),         // 0x00 QueryInterface
+    m_query_interface as *const (),    // 0x00 QueryInterface
     add_ref as *const (),              // 0x08 AddRef
     add_ref as *const (),              // 0x10 Release: the object is static
     m_get_status as *const (),         // 0x18

@@ -1,7 +1,23 @@
 """Task queue waiters through the public GDK interface slots."""
 import ctypes
 
-from test_runtime_cpp import CALLBACK, MANUAL, S_OK, WORK_PORT, TaskQueueApi, anyxboxx_only
+from test_runtime_cpp import (CALLBACK, MANUAL, S_OK, TASK_QUEUE_GUID, WORK_PORT,
+                              TaskQueueApi, anyxboxx_only)
+
+
+@anyxboxx_only
+def test_task_queue_query_interface(runtime_dir):
+    api = TaskQueueApi(runtime_dir)
+    ptr = ctypes.c_void_p
+    query = api.method(0, ctypes.c_uint32, ptr, ctypes.POINTER(ptr))
+    out = ptr()
+    for iid in (bytes.fromhex("0000000000000000c000000000000046"), TASK_QUEUE_GUID):
+        guid = (ctypes.c_ubyte * 16).from_buffer_copy(iid)
+        assert query(guid, ctypes.byref(out)) == S_OK
+        assert out.value == api.object.value
+    unknown = (ctypes.c_ubyte * 16).from_buffer_copy(bytes(16))
+    assert query(unknown, ctypes.byref(out)) == 0x80004002 and out.value is None
+    assert query(unknown, None) == 0x80004003
 
 
 @anyxboxx_only
