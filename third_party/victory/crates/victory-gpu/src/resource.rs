@@ -98,6 +98,13 @@ pub(crate) struct ResourceDesc {
     flags: u32,
 }
 
+impl ResourceDesc {
+    /// (Neptune) The mip levels the description asks for (0: a full chain).
+    pub(crate) fn mip_levels(&self) -> u32 {
+        u32::from(self.mip_levels)
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationInfo {
@@ -1421,6 +1428,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        // (Neptune) Timed for the pass over textures picked by index: what of
+        // its time is making host copies ([`made_here`]).
+        let making = MadeHere::start();
         let clear = r
             .host
             .clear
@@ -1514,9 +1524,83 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             SLOT_EVICT[5].fetch_add(now.wrapping_sub(evicted) & 0xffff_ffff, Relaxed);
             r.host.slot_returned.store(now.max(1), Relaxed);
         }
+        drop(making);
     }
     r.host.used.store(crate::host::moment(), Relaxed);
     made.clone()
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Host copies made on this thread, and the microseconds that took.
+    static MADE_HERE: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// A host copy being made (or refused), timed into [`MADE_HERE`] when it
+/// is dropped.
+#[cfg(windows)]
+struct MadeHere(std::time::Instant);
+
+#[cfg(windows)]
+impl MadeHere {
+    fn start() -> MadeHere {
+        MadeHere(std::time::Instant::now())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MadeHere {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros() as u64;
+        MADE_HERE.with(|m| {
+            let [n, all] = m.get();
+            m.set([n + 1, all + us]);
+        });
+    }
+}
+
+/// (Neptune) Host copies made on the calling thread so far, and the
+/// microseconds that took (`D3D12` texture creation and its bookkeeping):
+/// the pass over textures picked by index tells by these how much of its
+/// time went into making them.
+#[cfg(windows)]
+pub(crate) fn made_here() -> [u64; 2] {
+    MADE_HERE.with(std::cell::Cell::get)
+}
+
+/// (Neptune) Whether title texture `this` has its host copy now. Not a use
+/// of it, and nothing is made.
+#[cfg(windows)]
+pub(crate) fn host_copy_made(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// (Neptune) Whether the host refused to make a copy of title texture `this`.
+#[cfg(windows)]
+pub(crate) fn host_refused(this: This) -> bool {
+    !this.is_null() && resource(this).host.refused.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// (Neptune) Keeps title resource `this` alive until [`let_go_kept`]: a
+/// texture handed to a thread that makes it ready later
+/// (`crate::texture::prepare`) is not freed under it if the title
+/// releases it meanwhile.
+pub(crate) fn keep_alive(this: This) {
+    if !this.is_null() {
+        object::add_ref(this);
+    }
+}
+
+/// (Neptune) Lets go of what [`keep_alive`] kept; the resource is freed
+/// here if the title released it meanwhile.
+pub(crate) fn let_go_kept(this: This) {
+    if !this.is_null() {
+        resource_release(this);
+    }
 }
 
 /// The host copy of title texture `this` if it is made, without making it

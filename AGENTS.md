@@ -22,7 +22,7 @@ AnyXboxX is a GPL-3.0-or-later prototype that runs Xbox Series X (GDK, "Scarlett
 | `tools/` | Generators (GDK interface table, kernelx exports, RDNA 2 tables), comparison and measurement tools (TomBox, FSSM, Xbox compiler probe, GPU check), `jour_j.py`, the VIctory launcher `anyxboxx run` (replaces `lancer_victory.ps1`), neighbour watch (`sync_voisins.py`, `veille.py`) |
 | `site/` | GitHub Pages site, published as is by `.github/workflows/pages.yml` |
 | `tests/` | pytest suite (the README table holds the current test count) |
-| `docs/` | Research notes and logs, in English. `docs/fr/` holds the French version of each document (same tree). `docs/i18n/` holds the 8 README translations. |
+| `docs/` | Research notes and logs, in English. `docs/fr/` holds the French version of each document (same tree). `docs/i18n/` holds the French README (`README.fr.md`). |
 
 ## Setup and commands
 
@@ -51,7 +51,7 @@ cmake --build runtime/build --config Release
 3. **No fake success.** An unimplemented function returns `E_NOTIMPL` (or the console's error) and is logged; an untranslated instruction raises an error that names it.
 4. **Verify against an oracle.** Decoder changes are checked against the LLVM tables (`python tools/rdna2_mnemonics.py <llvm .s folder> --verifier`); every HLSL translation is checked against the reference interpreter, byte for byte, on GPU or WARP.
 5. **Tests with every change.** New behaviour comes with a test that fails without it.
-6. **README in 9 languages.** `README.md` (English) and `docs/i18n/README.*.md` must stay in sync: same table rows, same test count (rounded down to the hundred, written `800+`, checked by `tests/test_readme_sync.py`), same images. Image text is in English.
+6. **README in English and French.** `README.md` (English) and `docs/i18n/README.fr.md` must stay in sync: same table rows, same test count (rounded down to the hundred, written `800+`, checked by `tests/test_readme_sync.py`), same images. Image text is in English.
 7. **Git**: `main` is protected; work on a branch and open a pull request; CI (`.github/workflows/tests.yml`) must pass. Commit messages: `type: description` (`feat`, `fix`, `docs`, `test`, `refactor`, `chore`), written in English (older history is in French).
 8. **Code style**: small focused files (under about 400 lines), small functions, explicit error handling, no hidden mutation of shared state, constants instead of magic numbers where it helps reading. `third_party/` is exempt (VIctory alone is about 123,000 lines; the other folders are copies or submodules of other projects): it keeps its own style, and neither the 400-line rule nor ruff applies to it.
 9. **Native mode runs code unsandboxed.** Only run trusted test programs with `--natif` or `anyxboxx.exe`.

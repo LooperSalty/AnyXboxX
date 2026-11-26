@@ -1,6 +1,6 @@
 # Graphical launcher: install and use
 
-French version: [fr/lanceur.md](fr/lanceur.md). Branch: `rust/full` (not yet in `main`). Code: `crates/anyxboxx-launcher`.
+French version: [fr/lanceur.md](fr/lanceur.md). In `main`. Code: `crates/anyxboxx-launcher`.
 
 `anyxboxx-launcher.exe` is a window that checks your machine, verifies your game folder, builds VIctory, warms the shader cache and starts the game with the measured settings of `anyxboxx run` (the same set as `main`'s `tools\lancer_victory.ps1`). It does not contain or download any game file, and it never writes into the game folder.
 
@@ -16,9 +16,8 @@ French version: [fr/lanceur.md](fr/lanceur.md). Branch: `rust/full` (not yet in 
 ### 1. Get the code
 
 ```powershell
-git clone --branch rust/full https://github.com/LooperSalty/AnyXboxX.git
+git clone https://github.com/LooperSalty/AnyXboxX.git
 cd AnyXboxX
-git submodule update --init
 ```
 
 VIctory is included in `third_party/victory`: there is nothing else to download.

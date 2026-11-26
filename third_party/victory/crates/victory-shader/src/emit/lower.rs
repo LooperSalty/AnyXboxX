@@ -1690,7 +1690,7 @@ impl<'a> Lower<'a> {
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
-                for i in start + 1..sec.end {
+                for i in (start + 1..sec.end).chain(sec.after.iter().copied()) {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
                         inside.insert(w, (b, start, sec.end));
                     }
@@ -2246,8 +2246,23 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.lds_last = None;
+            // the constant-lane reads right after a section ([`super::wave::Section::after`])
+            let after: HashMap<usize, usize> = self
+                .sections
+                .get(&b)
+                .map(|s| s.iter().flat_map(|(&start, sec)| sec.after.iter().map(move |&j| (j, start))).collect())
+                .unwrap_or_default();
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if let Some(&start) = after.get(&i) {
+                    if self.twin.is_some() {
+                        self.paired_section_inst(b, i, start);
+                    } else {
+                        self.section_inst(b, i, start);
+                    }
+                    i += 1;
+                    continue;
+                }
                 if self.twin.is_some() {
                     self.paired_inst(b, i)?;
                 } else {
@@ -3280,6 +3295,12 @@ impl<'a> Lower<'a> {
             }
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
+                self.i32_of(v)
+            }
+            // `src_scc`: SCC as a number, 0 or 1 (the upscaler library's passes
+            // multiply by it and keep it in SGPRs).
+            Operand::Const(253) => {
+                let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
                 self.i32_of(v)
             }
             Operand::Const(c) => crate::resource::inline(c)
@@ -7456,6 +7477,38 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg), x, guard);
                 Ok(())
             }
+            "v_dot4_i32_i8" | "v_dot4_u32_u8" | "v_dot4c_i32_i8" => {
+                // Four byte products summed into the accumulator, wrapping:
+                // DXIL's dot4AddPacked (shader model 6.4; DP4A on NVIDIA).
+                // v_dot4c (VOP2) accumulates into its destination; the VOP3P
+                // forms take each byte source as two 16-bit halves that
+                // op_sel picks, as packed integer operations do (the
+                // console's compiler moves inline constants into the bytes
+                // it wants that way).
+                if v.sdwa.is_some() || v.dpp.is_some() || v.clamp || v.neg != 0 || v.neg_hi != 0 {
+                    return Err("modifiers on a dot product");
+                }
+                let (a, b, acc) = if name == "v_dot4c_i32_i8" {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                    (s(self, 0)?, s(self, 1)?, acc)
+                } else {
+                    let mut x = [self.s.m.i32(0); 2];
+                    for (k, x) in x.iter_mut().enumerate() {
+                        let lo = self.packed_src(inst, k, false, false)?;
+                        let hi = self.packed_src(inst, k, true, false)?;
+                        let k16 = self.s.m.i32(16);
+                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                        *x = self.s.m.bin(c, Bin::Or, lo, hi);
+                    }
+                    (x[0], x[1], s(self, 2)?)
+                };
+                let opcode = if name == "v_dot4_u32_u8" { 164 } else { 163 };
+                let r = self.s.op(c, "dot4AddPacked.i32", Attr::ReadNone, self.s.t.i32, opcode, &[acc, a, b]);
+                int(self, r)
+            }
             "v_cvt_pkrtz_f16_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let lo = self.f16_toward_zero(a);
@@ -8276,6 +8329,33 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Half `high` of operand `k` of `v_pk_fmac_f16` (VOP2: no op_sel), in
+    /// the low 16 bits: each half of the result reads the same half of both
+    /// sources and of the destination, its accumulator (`k` 2).
+    fn fmac_half(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let x = if k < 2 {
+            let op = *v.src.get(k).ok_or("a missing operand")?;
+            self.f16_operand(inst, &op)?
+        } else {
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                return Err("an accumulator");
+            };
+            self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?
+        };
+        let c = self.cur;
+        let x = if high {
+            let k16 = self.s.m.i32(16);
+            self.s.m.bin(c, Bin::LShr, x, k16)
+        } else {
+            x
+        };
+        let m = self.s.m.i32(0xFFFF);
+        Ok(self.s.m.bin(c, Bin::And, x, m))
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
@@ -8284,7 +8364,7 @@ impl<'a> Lower<'a> {
         };
         let float = op.ends_with("_f16");
         let n = match op {
-            "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            "fma_f16" | "fmac_f16" | "mad_u16" | "mad_i16" => 3,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
@@ -8293,13 +8373,20 @@ impl<'a> Lower<'a> {
         if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
             return Err("modifiers on a packed integer operation");
         }
+        if op == "fmac_f16" && (v.opsel != 0 || v.abs != 0 || v.neg != 0 || v.clamp) {
+            return Err("modifiers on v_pk_fmac_f16");
+        }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high, float)?;
+                let h = if op == "fmac_f16" {
+                    self.fmac_half(inst, k, high)?
+                } else {
+                    self.packed_src(inst, k, high, float)?
+                };
                 if float {
                     let mut f = self
                         .s
@@ -9352,7 +9439,9 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            // 16-bit coordinates (a16) are read as image loads read them
+            // (`addr_val`); 16-bit data has no atomic.
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.
@@ -9441,10 +9530,14 @@ impl<'a> Lower<'a> {
                 return Err("an image store to a mip level");
             }
             // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
+            // float format (the console converts by the view's format). The
+            // data has the first `dmask` channels, the others are written 0:
+            // right for a format with no more channels than that (the
+            // upscaler library's one-channel stores, `dmask` 1).
+            if !matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) {
                 return Err("an image store of some channels");
             }
+            let channels = dmask.count_ones() as u8;
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -9455,6 +9548,10 @@ impl<'a> Lower<'a> {
             };
             let mut vals = Vec::new();
             for k in 0..4u8 {
+                if k >= channels {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;

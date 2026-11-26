@@ -276,7 +276,7 @@ Variable added to the table above (diagnostic, `diag` build):
 
 ## Install
 
-On the `rust/full` branch, the graphical launcher does the build, the shader warm-up and the launch for you: see [launcher.md](launcher.md). The steps below are for `main` and the command line.
+The graphical launcher does the build, the shader warm-up and the launch for you: see [launcher.md](launcher.md). The steps below are for `main` and the command line.
 
 1. [Git](https://git-scm.com/).
 2. Rust through [rustup](https://rustup.rs/). The exact toolchain is pinned by `third_party/victory/rust-toolchain.toml` and is installed automatically on the first `cargo` command.

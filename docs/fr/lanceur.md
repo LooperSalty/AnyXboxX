@@ -1,6 +1,6 @@
 # Lanceur graphique : installation et utilisation
 
-Version anglaise : [../launcher.md](../launcher.md). Branche : `rust/full` (pas encore dans `main`). Code : `crates/anyxboxx-launcher`.
+Version anglaise : [../launcher.md](../launcher.md). Dans `main`. Code : `crates/anyxboxx-launcher`.
 
 `anyxboxx-launcher.exe` est une fenêtre qui vérifie votre machine et votre dossier du jeu, compile VIctory, préchauffe le cache des shaders et lance le jeu avec les réglages mesurés de `anyxboxx run` (les mêmes que `tools\lancer_victory.ps1` dans `main`). Il ne contient ni ne télécharge aucun fichier du jeu, et n'écrit jamais dans le dossier du jeu.
 
@@ -16,9 +16,8 @@ Version anglaise : [../launcher.md](../launcher.md). Branche : `rust/full` (pas 
 ### 1. Récupérer le code
 
 ```powershell
-git clone --branch rust/full https://github.com/LooperSalty/AnyXboxX.git
+git clone https://github.com/LooperSalty/AnyXboxX.git
 cd AnyXboxX
-git submodule update --init
 ```
 
 VIctory est inclus dans `third_party/victory` : rien d'autre à télécharger.

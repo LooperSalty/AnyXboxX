@@ -4,6 +4,21 @@
 
 Measurements from 21 November 2026. To reproduce them: `python PrototypeScarlett/scarlett.py --banc <folder>`.
 
+## Game measurements (VIctory, Xbox Series build 1.0.2.1)
+
+These are the runs that used to be listed in the README box. Figures are as reported by the maintainer from VIctory logs unless marked "observed" (the maintainer's own judgement of the picture) or "read from the log" (our own analysis). Each one is for the pin shown, which is no longer the current base.
+
+- 24 Nov, `d279e69`: about 4 fps; 13 minutes in the prison, then a device loss.
+- 24 Nov, `7b0f736` with `VICTORY_RELAY=2`: about 4.5 fps.
+- 24 Nov, launcher settings of #172 without DRED: about 5.5 fps. Batch 4 (three pull requests) with `VICTORY_RELAY=2`: about 6.6 fps, startup flicker fixed.
+- 24 Nov, batch 8 (`d138351`, then `19feca8`): 4.8 to 5.4 fps, about 6,550 draws per frame, irradiance cache shaders translated. With Microsoft's texture layout library (`-XgDll`): 5.4 to 7.1 fps, against 5.1 to 5.6 without it.
+- 25 Nov, `80d58f8`: 5.3 to 6.9 fps from a new save into the world, no device loss; full cutscenes (observed).
+- 25 Nov, Neptune base (2026-11-25c), Windows 11, RTX 4070 SUPER, i7-13700KF: median 13.8 fps in the world, 15.6 to 17 fps over the last minute, 72.5 ms per frame. With `-Quality`: 7 to 9 fps, 51 to 93 texture refusals against about 300.
+- 25 Nov, Proton (GE-Proton11-12), Fedora 44, RX 9070 XT: median 3.7 fps over about 23 minutes, no crash. Shadowed and indoor areas stay black.
+- 26 Nov, morning: median 13.4 fps. 26 Nov, afternoon: median 16 to 17 fps on the same machine, after #358 (copies), #386 (three fxceless options, +17 % in an A/B test) and #394 (heap sweep, +7 % and four times fewer stutters).
+
+The bottleneck is the CPU, not the GPU: the copies and read-backs that emulate the console's unified memory. The unified-memory work is in progress. Measured without drawing, the game code alone holds 30 fps.
+
 ## Method
 
 The benchmark loads each PE module of a folder, runs its TLS callbacks, then `DllMain(base, DLL_PROCESS_ATTACH, 0)`. A module is **initialized** when `DllMain` returns `TRUE`. The benchmark copies no file into the repository: only module names and measurements are published.

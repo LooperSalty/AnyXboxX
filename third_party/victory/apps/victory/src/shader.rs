@@ -106,7 +106,12 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
                 // Independent of the bitcode: titles may strip it.
-                let native = match dxil.map(|p| native_programs(p.data)) {
+                // (with `VICTORY_WAVE32_NVIDIA=1`, an `ACCC` part's native code too, as the runtime
+                // reads it)
+                let native_part = dxil.or_else(|| {
+                    container.part(FourCC::ACCC).filter(|_| victory_shader::emit::nvidia::enabled())
+                });
+                let native = match native_part.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();

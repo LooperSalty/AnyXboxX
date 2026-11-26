@@ -252,6 +252,12 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// `v_readlane_b32` at a constant lane right after the restore, of a
+    /// value the section made: read as the section leaves it (a wave64
+    /// reduction's total in lane 63, read once EXEC is back, as AMD's
+    /// compiler does in the console upscaler library's passes). Their
+    /// results are in `shapes`.
+    pub after: Vec<usize>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -289,8 +295,19 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let made = |x: Value| insts[i + 1..end].iter().any(|k| k.writes.iter().any(|w| w.1 == x));
+        let after: Vec<usize> = (end + 1..insts.len())
+            .take_while(|&j| {
+                let r = &insts[j];
+                r.name() == "v_readlane_b32"
+                    && matches!(&r.fields, Fields::Valu(v)
+                        if matches!(v.src.get(1), Some(Operand::Const(_) | Operand::Literal(_)))
+                            && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                                if r.read(Reg::V(reg)).is_some_and(made)))
+            })
+            .collect();
+        let shapes = simulate(insts[i + 1..end].iter().chain(after.iter().map(|&j| &insts[j])), wave, saved);
+        out.insert(i, Section { end, shapes, after });
         i = end + 1;
     }
     out
@@ -378,7 +395,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate<'a>(insts: impl IntoIterator<Item = &'a Inst>, wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {

@@ -276,7 +276,7 @@ Variable ajoutée au tableau ci-dessus (diagnostic, build `diag`) :
 
 ## Installation
 
-Sur la branche `rust/full`, le lanceur graphique fait la compilation, le préchauffage des shaders et le lancement : voir [lanceur.md](lanceur.md). Les étapes ci-dessous valent pour `main` et la ligne de commande.
+Le lanceur graphique fait la compilation, le préchauffage des shaders et le lancement : voir [lanceur.md](lanceur.md). Les étapes ci-dessous valent pour `main` et la ligne de commande.
 
 1. [Git](https://git-scm.com/).
 2. Rust via [rustup](https://rustup.rs/). La toolchain exacte est fixée par `third_party/victory/rust-toolchain.toml` et s'installe seule à la première commande `cargo`.

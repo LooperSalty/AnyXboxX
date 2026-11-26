@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{Host, HostList, host};
 use crate::object::This;
 
+pub(crate) mod prepare;
 #[cfg(test)]
 mod zero_upload_tests;
 
@@ -610,9 +611,32 @@ fn stage_buffer_from(
             if let Some(stats) = stats {
                 stats[1].fetch_add(1, Relaxed);
             }
-            host.upload_buffer(size)
+            let started = std::time::Instant::now();
+            let made = host.upload_buffer(size);
+            let us = started.elapsed().as_micros() as u64;
+            STAGED_HERE.with(|s| {
+                let mut now = s.get();
+                now[2] += 1;
+                now[3] += us;
+                s.set(now);
+            });
+            made
         }
     }
+}
+
+thread_local! {
+    /// On this thread: staging buffers made, the microseconds that took
+    /// (their upload buffers among them), and of those upload buffers the
+    /// ones made new (not from the pool) and their microseconds.
+    static STAGED_HERE: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// (Neptune) What [`STAGED_HERE`] holds for the calling thread: the pass
+/// over textures picked by index tells by these how much of its time went
+/// into making staging buffers.
+pub(crate) fn staged_here() -> [u64; 4] {
+    STAGED_HERE.with(std::cell::Cell::get)
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -774,6 +798,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
+    // (Neptune) And what a prepare thread made ready for it: its memory goes.
+    prepare::forget(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -1747,6 +1773,22 @@ fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32)
     (first, layout.bytes_from(first) as usize)
 }
 
+/// (Neptune) The bytes of title memory a staging buffer of `resource` from
+/// mip `first` on reads ([`staged_part`]), as the pass counts them; 0 for
+/// what has no console layout.
+fn staged_bytes(resource: This, first: u32) -> u64 {
+    let Some((_, desc)) = crate::resource::texture_memory(resource) else {
+        return 0;
+    };
+    let Some(texture) = crate::resource::texture_layout(&desc) else {
+        return 0;
+    };
+    let Some(plane) = texture.planes.first() else {
+        return 0;
+    };
+    staged_part(&plane.layout, desc.mip_levels(), first).1 as u64
+}
+
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
@@ -1763,6 +1805,50 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     {
         return Some(s.clone());
     }
+    // (Neptune) One a prepare thread made and detiled (`prepare`): taken as
+    // it is (`VICTORY_TEXTURE_PREPARE_THREADS`; none without).
+    if let Some(s) = prepare::take_ready(resource, first, on_demand) {
+        map.insert(resource as usize, s.clone());
+        return Some(s);
+    }
+    let s = build_staging(resource, texture, first, on_demand)?;
+    map.insert(resource as usize, s.clone());
+    Some(s)
+}
+
+/// (Neptune) For a prepare thread (`prepare`): the staging state of title
+/// texture `resource` from mip `first` on, made as [`staging`] makes it but
+/// not put in the table (the pass that records its upload puts it there).
+/// `None` if the table has one that serves already, or none can be made.
+fn prepared_staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
+    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let first = if on_demand { 0 } else { first };
+    {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if map.as_ref().and_then(|map| map.get(&(resource as usize))).is_some_and(|s| s.first <= first) {
+            return None;
+        }
+    }
+    build_staging(resource, texture, first, on_demand)
+}
+
+/// A staging state for title texture `resource` from mip `first` on (as
+/// [`staging`] decided it), its upload buffer made or taken from the pool;
+/// nothing is detiled into it yet. Timed into [`STAGED_HERE`].
+fn build_staging(resource: This, texture: &ID3D12Resource, first: u32, on_demand: bool) -> Option<Arc<Staging>> {
+    let started = std::time::Instant::now();
+    let made = build_staging_untimed(resource, texture, first, on_demand);
+    let us = started.elapsed().as_micros() as u64;
+    STAGED_HERE.with(|s| {
+        let mut now = s.get();
+        now[0] += 1;
+        now[1] += us;
+        s.set(now);
+    });
+    made
+}
+
+fn build_staging_untimed(resource: This, texture: &ID3D12Resource, first: u32, on_demand: bool) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1833,7 +1919,6 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
     Some(s)
 }
 

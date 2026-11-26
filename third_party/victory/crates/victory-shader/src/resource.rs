@@ -1180,6 +1180,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
+        if let Some(source) = self.made_raw(words) {
+            return Ok(source);
+        }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
@@ -2097,6 +2100,50 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// A loaded buffer descriptor the code made raw. AMD's compiler (the
+    /// console upscaler library's passes, [`crate::accc`]) clears the stride
+    /// of dword 1 (`s_and_b32 .., 0xc000ffff`), multiplies dword 2's record
+    /// count by the stride it had, at least 1 (`s_bfe_u32 .., 0xe0010`,
+    /// `s_max_u32 .., 1`, `s_mul_i32`), and sets dword 3's out-of-bounds
+    /// mode to bytes (`s_and_b32 .., 0xcfffffff`, `s_or_b32 ..,
+    /// 0x30000000`): the same memory and bounds, by bytes, as the view the
+    /// host binds for the descriptor loaded, which it reads by bytes too.
+    // shortcut: an access that indexed such a descriptor by records (`idxen`,
+    // stride 0 on the console) would get the view's stride on the host; the
+    // upscaler's accesses use offsets.
+    fn made_raw(&self, words: &[Term]) -> Option<Source> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        let operand = |v: Value, name: &str, mask: u32| -> Option<Term> {
+            match self.sop2(v, &[name])?.1 {
+                [x, Term::Const(m)] | [Term::Const(m), x] if m == mask => Some(x),
+                _ => None,
+            }
+        };
+        let x1 = operand(w1, "s_and_b32", 0xc000_ffff)?;
+        let Term::Value(o3) = operand(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let x3 = operand(o3, "s_and_b32", 0xcfff_ffff)?;
+        let (_, [a, b]) = self.sop2(w2, &["s_mul_i32"])?;
+        let stride = |t: Term| {
+            let Term::Value(m) = t else { return false };
+            let Some(Term::Value(f)) = operand(m, "s_max_u32", 1) else {
+                return false;
+            };
+            operand(f, "s_bfe_u32", 0x000e_0010) == Some(x1)
+        };
+        let x2 = if stride(b) {
+            a
+        } else if stride(a) {
+            b
+        } else {
+            return None;
+        };
+        self.loaded(&[w0, x1, x2, x3])
+    }
+
     /// A descriptor the code keeps per lane: every dword of `words` is the
     /// first lane (`v_readfirstlane_b32`) of a VGPR that `v_mov_b32` filled
     /// from SGPRs. The console compiler does this to a descriptor loaded on
@@ -2856,6 +2903,61 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    #[test]
+    fn a_buffer_descriptor_made_raw_is_the_descriptor_loaded() {
+        // AMD's compiler (the console upscaler library) turns a structured
+        // buffer's descriptor into a raw one before reading it by bytes.
+        let r = track_words(
+            &[
+                0xBE8C_0309, // s_mov_b32 s12, s9
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF408_0006,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x9384_FF01,
+                0x000E_0010, // s_bfe_u32 s4, s1, 0xe0010 (the stride)
+                0x8484_8104, // s_max_u32 s4, s4, 1
+                0x8703_FF03,
+                0xCFFF_FFFF, // s_and_b32 s3, s3, 0xcfffffff
+                0x9302_0402, // s_mul_i32 s2, s2, s4
+                0x8803_FF03,
+                0x3000_0000, // s_or_b32 s3, s3, 0x30000000
+                0x8701_FF01,
+                0xC000_FFFF, // s_and_b32 s1, s1, 0xc000ffff
+                0xE030_1000,
+                0x8000_0100, // buffer_load_dword v1, v0, s[0:3], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let Source::Loaded { first: 0, .. } = r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors[0].source);
+        };
+        // A stride kept, or a count not multiplied by it, is another descriptor.
+        let code: Vec<u8> = [
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0006,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8703_FF03,
+            0xCFFF_FFFF, // s_and_b32 s3, s3, 0xcfffffff
+            0x8803_FF03,
+            0x3000_0000, // s_or_b32 s3, s3, 0x30000000
+            0x8701_FF01,
+            0xC000_FFFF, // s_and_b32 s1, s1, 0xc000ffff
+            0xE030_1000,
+            0x8000_0100, // buffer_load_dword v1, v0, s[0:3], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Cs, lanes(&p).as_ref()).is_err());
     }
 
     #[test]
