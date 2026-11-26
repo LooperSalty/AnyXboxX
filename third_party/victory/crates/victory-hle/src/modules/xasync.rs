@@ -1001,9 +1001,39 @@ extern "system" fn m_get_process_queue(_: This, out: *mut *const Queue) -> bool 
 extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
     XTaskQueueSetCurrentProcessTaskQueue(q)
 }
-/// The runtime's debug check that the caller is not a time-critical thread,
-/// which every runtime call in a title makes first.
-extern "system" fn m_check_thread(_: This) {}
+/// XThreadAssertNotTimeSensitive: break only when a debugger is attached.
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xthread/functions/xthreadassertnottimesensitive
+extern "system" fn m_check_thread(_: This) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            DebugBreak, IsDebuggerPresent, OutputDebugStringW,
+        };
+        check_thread(
+            TIME_SENSITIVE.with(Cell::get),
+            || {
+                // SAFETY: this Win32 function takes no arguments.
+                unsafe { IsDebuggerPresent() != 0 }
+            },
+            || {
+                let message: Vec<u16> =
+                    "Time-sensitive thread violation\0".encode_utf16().collect();
+                // SAFETY: the message is NUL-terminated and a debugger is attached.
+                unsafe {
+                    OutputDebugStringW(message.as_ptr());
+                    DebugBreak();
+                }
+            },
+        );
+    }
+}
+
+#[cfg(any(windows, test))]
+fn check_thread(sensitive: bool, debugger: impl FnOnce() -> bool, breakpoint: impl FnOnce()) {
+    if sensitive && debugger() {
+        breakpoint();
+    }
+}
 
 // XThread: the time-sensitivity mark is per thread (the C++ runtime keeps it in a thread_local).
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
@@ -1071,6 +1101,15 @@ static VTABLE: Methods<31> = Methods([
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn time_sensitive_assert_breaks_only_under_a_debugger() {
+        let breaks = Cell::new(0);
+        for (sensitive, attached) in [(false, false), (false, true), (true, false), (true, true)] {
+            check_thread(sensitive, || attached, || breaks.set(breaks.get() + 1));
+        }
+        assert_eq!(breaks.get(), 1);
+    }
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
