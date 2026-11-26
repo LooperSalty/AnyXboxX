@@ -1,0 +1,30 @@
+[package]
+name = "anyxboxx"
+description = "AnyXboxX command line: runs the game through VIctory (replaces the former tools/lancer_victory.ps1) and the reports of scarlett.py."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "anyxboxx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anyxboxx"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+thiserror.workspace = true
+anyxboxx-report.workspace = true
+victory-hle.workspace = true
+victory-pe.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# GetLocalTime: the local-time stamp of the jour-j report folder, as Python's time.strftime.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+
+[lints]
+workspace = true

@@ -75,6 +75,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Reusable buffer for page numbers read out of the faults buffer.
+    fault_buf: Vec<u32>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,6 +113,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            fault_buf: Vec::new(),
         })
     }
 
@@ -200,7 +203,8 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
-        let mut pages = Vec::new();
+        let mut pages = std::mem::take(&mut self.fault_buf);
+        pages.clear();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -224,9 +228,14 @@ impl Memory {
                 );
             }
         }
-        for page in pages {
+        for &page in &pages {
             self.map(u64::from(page) * PAGE);
         }
+        pages.clear();
+        if pages.capacity() > 64 {
+            pages.shrink_to(64);
+        }
+        self.fault_buf = pages;
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
@@ -234,6 +243,15 @@ impl Memory {
     fn name(&mut self, address: u64) {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
+    }
+}
+
+/// Clears the per-frame refused-page set and trims spike capacity back to a warm bound.
+fn clear_refused(set: &mut std::collections::HashSet<u64>) {
+    const WARM_CAP: usize = 256;
+    set.clear();
+    if set.capacity() > WARM_CAP {
+        set.shrink_to(WARM_CAP);
     }
 }
 
@@ -258,7 +276,7 @@ pub(crate) fn ready(
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
-        m.refused.clear();
+        clear_refused(&mut m.refused);
         m.take_faults();
     }
     let numbered = m.copies.len();
@@ -320,4 +338,31 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_refused_reclaims_oversized_capacity_and_keeps_warm_set() {
+        let mut huge: std::collections::HashSet<u64> = (0..4096).collect();
+        let peak_cap = huge.capacity();
+        assert!(peak_cap > 256);
+        clear_refused(&mut huge);
+        assert!(huge.is_empty());
+        assert!(
+            huge.capacity() < peak_cap && huge.capacity() <= 512,
+            "oversized refused set should shrink from {peak_cap}, got {}",
+            huge.capacity()
+        );
+
+        let mut warm: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(64);
+        warm.insert(1);
+        let warm_cap = warm.capacity();
+        assert!(warm_cap <= 256);
+        clear_refused(&mut warm);
+        assert!(warm.is_empty());
+        assert_eq!(warm.capacity(), warm_cap);
+    }
 }

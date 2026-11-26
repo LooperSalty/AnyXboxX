@@ -2,9 +2,11 @@
 //! GPU yet, so only signals (the title's, later our queues') move one.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -63,6 +65,72 @@ pub(crate) extern "system" fn create(
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
 
+/// `VICTORY_FENCE_WAKE=1` (off by default; cool_fox `e05d463`): a blocking
+/// wait sleeps on the fence's value, and a signal wakes it, instead of
+/// failing at once.
+#[cfg(windows)]
+pub(crate) fn wake_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch(std::env::var_os("VICTORY_FENCE_WAKE")))
+}
+
+/// `VICTORY_VALUE_WAKE=1` (off by default; cool_fox `e05d463`): a list's
+/// bottom-of-pipe write to memory wakes the threads sleeping on that word.
+#[cfg(windows)]
+pub(crate) fn value_wake_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| switch(std::env::var_os("VICTORY_VALUE_WAKE")))
+}
+
+/// Whether a switch's variable is set to `1`.
+#[cfg(windows)]
+fn switch(value: Option<OsString>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// How long a blocking wait (a null event) sleeps for its value, in ms.
+#[cfg(windows)]
+const BLOCKING_WAIT_MS: u64 = 250;
+/// The longest single sleep, in ms, so that held work is looked at between.
+#[cfg(windows)]
+const WAIT_SLICE_MS: u128 = 10;
+
+/// Waits until `word` holds `value` or `timeout` has passed, sleeping on
+/// the word (a [`set`] wakes it). Whether it got there.
+#[cfg(windows)]
+pub(crate) fn wait_reached(word: &AtomicU64, value: u64, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = word.load(Ordering::Acquire);
+        if current >= value {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let ms = (deadline - now).as_millis().clamp(1, WAIT_SLICE_MS) as u32;
+        // SAFETY: sleeps only while the word still holds `current`, for
+        // `size_of::<u64>()` bytes at the address of a live u64.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                (word as *const AtomicU64).cast(),
+                (&raw const current).cast(),
+                std::mem::size_of::<u64>(),
+                ms,
+            );
+        }
+        crate::queue::release_held(false);
+    }
+}
+
+/// Wakes the threads sleeping on the word at `at`.
+#[cfg(windows)]
+pub(crate) fn wake_word(at: *const c_void) {
+    // SAFETY: waking an address nobody waits on does nothing.
+    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(at) };
+}
+
 fn set_event(event: usize) {
     #[cfg(windows)]
     // SAFETY: the title passed an event handle.
@@ -87,8 +155,28 @@ extern "system" fn release(this: This) -> u32 {
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
+/// The title's [`completed`]. (Neptune) A signal of the fence carried behind
+/// merged title submissions (`VICTORY_MERGE_SUBMISSIONS=2`) goes to the card
+/// with them first, so that the title, asking again, sees it once they have
+/// run.
+extern "system" fn completed_asked(this: This) -> u64 {
+    #[cfg(windows)]
+    crate::host::merge_fence_asked(this as usize);
+    completed(this)
+}
+/// Where the fence's value is (address, bytes): titles read it there, and a
+/// list may wait for it as a memory value.
+#[cfg(windows)]
+pub(crate) fn value_place(this: This) -> (usize, usize) {
+    (gpu_address(this) as usize, 8)
+}
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    // (Neptune) As [`completed_asked`], for a value not reached yet.
+    #[cfg(windows)]
+    if fence.value.load(Ordering::Acquire) < value {
+        crate::host::merge_fence_asked(this as usize);
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -98,18 +186,22 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        drop(waiters);
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
         #[cfg(windows)]
         if crate::host::late() {
-            drop(waiters);
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
-            return E_NOTIMPL;
+        }
+        // With `VICTORY_FENCE_WAKE=1` the wait sleeps on the fence's value
+        // for a while, and a signal wakes it ([`set`]).
+        #[cfg(windows)]
+        if wake_on() && wait_reached(&fence.value, value, Duration::from_millis(BLOCKING_WAIT_MS)) {
+            return S_OK;
         }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
@@ -133,6 +225,13 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    // (cool_fox `e05d463`) A wait sleeping on the value is woken now, after
+    // the events are set.
+    #[cfg(windows)]
+    if wake_on() {
+        wake_word((&raw const fence.value).cast());
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -157,7 +256,7 @@ static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
-    f[8] = completed as *const (); // 0x40
+    f[8] = completed_asked as *const (); // 0x40
     f[9] = set_event_on_completion as *const (); // 0x48
     f[10] = signal as *const (); // 0x50
     f[11] = creation_flags as *const (); // 0x58
@@ -169,6 +268,43 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_waiter_is_woken_by_a_set_from_another_thread() {
+        let word = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                word.store(7, Ordering::Release);
+                wake_word((&raw const word).cast());
+            });
+            assert!(wait_reached(&word, 5, Duration::from_secs(5)));
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_gives_up_at_its_deadline() {
+        let word = AtomicU64::new(1);
+        let started = Instant::now();
+        assert!(!wait_reached(&word, 5, Duration::from_millis(30)));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_reached_value_is_not_waited_for() {
+        assert!(wait_reached(&AtomicU64::new(9), 5, Duration::ZERO));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_switches_are_off_unless_set_to_one() {
+        assert!(!switch(None));
+        assert!(!switch(Some("0".into())));
+        assert!(switch(Some("1".into())));
+    }
 
     #[cfg(windows)]
     #[test]

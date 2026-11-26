@@ -416,7 +416,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                             let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
                             let total = u32::from_le_bytes(total) as usize;
                             let bytes = &bytes[..total.min(bytes.len())];
-                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
+                            let Some(dxil) = native_part(&container) else { continue };
                             if !lock(&seen).insert(blake3::hash(bytes)) {
                                 continue;
                             }
@@ -492,7 +492,7 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = native_part(&container) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     // `~`: the hash of the code alone; containers that differ only around
@@ -935,4 +935,14 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The part holding the native code: `DXIL`, or with `VICTORY_WAVE32_NVIDIA=1` an `ACCC` part
+/// (native code another compiler made: the console upscaler library's passes), as the runtime
+/// reads them.
+fn native_part<'a>(container: &Container<'a>) -> Option<&'a [u8]> {
+    container
+        .part(FourCC::DXIL)
+        .or_else(|| container.part(FourCC::ACCC).filter(|_| victory_shader::emit::nvidia::enabled()))
+        .map(|p| p.data)
 }

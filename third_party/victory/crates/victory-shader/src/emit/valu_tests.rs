@@ -1678,3 +1678,71 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// VOP3P `op vdst, src0, src1, src2` with the default op_sel_hi (each half
+/// of the result from the same half of the sources).
+const fn vop3p(op: u8, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0xCC00_0000 | (op as u32 & 0x7F) << 16 | 1 << 14 | vdst as u32,
+        3 << 27 | (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// `acc` plus the four products of the bytes of `a` and `b` (signed or
+/// not), wrapping as the hardware's i32 does.
+fn dot4(a: u32, b: u32, acc: u32, signed: bool) -> u32 {
+    (0..4).fold(acc, |s, k| {
+        let (x, y) = ((a >> (8 * k)) as u8, (b >> (8 * k)) as u8);
+        let p = if signed {
+            (i32::from(x as i8) * i32::from(y as i8)) as u32
+        } else {
+            u32::from(x) * u32::from(y)
+        };
+        s.wrapping_add(p)
+    })
+}
+
+#[test]
+fn dot4_of_bytes_wraps_into_the_accumulator() {
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2 (VOP2 0x0d): the destination accumulates
+    let accumulating = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), vop2(0x0d, 0, vgpr(1), 2)]);
+    // v_dot4_i32_i8 v0, v1, v2, v3 and v_dot4_u32_u8 (VOP3P 0x16, 0x17)
+    let signed = build_valu_cs(&vop3p(0x16, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let unsigned = build_valu_cs(&vop3p(0x17, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        [0x7F80_FF01, 0x0280_7F7F, 5, 0],
+        // 4 x 16384 past i32::MAX: wraps
+        [0x8080_8080, 0x8080_8080, 0x7FFF_FFF0, 0],
+        [0x0102_0304, 0xFFFE_FDFC, 0, 0],
+        [0, 0x1234_5678, 0xDEAD_BEEF, 0],
+    ];
+    for shader in [&accumulating, &signed] {
+        run_cases(shader, &cases, |backend, i, [a, b, acc, _], got| {
+            assert_eq!(got, dot4(a, b, acc, true), "{backend}: case {i}: {got:#010x}");
+        });
+    }
+    run_cases(&unsigned, &cases, |backend, i, [a, b, acc, _], got| {
+        assert_eq!(got, dot4(a, b, acc, false), "{backend}: case {i}: {got:#010x}");
+    });
+}
+
+#[test]
+fn packed_fmac_f16_accumulates_each_half_into_its_own() {
+    // v_mov_b32 v0, v3; v_pk_fmac_f16 v0, v1, v2 (VOP2 0x3c)
+    let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), vop2(0x3c, 0, vgpr(1), 2)]);
+    // Halves low first: (1.5, 2.0) x (2.0, -0.5) + (0.25, 3.0) = (3.25, 2.0).
+    let cases = [[0x4000_3E00, 0xB800_4000, 0x4200_3400, 0], [0x3C00_3C00, 0x3C00_3C00, 0, 0]];
+    let want = [0x4000_4280u32, 0x3C00_3C00];
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        assert_eq!(got, want[i], "{backend}: case {i}: {got:#010x}");
+    });
+}
+
+#[test]
+fn src_scc_reads_scc_as_a_number() {
+    // s_cmp_lg_u32 s0, 0; s_mul_i32 s12, s1, src_scc; v_mov_b32 v0, s12
+    let shader = build_valu_cs(&[0xBF07_8000, sop2(0x26, 12, 1, 0xFD), vop1(0x001, 0, sgpr(12))]);
+    run_cases(&shader, &[[0, 7, 0, 0], [3, 7, 0, 0]], |backend, i, _, got| {
+        assert_eq!(got, [0, 7][i], "{backend}: case {i}");
+    });
+}

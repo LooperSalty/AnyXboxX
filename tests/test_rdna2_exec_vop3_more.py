@@ -124,3 +124,12 @@ def test_hlsl_translates_the_new_vop3_operations():
 def test_new_vop3_operations_match_interpreter_on_gpu():
     expected, actual = compare(vop3_parity_program())
     assert actual == expected
+
+
+@pytest.mark.parametrize("name", ("v_madmk_f32", "v_madak_f32", "v_fmamk_f32", "v_fmaak_f32"))
+def test_vop3_literal_operations_without_literal_are_refused(name):
+    code = program(*vop3(name, 3, V + 1, V + 2))
+    with pytest.raises(rdna2_exec.Untranslated, match="littéral"):
+        rdna2_exec.run(code)
+    with pytest.raises(rdna2_hlsl.Untranslatable, match="littéral"):
+        rdna2_hlsl.translate(code)

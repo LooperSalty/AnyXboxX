@@ -1,11 +1,12 @@
-# Runtime C++ d'AnyXboxX : DLL qui remplacent les bibliothèques de la console.
+﻿# Runtime C++ d'AnyXboxX : DLL qui remplacent les bibliothÃ¨ques de la console.
 #
+#   cargo build --release            (DLL Rust d'abord, voir rust_dlls plus bas)
 #   cmake -S runtime -B runtime/build -A x64
 #   cmake --build runtime/build --config Release
 #
-# Les DLL sont produites dans runtime/build/bin, où le mode natif les cherche
-# (ou dans le dossier donné par la variable ANYXBOXX_RUNTIME).
-cmake_minimum_required(VERSION 3.20)
+# Les DLL sont produites dans runtime/build/bin, oÃ¹ le mode natif les cherche
+# (ou dans le dossier donnÃ© par la variable ANYXBOXX_RUNTIME).
+cmake_minimum_required(VERSION 3.21)
 project(AnyXboxXRuntime LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -14,9 +15,9 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Même CRT que Python (ucrtbase) : stderr est partagé avec le journal d'AnyXboxX.
+# MÃªme CRT que Python (ucrtbase) : stderr est partagÃ© avec le journal d'AnyXboxX.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
-# « $<0:> » évite le sous-dossier Release/Debug des générateurs multi-configurations.
+# Â« $<0:> Â» Ã©vite le sous-dossier Release/Debug des gÃ©nÃ©rateurs multi-configurations.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<0:>")
 
 function(anyxboxx_dll name)
@@ -48,22 +49,27 @@ anyxboxx_dll(xgameruntime xgameruntime/xgameruntime.cpp xgameruntime/served_inte
              xgameruntime/store_interface.cpp
              xgameruntime/xgameruntime.def)
 target_link_libraries(xgameruntime PRIVATE anyxboxx_task dxgi ole32 iphlpapi)
-anyxboxx_dll(xmem xmem/xmem.cpp xmem/era_heap.cpp xmem/era_query.cpp xmem/aligned_pages.cpp
-             xmem/virtual_alloc.cpp xmem/physical_pages.cpp xmem/xmem.def)
-anyxboxx_dll(d3d12_xs d3d12_xs/d3d12_xs.cpp d3d12_xs/virtual_memory.cpp d3d12_xs/d3d12_xs.def)
-anyxboxx_dll(XCRDAPI xcrdapi/xcrdapi.cpp xcrdapi/xcrdapi.def)
-anyxboxx_dll(kernelx kernelx/kernelx.cpp)
-anyxboxx_dll(anyxboxx_tls tls/anyxboxx_tls.cpp)
 
-# Lanceur natif sans Python : anyxboxx.exe <jeu.exe | dossier du paquet> [--fps]
-add_executable(anyxboxx launcher/launcher.cpp)
-target_compile_definitions(anyxboxx PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(anyxboxx PRIVATE /W4 /WX /permissive- /utf-8)
+# DLL du runtime portÃ©es en Rust (crates/anyxboxx-*, docs/rust-full-status.md) : compilÃ©es par
+# cargo, copiÃ©es ici Ã  cÃ´tÃ© des DLL C++. Â« source=nom dans bin Â», sÃ©parÃ©es par des virgules.
+set(ANYXBOXX_RUST_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../target/release" CACHE PATH
+    "Dossier de cargo build --release (les DLL Rust du runtime)")
+set(ANYXBOXX_RUST_DLLS "xcrdapi.dll=XCRDAPI.dll,kernelx.dll=kernelx.dll,d3d12_xs.dll=d3d12_xs.dll,anyxboxx_tls.dll=anyxboxx_tls.dll,xmem.dll=xmem.dll,anyxboxx-native-launcher.exe=anyxboxx.exe,anyxboxx_gpu_run.exe=anyxboxx_gpu_run.exe")
+add_custom_target(rust_dlls ALL
+  COMMAND ${CMAKE_COMMAND} -DRUST_RELEASE=${ANYXBOXX_RUST_RELEASE} -DBIN=${CMAKE_BINARY_DIR}/bin
+          -DDLLS=${ANYXBOXX_RUST_DLLS} -P ${CMAKE_CURRENT_SOURCE_DIR}/rust_dlls.cmake
+  VERBATIM)
+
+# Keep the C++ native launcher as an oracle for parity tests; anyxboxx.exe is copied by rust_dlls.
+add_executable(anyxboxx_cpp launcher/launcher.cpp)
+target_compile_definitions(anyxboxx_cpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(anyxboxx_cpp PRIVATE /W4 /WX /permissive- /utf-8)
 # Base haute : la base préférée des jeux (0x140000000) reste libre pour eux.
-target_link_options(anyxboxx PRIVATE /BASE:0x7FF700000000 /DYNAMICBASE)
+target_link_options(anyxboxx_cpp PRIVATE /BASE:0x7FF700000000 /DYNAMICBASE)
 
-# Exécution sur le GPU du PC d'un shader traduit RDNA 2 → HLSL → DXIL (emu/rdna2_hlsl.py).
-add_executable(anyxboxx_gpu_run gpu_runner/gpu_run.cpp gpu_runner/adapter.cpp)
-target_compile_definitions(anyxboxx_gpu_run PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(anyxboxx_gpu_run PRIVATE /W4 /WX /permissive- /utf-8)
-target_link_libraries(anyxboxx_gpu_run PRIVATE d3d12 dxgi)
+# ExÃ©cution sur le GPU du PC d'un shader traduit RDNA 2 â†’ HLSL â†’ DXIL (emu/rdna2_hlsl.py).
+add_executable(anyxboxx_gpu_run_cpp gpu_runner/gpu_run.cpp gpu_runner/adapter.cpp)
+target_compile_definitions(anyxboxx_gpu_run_cpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(anyxboxx_gpu_run_cpp PRIVATE /W4 /WX /permissive- /utf-8)
+target_link_libraries(anyxboxx_gpu_run_cpp PRIVATE d3d12 dxgi)
+

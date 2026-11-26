@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import sync_voisins as sv  # noqa: E402
 
-# Voisin factice : copie de fichiers sous « tools/ », comme le faisait Leonida avant sa suppression.
+# Voisin factice : copie de fichiers sous « tools/ ».
 COPIE = sv.Voisin("Factice", "exemple/factice", "third_party/factice", prefixe="tools/",
                   portes=("runtime/src/gfx10_descriptors.h", "tools/gfx10_formats.json"))
 X2W = sv.VOISINS[1]

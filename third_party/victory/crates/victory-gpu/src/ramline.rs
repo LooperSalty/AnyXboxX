@@ -402,7 +402,8 @@ fn upload_line() -> String {
     let [pool, peak, overflow, overflows] = crate::windowup::stats();
     format!(
         "; window upload: transient windows {}, pool {} MB (peak {} MB, overflow slabs alive {} MB, overflow allocations {}), \
-         sent from chunks since the last line {} MB, buffers not folded into one {}, shader writes to one (bug) {}",
+         sent from chunks since the last line {} MB, buffers not folded into one {}, shader writes to one (bug) {}, \
+         prints of the pages sent {} MB (VICTORY_WINDOW_SKIP_SAME)",
         TRANSIENT[0].load(Relaxed),
         mb(pool),
         mb(peak),
@@ -411,5 +412,6 @@ fn upload_line() -> String {
         mb(crate::windowup::SENT.swap(0, Relaxed)),
         TRANSIENT[1].load(Relaxed),
         TRANSIENT[2].load(Relaxed),
+        mb(crate::shadow::window_print_bytes()),
     )
 }

@@ -1630,7 +1630,10 @@ pub fn writing(at: usize, len: usize) {
 /// 4, both also for reads to plain addresses when they have finished.
 /// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
 /// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// everything. `5` (also `guards+reads`): bits 1 and 4, the host copies
+/// under reads to plain addresses taken again too, without making texture
+/// slots due; and any other number from 2 to 7 is taken as the bits
+/// themselves ([`page_writes_mode`]).
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
@@ -1638,13 +1641,21 @@ pub fn writing(at: usize, len: usize) {
 /// queue in an earlier form: still asked for by name.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("1") => 3,
-        Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
-    })
+    *MODE.get_or_init(|| page_writes_mode(std::env::var("VICTORY_PAGE_WRITES").ok().as_deref()))
+}
+
+/// [`page_writes`] from the switch's value. `1` keeps its meaning (bits 1
+/// and 2, as before); other numbers up to 7 are the bits.
+fn page_writes_mode(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 3,
+        Some("slots") => 2,
+        Some("all") => 7,
+        Some("guards+reads") => 5,
+        Some(v) => v.parse::<u8>().ok().filter(|&bits| (2..=7).contains(&bits)).unwrap_or(1),
+        None => 1,
+    }
 }
 
 /// Since the start: writes into physical pages through the runtime's own
@@ -1984,6 +1995,29 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod page_writes_tests {
+    use super::page_writes_mode;
+
+    #[test]
+    fn page_writes_takes_its_names_and_the_bits_as_a_number() {
+        // The names keep their meanings.
+        assert_eq!(page_writes_mode(None), 1);
+        assert_eq!(page_writes_mode(Some("guards")), 1);
+        assert_eq!(page_writes_mode(Some("0")), 0);
+        assert_eq!(page_writes_mode(Some("1")), 3);
+        assert_eq!(page_writes_mode(Some("slots")), 2);
+        assert_eq!(page_writes_mode(Some("all")), 7);
+        // Host copies under finished reads too, texture slots left alone.
+        assert_eq!(page_writes_mode(Some("5")), 5);
+        assert_eq!(page_writes_mode(Some(" guards+reads ")), 5);
+        assert_eq!(page_writes_mode(Some("6")), 6);
+        // Not a mode: the default.
+        assert_eq!(page_writes_mode(Some("8")), 1);
+        assert_eq!(page_writes_mode(Some("many")), 1);
+    }
 }
 
 #[cfg(test)]

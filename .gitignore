@@ -8,9 +8,12 @@ __pycache__/
 .ruff_cache/
 /runtime/build/
 
-# Rust
-rust/target/
 
 # Paramètres et worktrees Claude Code personnels
 .claude/settings.local.json
 .claude/worktrees/
+
+# Root Cargo workspace (crates/)
+/target/
+# Build folder of the former rust/ workspace (merged into crates/), left on disk by older builds
+/rust/target/

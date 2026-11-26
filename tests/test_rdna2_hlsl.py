@@ -39,7 +39,7 @@ def compare(data, sgprs=None, memory=b""):
 
 def test_translation_is_a_plain_compute_shader():
     hlsl = rdna2_hlsl.translate(program(vop1("v_mov_b32", 1, ONE)))
-    assert "[numthreads(32, 1, 1)]" in hlsl and "switch (pc)" not in hlsl and "v[1] = 0x3F800000u" in hlsl
+    assert "[numthreads(32, 1, 1)]" in hlsl and "while (pc" not in hlsl and "v[1] = 0x3F800000u" in hlsl
 
 
 def test_untranslatable_instruction_is_named():
@@ -135,3 +135,11 @@ def test_vop3_integer_operations_match():
         *store_lane(1, 0), *store_lane(2, 1), *store_lane(3, 2), *store_lane(4, 3),
         *store_lane(5, 4), *store_lane(6, 5), *store_lane(7, 6)))
     assert actual == expected
+
+
+def test_spirv_option_is_refused_by_name(tmp_path, capsys):
+    import scarlett
+    shader = tmp_path / "shader.bin"
+    shader.write_bytes(program(vop1("v_mov_b32", 1, ONE)))
+    assert scarlett.main(["--rdna2", str(shader), "--spirv", "ps"]) == 2
+    assert "--spirv" in capsys.readouterr().err

@@ -5,18 +5,21 @@ component, two per VGPR: emu/rdna2_buffer_d16.py).
 Formats et conversions : emu/rdna2_buffer_format.py. Adresse et bornes comme les autres accès
 MUBUF (emu/rdna2_exec_memory.py, _buffer) : base + soffset + index × pas + décalage ; avec un pas
 non nul, l'élément est dans le buffer si index < NUM_RECORDS, sinon si décalage + taille de
-l'élément <= NUM_RECORDS (l'élément entier, comme Leonida, buffer_address avec elem="fmt").
+l'élément <= NUM_RECORDS (l'élément entier : ISA, section 8.1.5, p. 62, note 3 : les accès
+load/store-format sont vérifiés « all or nothing »).
 Hors du buffer, une lecture donne des composantes nulles et une écriture n'écrit rien.
 
 Composantes lues (spécification XML d'AMD : « Load N-component formatted data … convert the data to
 32 bit integral or floating point format ») :
 - MUBUF : DST_SEL du V# pour chaque composante écrite : 0, 1 (1.0 ou 1, voir select_one) ou une
-  composante X à W du format ; DST_SEL = 1 reste 1 hors du buffer (Leonida, mesuré). Une sélection
+  composante X à W du format ; DST_SEL = 1 reste 1 hors du buffer (ISA, section 8.1.5, p. 62, note 1 : « except for
+  components with V#.dst_sel = SEL_1 that return 1 »). Une sélection
   d'une composante absente du format, ou les valeurs 2 et 3, sont refusées.
-- MTBUF : le format de l'instruction, composantes dans l'ordre, sans DST_SEL (Leonida : « the V#
-  selectors apply only to MUBUF ») ; lire plus de composantes que le format n'en a est refusé. Un V#
-  de FORMAT INVALID (0) désactive l'accès malgré le format de l'instruction (Leonida, écriture
-  mesurée sur gfx1035) : lecture nulle, rien d'écrit.
+- MTBUF : le format de l'instruction, composantes dans l'ordre, sans DST_SEL (ISA, section 8.1.4,
+  table 31, p. 59 : TBUFFER_*_FORMAT_*, format « instruction », DST SEL « identity ») ; lire plus de
+  composantes que le format n'en a est refusé. Un V# de FORMAT INVALID (0) désactive l'accès malgré le
+  format de l'instruction (même page : « The resource's data format must not be INVALID; that format
+  has specific meaning (unbound resource) ») : lecture nulle, rien d'écrit.
 Écriture : autant de composantes que le format ; MUBUF exige un DST_SEL « identité » (voir
 rdna2_buffer_format.store_selects_ok). Une adresse non alignée sur la taille d'une composante, lds,
 tfe, SWIZZLE_ENABLE et ADD_TID_ENABLE sont refusés en les nommant.

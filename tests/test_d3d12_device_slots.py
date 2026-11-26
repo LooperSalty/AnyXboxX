@@ -2,15 +2,17 @@
 
 La table compare, pour chaque slot que le titre appelle avant le premier « Close » en échec, ce que TomBox
 assigne dans sa table de périphérique (crates/compat/d3d12_xs, 90 slots, DEVICE_SLOTS) et ce qu'AnyXboxX sert.
-AnyXboxX ne sert aucun slot de périphérique : d3d12_xs.def n'exporte ni D3D12XboxCreateDevice ni de table.
+AnyXboxX ne sert aucun slot de périphérique : d3d12_xs.dll (crates/anyxboxx-d3d12-xs) n'exporte ni
+D3D12XboxCreateDevice ni de table.
 Le test fige cet état : toute nouvelle implémentation doit mettre à jour la table et la note.
 """
+import re
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-DEF_FILE = ROOT / "runtime" / "d3d12_xs" / "d3d12_xs.def"
+CRATE = ROOT / "crates" / "anyxboxx-d3d12-xs"
 TOMBOX_DEVICE_SLOTS = 90  # DEVICE_SLOTS dans TomBox crates/compat/d3d12_xs/src/console_slots.rs
 
 # slot, rôle mesuré (note, section 4), statut dans TomBox (grep des affectations `[n] = ...`), servi par AnyXboxX
@@ -36,9 +38,12 @@ MEASURED_SLOTS = {8, 9, 16, 26, 36, 41, 48, 49, 57, 61, 73, 74, 79, 86, 127}
 
 
 def _exports():
-    lines = DEF_FILE.read_text(encoding="utf-8").splitlines()
-    start = lines.index("EXPORTS") + 1
-    return {line.split()[0] for line in lines[start:] if line.strip() and not line.lstrip().startswith(";")}
+    """Exports de d3d12_xs.dll : fonctions `#[unsafe(no_mangle)]` de la crate et redirections de build.rs."""
+    own = re.findall(r'#\[unsafe\(no_mangle\)\]\s*pub unsafe extern "system" fn (\w+)',
+                     (CRATE / "src" / "lib.rs").read_text(encoding="utf-8"))
+    build = (CRATE / "build.rs").read_text(encoding="utf-8")
+    forwarded = re.findall(r'"(D3D12\w+)"', build[build.index("const FORWARDED"):build.index("fn main")])
+    return set(own) | set(forwarded)
 
 
 def test_every_measured_slot_is_in_the_table():
