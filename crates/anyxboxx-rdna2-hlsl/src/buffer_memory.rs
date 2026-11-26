@@ -5,7 +5,19 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     let rest = name
         .strip_prefix("buffer_")
         .ok_or_else(|| format!("untranslated instruction: {name}"))?;
-    let (write, width) = if let Some(width) = rest.strip_prefix("load_") {
+    let atomic = match rest {
+        "atomic_add" => Some("InterlockedAdd"),
+        "atomic_swap" => Some("InterlockedExchange"),
+        "atomic_and" => Some("InterlockedAnd"),
+        "atomic_or" => Some("InterlockedOr"),
+        "atomic_xor" => Some("InterlockedXor"),
+        "atomic_umin" => Some("InterlockedMin"),
+        "atomic_umax" => Some("InterlockedMax"),
+        _ => None,
+    };
+    let (write, width) = if atomic.is_some() {
+        (false, "dword")
+    } else if let Some(width) = rest.strip_prefix("load_") {
         (false, width)
     } else if let Some(width) = rest.strip_prefix("store_") {
         (true, width)
@@ -65,6 +77,19 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
         resource + 2
     );
     let address = format!("(s[{resource}]{extra} + {byte_offset})");
+    if let Some(function) = atomic {
+        let keep = if (word >> 14) & 1 != 0 {
+            format!(" v[{data}] = old;")
+        } else {
+            String::new()
+        };
+        return Ok(vec![
+            format!(
+                "if ((((s[126] >> lane) & 1u) != 0) && {inside}) {{ uint old; g_memory.{function}({address}, v[{data}], old);{keep} }}"
+            ),
+            "AllMemoryBarrierWithGroupSync();".into(),
+        ]);
+    }
     if write {
         let writes = (0..count)
             .map(|i| format!("g_memory.Store({address} + {}u, v[{}]);", 4 * i, data + i))
