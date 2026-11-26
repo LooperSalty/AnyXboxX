@@ -1,6 +1,6 @@
 //! Typed buffer accesses of the reference interpreter: buffer_load/store_format_* (MUBUF, format of the
 //! V#) and tbuffer_load/store_format_* (MTBUF, format of the instruction). Port of `execute` and
-//! `_results` in `emu/rdna2_exec_format.py`; the _d16 forms stay refused.
+//! `_results` in `emu/rdna2_exec_format.py`, including packed d16 forms.
 //!
 //! The address and the bounds are those of the other MUBUF accesses: base + SOFFSET + index x stride +
 //! byte offset; with a stride the element is inside when its index is below NUM_RECORDS, otherwise
@@ -11,6 +11,7 @@ use crate::buffer_format::Format;
 use crate::error::Error;
 use crate::format_access::{self, Access, SELECT_ONE, SELECT_X, SELECT_ZERO};
 use crate::format_convert::{decode, encode, select_one};
+use crate::format_d16;
 use crate::memory::descriptor;
 use crate::wave::{NULL, Wave};
 
@@ -107,14 +108,28 @@ pub fn execute(wave: &mut Wave, name: &str, word: u64) -> Result<(), Error> {
         if access.store {
             if inside {
                 let values = (0..format.count())
-                    .map(|i| vgpr(wave, access.vdata + i, lane))
+                    .map(|i| {
+                        if access.d16 {
+                            let shift = if access.high { 16 } else { (i % 2) * 16 };
+                            let reg = if access.high { 0 } else { i / 2 };
+                            let half = (vgpr(wave, access.vdata + reg, lane)? >> shift) & 0xffff;
+                            Ok(format_d16::widen(format, half, format.widths[i]))
+                        } else {
+                            vgpr(wave, access.vdata + i, lane)
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 wave.memory.write(address, &encode(format, &values));
             }
             continue;
         }
         let components = if inside {
-            decode(format, &wave.memory.read(address, format.size))
+            let data = wave.memory.read(address, format.size);
+            if access.d16 {
+                format_d16::decode(format, &data)
+            } else {
+                decode(format, &data)
+            }
         } else {
             vec![0; format.count()]
         };
@@ -122,7 +137,15 @@ pub fn execute(wave: &mut Wave, name: &str, word: u64) -> Result<(), Error> {
             .into_iter()
             .enumerate()
         {
-            set_vgpr(wave, access.vdata + i, lane, value)?;
+            if access.d16 {
+                let shift = if access.high { 16 } else { (i % 2) * 16 };
+                let reg = access.vdata + if access.high { 0 } else { i / 2 };
+                let old = vgpr(wave, reg, lane)?;
+                let half = format_d16::narrow(format, value);
+                set_vgpr(wave, reg, lane, old & !(0xffff << shift) | half << shift)?;
+            } else {
+                set_vgpr(wave, access.vdata + i, lane, value)?;
+            }
         }
     }
     Ok(())

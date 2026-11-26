@@ -5,16 +5,14 @@ use eframe::egui::{self, RichText, Ui};
 
 use crate::app::App;
 use crate::options::{Keyboard, LogLevel, Preset, Resolution, WindowMode};
-use crate::theme;
+use crate::{theme, tokens, widgets};
 
 pub fn cards(app: &mut App, ui: &mut Ui) {
-    ui.label(RichText::new("Launch options").size(22.0).strong());
-    ui.add_space(theme::SP_S);
     ui.columns(2, |columns| {
         display_card(app, &mut columns[0]);
         keyboard_card(app, &mut columns[1]);
     });
-    ui.add_space(theme::SP_S);
+    ui.add_space(tokens::M);
     ui.columns(2, |columns| {
         performance_card(app, &mut columns[0]);
         diagnostics_card(app, &mut columns[1]);
@@ -22,8 +20,8 @@ pub fn cards(app: &mut App, ui: &mut Ui) {
 }
 
 fn card_title(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(18.0).strong());
-    ui.add_space(theme::SP_XS);
+    ui.label(tokens::subtitle(text));
+    ui.add_space(tokens::S);
 }
 
 /// One pill per choice; the chosen one is lit.
@@ -35,7 +33,7 @@ fn pills<T: Copy + PartialEq>(
 ) {
     ui.horizontal_wrapped(|ui| {
         for &choice in all {
-            if theme::tab_pill(ui, *value == choice, label(choice)) {
+            if widgets::pill(ui, *value == choice, label(choice)) {
                 *value = choice;
             }
         }
@@ -43,9 +41,9 @@ fn pills<T: Copy + PartialEq>(
 }
 
 fn toggle_row(ui: &mut Ui, text: &str, value: &mut bool) {
-    ui.horizontal(|ui| {
-        theme::toggle(ui, value);
-        ui.label(text);
+    ui.horizontal_top(|ui| {
+        widgets::toggle(ui, value);
+        ui.add(egui::Label::new(tokens::body(text)).wrap());
     });
 }
 
@@ -72,9 +70,9 @@ fn display_card(app: &mut App, ui: &mut Ui) {
                 );
             }
         }
-        ui.add_space(theme::SP_S);
+        ui.add_space(tokens::S);
         pills(ui, &mut options.window, &WindowMode::ALL, WindowMode::label);
-        ui.add_space(theme::SP_S);
+        ui.add_space(tokens::S);
         toggle_row(
             ui,
             "Stats overlay (F10 shows and hides it)",
@@ -82,7 +80,8 @@ fn display_card(app: &mut App, ui: &mut Ui) {
         );
         ui.label(
             RichText::new("The size is what the console reports to the game.")
-                .color(theme::TEXT_MUTED),
+                .color(theme::TEXT_MUTED)
+                .size(tokens::CAPTION),
         );
     });
 }
@@ -92,7 +91,7 @@ fn keyboard_card(app: &mut App, ui: &mut Ui) {
         card_title(ui, "Keyboard");
         let keyboard = &mut app.settings.options.keyboard;
         pills(ui, keyboard, &Keyboard::ALL, Keyboard::label);
-        ui.add_space(theme::SP_S);
+        ui.add_space(tokens::S);
         ui.label(format!("Move: {}", keyboard.move_keys()));
         ui.label("Look: I J K L (up, left, down, right)");
         ui.label(keyboard.shoulder_keys());
@@ -110,8 +109,12 @@ fn performance_card(app: &mut App, ui: &mut Ui) {
             &Preset::ALL,
             Preset::label,
         );
-        ui.label(RichText::new(settings.options.preset.description()).color(theme::TEXT_MUTED));
-        ui.add_space(theme::SP_S);
+        ui.label(
+            RichText::new(settings.options.preset.description())
+                .color(theme::TEXT_MUTED)
+                .size(tokens::CAPTION),
+        );
+        ui.add_space(tokens::S);
         ui.add(
             egui::Slider::new(&mut settings.jobs, 0..=32).text("shader workers (0 = every core)"),
         );
@@ -144,7 +147,7 @@ fn diagnostics_card(app: &mut App, ui: &mut Ui) {
             &LogLevel::ALL,
             LogLevel::label,
         );
-        ui.add_space(theme::SP_S);
+        ui.add_space(tokens::S);
         toggle_row(
             ui,
             "Skip the running-game check",
@@ -152,7 +155,8 @@ fn diagnostics_card(app: &mut App, ui: &mut Ui) {
         );
         ui.label(
             RichText::new("Only if you are sure no game runs (hosts without tasklist).")
-                .color(theme::TEXT_MUTED),
+                .color(theme::TEXT_MUTED)
+                .size(tokens::CAPTION),
         );
         toggle_row(
             ui,

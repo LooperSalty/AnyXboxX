@@ -89,6 +89,7 @@ fn object_for(name: &str, pairs: &[(Guid, Guid)], gdk: &[tables::GdkApi]) -> *co
         "GameSaveInterface" => crate::save_interface::methods(),
         "LocalStorageInterface" => crate::local_storage::methods(),
         "StoreInterface" => crate::store::methods(),
+        "PackageInterface" => crate::package::methods(),
         "HdrDisplayInterface" => crate::hdr_display::methods(),
         "NetworkingInterface" => crate::networking::methods(),
         _ => Vec::new(),

@@ -15,7 +15,13 @@ use crate::wave::{SCALAR_REGISTERS, Wave};
 const NULL: usize = 125;
 const DWORD: usize = 4;
 const GLC_BIT: u32 = 16;
-const CACHE_CONTROL: [&str; 3] = ["s_dcache_inv", "s_gl1_inv", "s_dcache_wb"];
+const CACHE_CONTROL: [&str; 5] = [
+    "s_dcache_inv",
+    "s_gl1_inv",
+    "s_dcache_wb",
+    "s_atc_probe",
+    "s_atc_probe_buffer",
+];
 const LOAD_WORDS: [(&str, usize); 5] = [
     ("dword", 1),
     ("dwordx2", 2),

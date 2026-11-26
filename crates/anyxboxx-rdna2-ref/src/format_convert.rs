@@ -125,6 +125,9 @@ pub fn decode(format: &Format, data: &[u8]) -> Vec<u32> {
 }
 
 fn field(format: &Format, value: u32, width: u32) -> u64 {
+    if format.kind == Kind::Float && width == 16 {
+        return u64::from(value & 0xffff);
+    }
     if width == DWORD_BITS {
         return u64::from(value);
     }

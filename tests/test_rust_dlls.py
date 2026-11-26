@@ -20,8 +20,15 @@ REPO = Path(__file__).resolve().parents[1]
 RUST_RELEASE = REPO / "target" / "release"
 # DLL name in the runtime folder → (Rust cdylib in target/release, pytest files of the C++ DLL).
 PORTED = {
+    "xgameruntime.dll": (
+        "xgameruntime.dll",
+        [str(p.relative_to(REPO)) for pattern in ("tests/test_gdk_*.py", "tests/test_runtime_*.py")
+         for p in sorted(REPO.glob(pattern))] + ["tests/test_native_services.py"],
+    ),
 }
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows DLLs")
+# Skip reasons that only mean the machine lacks an optional component.
+ALLOWED_SKIPS = ("runtime GDK de Windows absent",)
 
 
 def mixed_runtime(tmp_path, name, rust_file):
@@ -40,13 +47,19 @@ def test_cpp_tests_pass_against_the_rust_dll(tmp_path, name):
             pytest.fail(f"absent: {missing or RUNTIME_DIR} (cargo build --release; cmake runtime/)")
         pytest.skip("Rust DLL or C++ runtime not built")
     folder = mixed_runtime(tmp_path, name, rust_file)
-    env = {**os.environ, "ANYXBOXX_RUNTIME": str(folder), "ANYXBOXX_REQUIRE_RUNTIME": "1"}
-    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *test_files],
+    env = {**os.environ, "ANYXBOXX_RUNTIME": str(folder), "ANYXBOXX_REQUIRE_RUNTIME": "1",
+           "ANYXBOXX_TEST_RUST_XGAMERUNTIME": "1"}
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+                           f"--basetemp={tmp_path / 'nested'}", *test_files],
                           cwd=REPO, env=env, capture_output=True, text=True, timeout=600)
     summary = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else done.stderr
     assert done.returncode == 0, done.stdout[-4000:]
     passed = re.search(r"(\d+) passed", summary)
-    assert passed and int(passed.group(1)) > 0 and "skipped" not in summary, summary
+    skips = [line for line in done.stdout.splitlines() if line.startswith("SKIPPED")]
+    # Only skips that depend on the machine are accepted: the Windows GDK runtime is not
+    # installed on CI, and that test compares against it, not against our DLL.
+    unexpected = [line for line in skips if not any(reason in line for reason in ALLOWED_SKIPS)]
+    assert passed and int(passed.group(1)) > 0 and not unexpected, (summary, unexpected)
 
 
 def exports(path):

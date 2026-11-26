@@ -129,7 +129,12 @@ impl Wave {
                     value
                 })
             }
-            _ => float::inline_constant(code).ok_or_else(|| {
+            _ => (if width == 2 {
+                float::inline_double(code)
+            } else {
+                float::inline_constant(code)
+            })
+            .ok_or_else(|| {
                 Error::Untranslated(format!("opérande scalaire {code} non pris en charge"))
             }),
         }
@@ -141,18 +146,17 @@ impl Wave {
             return Ok(());
         }
         let index = code as usize;
-        if index >= SCALAR_REGISTERS {
-            return Err(Error::Operand(format!(
-                "écriture dans le registre scalaire {code}"
+        if index
+            .checked_add(width)
+            .is_none_or(|end| end > SCALAR_REGISTERS)
+        {
+            return Err(Error::Untranslated(format!(
+                "écriture de {} bits au-delà de s127 (s{code})",
+                32 * width
             )));
         }
         self.s[index] = value as u32;
         if width == 2 {
-            if index + 1 >= SCALAR_REGISTERS {
-                return Err(Error::Operand(format!(
-                    "écriture 64 bits au-delà de s127 ({code})"
-                )));
-            }
             self.s[index + 1] = (value >> 32) as u32;
         }
         Ok(())
@@ -170,6 +174,17 @@ impl Wave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_write_past_s127_is_refused_without_mutation() {
+        let mut wave = Wave::new(64).unwrap();
+        wave.s[127] = 0x1234_5678;
+        assert!(matches!(
+            wave.write_mask(127, 0),
+            Err(Error::Untranslated(_))
+        ));
+        assert_eq!(wave.s[127], 0x1234_5678);
+    }
 
     #[test]
     fn exec_starts_with_every_lane_and_v0_holds_the_lane_numbers() {

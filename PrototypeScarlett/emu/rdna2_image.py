@@ -16,12 +16,12 @@ Positions des champs et constantes :
 
 Opérations prises en charge (le reste est refusé en le nommant) : image 2D linéaire à un seul
 niveau mip (BASE_LEVEL = LAST_LEVEL = 0, lignes de width × taille du texel), formats
-8_UNORM, 8_8_UNORM, 8_8_8_8_UNORM, 32_FLOAT, 32_32_FLOAT et 32_32_32_32_FLOAT ; lecture/écriture
-directe (image_load[_mip], image_store[_mip], image_get_resinfo) ; échantillonnage
-(image_sample[_lz|_l][_o], image_sample_c[_lz|_l][_o], image_gather4[_lz|_l][_o]) au plus proche
-ou bilinéaire, adressage wrap, mirror, clamp-to-edge, mirror-once-to-edge, clamp-to-border et
-mirror-once-to-border (couleurs de bordure standard). L'interpréteur et le HLSL font le même
-calcul, au bit près.
+8_UNORM, 8_8_UNORM, 8_8_8_8_UNORM, 32_UINT, 32_SINT, 32_FLOAT, 32_32_UINT, 32_32_SINT,
+32_32_FLOAT et 32_32_32_32_FLOAT ; lecture/écriture directe (image_load[_mip], image_store[_mip],
+image_get_resinfo) ; atomiques 2D (image_atomic_*) ; échantillonnage (image_sample[_lz|_l][_o],
+image_sample_c[_lz|_l][_o], image_gather4[_lz|_l][_o]) au plus proche ou bilinéaire, adressage
+wrap, mirror, clamp-to-edge, mirror-once-to-edge, clamp-to-border et mirror-once-to-border
+(couleurs de bordure standard). L'interpréteur et le HLSL font le même calcul, au bit près.
 """
 import json
 import struct
@@ -32,18 +32,28 @@ FORMAT_NAMES = {int(code): name for code, name in
                 json.loads((Path(__file__).parent / "data" / "gfx10_formats.json").read_text(encoding="utf-8")).items()}
 FORMAT_8_UNORM = 1
 FORMAT_8_8_UNORM = 14
+FORMAT_32_UINT = 20
+FORMAT_32_SINT = 21
 FORMAT_32_FLOAT = 22
 FORMAT_8_8_8_8_UNORM = 56
+FORMAT_32_32_UINT = 62
+FORMAT_32_32_SINT = 63
 FORMAT_32_32_FLOAT = 64
 FORMAT_32_32_32_32_FLOAT = 77
 TEXEL_BYTES = {
     FORMAT_8_UNORM: 1,
     FORMAT_8_8_UNORM: 2,
+    FORMAT_32_UINT: 4,
+    FORMAT_32_SINT: 4,
     FORMAT_32_FLOAT: 4,
     FORMAT_8_8_8_8_UNORM: 4,
+    FORMAT_32_32_UINT: 8,
+    FORMAT_32_32_SINT: 8,
     FORMAT_32_32_FLOAT: 8,
     FORMAT_32_32_32_32_FLOAT: 16,
 }
+ATOMIC_FORMATS_32 = frozenset({FORMAT_32_UINT, FORMAT_32_SINT, FORMAT_32_FLOAT})
+ATOMIC_FORMATS_64 = frozenset({FORMAT_32_32_UINT, FORMAT_32_32_SINT, FORMAT_32_32_FLOAT})
 TYPE_2D = 9
 DIM_2D = 1
 CLAMP_WRAP = 0
@@ -77,8 +87,15 @@ GATHER_OPS = frozenset({
     "image_gather4", "image_gather4_lz", "image_gather4_l",
     "image_gather4_o", "image_gather4_lz_o", "image_gather4_l_o",
 })
+ATOMIC_OPS = frozenset({
+    "image_atomic_swap", "image_atomic_cmpswap", "image_atomic_add", "image_atomic_sub",
+    "image_atomic_smin", "image_atomic_umin", "image_atomic_smax", "image_atomic_umax",
+    "image_atomic_and", "image_atomic_or", "image_atomic_xor", "image_atomic_inc",
+    "image_atomic_dec", "image_atomic_fcmpswap", "image_atomic_fmin", "image_atomic_fmax",
+})
+ATOMIC_CMPSWAP_OPS = frozenset({"image_atomic_cmpswap", "image_atomic_fcmpswap"})
 SAMPLER_OPS = SAMPLE_OPS | COMPARE_OPS | GATHER_OPS
-SUPPORTED_OPS = DIRECT_OPS | SAMPLER_OPS
+SUPPORTED_OPS = DIRECT_OPS | SAMPLER_OPS | ATOMIC_OPS
 
 
 class ImageError(ValueError):
@@ -90,9 +107,24 @@ def instruction_fields(word):
     nsa = (word >> 1) & 0x3
     addresses = [(word >> 32) & 0xFF] + [(word >> (64 + 8 * k)) & 0xFF for k in range(4 * nsa)]
     return {"nsa": nsa, "dim": (word >> 3) & 0x7, "dmask": (word >> 8) & 0xF, "unorm": (word >> 12) & 1,
-            "r128": (word >> 15) & 1, "tfe": (word >> 16) & 1, "lwe": (word >> 17) & 1,
+            "glc": (word >> 13) & 1, "r128": (word >> 15) & 1, "tfe": (word >> 16) & 1, "lwe": (word >> 17) & 1,
             "vaddr": addresses, "vdata": (word >> 40) & 0xFF, "srsrc": ((word >> 48) & 0x1F) * 4,
             "ssamp": ((word >> 53) & 0x1F) * 4, "a16": (word >> 62) & 1, "d16": (word >> 63) & 1}
+
+
+def atomic_width(name, dmask):
+    """Largeur en bits (32 ou 64) d'un image_atomic_* d'après dmask ; ImageError sinon."""
+    if name in ATOMIC_CMPSWAP_OPS:
+        if dmask == 0x3:
+            return 32
+        if dmask == 0xF:
+            return 64
+        raise ImageError(f"{name} : dmask 0x{dmask:x} non pris en charge (0x3 ou 0xf attendus)")
+    if dmask == 0x1:
+        return 32
+    if dmask == 0x3:
+        return 64
+    raise ImageError(f"{name} : dmask 0x{dmask:x} non pris en charge (0x1 ou 0x3 attendus)")
 
 
 def check_instruction(name, fields):
@@ -105,6 +137,8 @@ def check_instruction(name, fields):
             raise ImageError(f"{name} : option {flag} non prise en charge")
     if name in GATHER_OPS and bin(fields["dmask"]).count("1") != 1:
         raise ImageError(f"{name} : dmask 0x{fields['dmask']:x} non pris en charge (un seul canal)")
+    if name in ATOMIC_OPS:
+        atomic_width(name, fields["dmask"])
 
 
 def has_offset(name):
@@ -121,7 +155,7 @@ def address_count(name):
         return 1
     if name in ("image_load_mip", "image_store_mip"):
         return 3
-    if name in DIRECT_OPS:
+    if name in DIRECT_OPS or name in ATOMIC_OPS:
         return 2
     return 2 + int(has_offset(name)) + int(name in COMPARE_OPS) + int(has_lod(name))
 

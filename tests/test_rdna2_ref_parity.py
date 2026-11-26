@@ -21,6 +21,8 @@ from emu import rdna2_exec, rdna2_image
 from emu.rdna2_exec import VOP2_CARRY, Wave
 from emu.rdna2_exec_cmp64 import COMPARE64
 from emu.rdna2_exec_dot import OPERATIONS as DOT_OPERATIONS
+from emu.rdna2_exec_int16 import PACKED
+from emu.rdna2_exec_pkf16 import PACKED_F16, VOP3P as PKF16_VOP3P
 from emu.rdna2_exec_memory import PAGE
 from emu.rdna2_exec_movrel import SCALAR as MOVREL_SCALAR, VECTOR as MOVREL_VECTOR
 from emu.rdna2_exec_wide import OPERATIONS as WIDE_OPERATIONS
@@ -195,6 +197,36 @@ def test_a_literal_operand_is_the_second_word_in_both_models():
     exe = binary()
     words = program(sop1("s_mov_b32", 0, 255), 0xDEAD_BEEF, sop2("s_xor_b32", 1, 0, 255), 0x0F0F_0F0F)
     assert_same(exe, 32, False, [], words)
+
+
+def test_inline_double_constants_match_the_python_model():
+    exe = binary()
+    for lanes in (32, 64):
+        for source in range(240, 249):
+            for instruction in (sop1("s_mov_b64", 4, source), sop1("s_not_b64", 4, source),
+                                sop2("s_xor_b64", 4, source, 193)):
+                assert_same(exe, lanes, False, [], program(instruction))
+            assert_same(exe, lanes, False, [], program(vopc("v_cmp_eq_f64", source, 0)))
+
+
+def test_scalar_packs_match_the_python_model():
+    exe = binary()
+    for name in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
+        for scc in (False, True):
+            for a, b in ((0, 1), (240, 248), (193, 192), (LITERAL, 1), (0, LITERAL)):
+                words = [sop2(name, 3, a, b)]
+                if LITERAL in (a, b):
+                    words.append(0xAAAA_BBBB)
+                assert_same(exe, 32, scc, [(0, 0x12345678), (1, 0x9abcdef0)], program(*words))
+
+
+def test_sdwa_integer_output_modifiers_match_the_python_model():
+    exe = binary()
+    instruction = vop2("v_and_b32", 3, 0xF9, 0)
+    for lanes in (32, 64):
+        for flags in (0, 1 << 13, 1 << 14, 2 << 14, 3 << 14):
+            program_words = program(instruction, 6 << 8 | 6 << 16 | 6 << 24 | flags)
+            assert_same(exe, lanes, False, [], program_words)
 
 
 # Float literals the model treats specially: NaN, infinities, signed zeros, subnormals, the largest finite
@@ -470,6 +502,14 @@ def smem(name, sdata, sbase, offset=0, soffset=125, glc=0):
     """Les deux mots d'une instruction SMEM (sdata, sbase en SGPR, décalage signé 21 bits, soffset, glc)."""
     first = 0x3D << 26 | OPCODES["SMEM", name] << 18 | glc << 16 | sdata << 6 | sbase // 2
     return first, soffset << 25 | offset & 0x1FFFFF
+
+
+def test_scalar_hints_match_the_python_model():
+    words = program(sopk("s_version", 7, 0x2000),
+                    *smem("s_atc_probe", 7, 4, offset=0x64),
+                    *smem("s_atc_probe_buffer", 3, 8))
+    for lanes in (32, 64):
+        assert_same(binary(), lanes, True, [(3, 0x12345678), (7, 0xabcdef01)], words)
 
 
 def test_scalar_memory_programs_match_the_python_model():
@@ -849,7 +889,6 @@ def refused_format_accesses():
         (5 | 4 << 3 | 20 << 12, 0, mubuf("buffer_store_format_x", vdata=8, srsrc=2)),         # DST_SEL Y X
         (1 << 12, 0, mtbuf("tbuffer_load_format_xyz", 23, vdata=8, srsrc=2)),                 # 3 sur 16_16
         (1 << 12, 0, mtbuf("tbuffer_load_format_x", 22, vdata=8, srsrc=2, tfe=1)),            # tfe
-        (1 << 12, 0, mtbuf("tbuffer_load_format_d16_x", 22, vdata=8, srsrc=2)),               # _d16
         (IDENTITY | 27 << 12, 0, mubuf("buffer_load_format_x", vdata=8, srsrc=2, offset=1)),  # non aligné
         (IDENTITY | 22 << 12, 0, (lds[0] | 1 << 16, lds[1])),                                 # lds
         (IDENTITY | 22 << 12, 1 << 31, lds),                                                  # SWIZZLE_ENABLE
@@ -1028,8 +1067,7 @@ D16_BIT = 1 << 31                               # mot 2 d'une instruction MIMG :
 
 
 def refused_d16_accesses():
-    """(scalaires, instruction) : les formes _d16 typées (MUBUF, MTBUF) et les images d16, refusées par
-    les deux modèles (rdna2_exec_format et rdna2_image ne les prennent pas en charge)."""
+    """Formes _d16 typées (MUBUF, MTBUF) et images d16, à comparer avec le modèle Python."""
     buffer = buffer_descriptor(2, IDENTITY | 22 << 12)
     image = [(16 + i, value) for i, value in
              enumerate(rdna2_image.encode_image(IMAGE_ADDRESS, rdna2_image.FORMAT_32_FLOAT, 4, 4)) if value]
@@ -1048,15 +1086,30 @@ def refused_d16_accesses():
     return cases
 
 
-def test_refused_d16_typed_and_image_accesses_match_the_python_model():
+def test_d16_typed_and_image_accesses_match_the_python_model():
     exe = binary()
     cases = refused_d16_accesses()
     assert len(cases) >= 28, len(cases)
     for scalars, instruction in cases:
         program_words = words(instruction)
         for lanes in (32, 64):
-            assert run_python(lanes, False, scalars, program_words) == "error untranslated\n", instruction
             assert_same(exe, lanes, False, scalars, program_words)
+
+
+def test_d16_buffer_formats_match_the_python_model():
+    exe = binary()
+    memory = [(0x2000, [0xFFEF_FFAF, 0x8009_7FF7, 0x7F80_0001, 0xFFFF_1234])]
+    for family, encode in (("MUBUF", mubuf), ("MTBUF", mtbuf)):
+        for (kind, name), _ in sorted(OPCODES.items()):
+            if kind != family or "_format_d16" not in name:
+                continue
+            for fmt in range(1, 78):
+                scalars = buffer_descriptor(2, IDENTITY | fmt << 12)
+                instruction = (encode(name, fmt, vdata=8, srsrc=2) if family == "MTBUF"
+                               else encode(name, vdata=8, srsrc=2))
+                program_words = words(vop1("v_mov_b32", 8, LITERAL), 0xCAFE_BABE,
+                                      vop1("v_mov_b32", 9, LITERAL), 0xFACE_1234, instruction)
+                assert_same(exe, 32, False, scalars, program_words, memory)
 
 
 FLOAT32_SPECIALS = (0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x40000000, 0x3F000000, 0x7FC00001,
@@ -1188,8 +1241,22 @@ def vop3p_cases():
     """(programme, exécuté) : les VOP3P hors produits scalaires et les produits scalaires avec op_sel,
     neg ou clamp, que le modèle Python refuse, et un produit scalaire sans modificateur."""
     sources = (V0 + 1, V0 + 2, V0 + 1)
-    cases = [(vop3p(name, 9, sources), False)
+    cases = [(vop3p(name, 9, sources), name in PACKED or name in PKF16_VOP3P)
              for (family, name) in sorted(OPCODES) if family == "VOP3P" and name not in DOT_OPERATIONS]
+    cases += [(vop3p(name, 9, sources, **flags), runs)
+              for name in PACKED for flags, runs in (({"op_sel": 5, "op_sel_hi": 2}, True),
+                                                      ({"neg_lo": 1}, False),
+                                                      ({"clamp": 1}, not any(x in name for x in ("mul", "shr", "shl"))))]
+    # Packed f16 (VOP3P): every modifier is defined, the clamp included.
+    cases += [(vop3p(name, 9, sources, **flags), True)
+              for name in PACKED_F16 for flags in ({"op_sel": 5, "op_sel_hi": 2}, {"neg_lo": 1}, {"neg_hi": 6}, {"clamp": 1})]
+    # Mixed precision and f16 dot product: op_sel[i] needs op_sel_hi[i]; op_sel[2] and neg_hi[2] are refused.
+    cases += [(vop3p("v_fma_mix_f32", 9, sources, op_sel=2), True),
+              (vop3p("v_fma_mixlo_f16", 9, sources, op_sel=1, op_sel_hi=0b110), False),
+              (vop3p("v_fma_mixhi_f16", 9, sources, neg_lo=4, neg_hi=1, clamp=1), True),
+              (vop3p("v_dot2_f32_f16", 9, sources, op_sel=4), False),
+              (vop3p("v_dot2_f32_f16", 9, sources, neg_hi=4), False),
+              (vop3p("v_dot2_f32_f16", 9, sources, neg_lo=4, clamp=1), True)]
     cases += [(vop3p("v_dot4_u32_u8", 9, sources, **flags), False)
               for flags in ({"op_sel": 1}, {"op_sel_hi": 0b011}, {"neg_lo": 2}, {"neg_hi": 4}, {"clamp": 1})]
     return cases + [(vop3p("v_dot2_i32_i16", 9, sources), True)]
@@ -1210,9 +1277,80 @@ def test_vop3p_forms_match_the_python_model():
     assert_select_cases(vop3p_cases())
 
 
+PKF16_SPECIAL_WORDS = (0x00000000, 0x80000000, 0x3C003C00, 0xBC00BC00, 0x7C007C00, 0xFC00FC00, 0x7E007E00,
+                       0x7BFF7BFF, 0x00010001, 0x83FF83FF, 0x3F800000, 0xBF800000, 0x7F800000, 0xFF800000,
+                       0x7FC00000, 0x7F800001, 0x00800000, 0x7F7FFFFF, 0x3C014000)
+PKF16_VOP3P_NAMES = ("v_pk_fma_f16", "v_pk_add_f16", "v_pk_mul_f16", "v_pk_min_f16", "v_pk_max_f16",
+                     "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16", "v_dot2_f32_f16")
+PKF16_PROGRAMS = 200
+
+
+def pkf16_operand(rng):
+    """A 32-bit operand: halves and f32 values at the edges (NaN, infinities, subnormals, ties) or random bits."""
+    return rng.choice(PKF16_SPECIAL_WORDS) if rng.random() < 0.4 else rng.getrandbits(32)
+
+
+def pkf16_program(rng):
+    """Words of one program: v1 to v3 loaded with operands, then a packed f16 form with random modifiers."""
+    setup = []
+    for index in (1, 2, 3):
+        setup += [vop1("v_mov_b32", index, LITERAL), pkf16_operand(rng)]
+    sources = (V0 + 1, V0 + 2, V0 + 3) if rng.random() < 0.8 else (V0 + 1, rng.choice((240, 242, 245, 248, 128)), V0 + 3)
+    if rng.random() < 0.8:
+        flags = {"op_sel": rng.randrange(8), "op_sel_hi": rng.randrange(8), "neg_lo": rng.randrange(8),
+                 "neg_hi": rng.randrange(8), "clamp": rng.randrange(2)}
+        if rng.random() < 0.5:
+            flags = {"clamp": flags["clamp"]}
+        instruction = vop3p(rng.choice(PKF16_VOP3P_NAMES), 9, sources, **flags)
+    elif rng.random() < 0.5:
+        instruction = vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), op_sel=rng.randrange(16),
+                           clamp=rng.randrange(2), abs_bits=rng.randrange(8), neg=rng.randrange(8))
+    else:
+        instruction = vop2("v_pk_fmac_f16", 9, V0 + 1, 2)
+    return words(*setup, instruction)
+
+
+def test_pkf16_random_programs_match_the_python_model():
+    exe = binary()
+    rng = random.Random(SEED + 3)
+    for _ in range(PKF16_PROGRAMS):
+        program_words = program(*pkf16_program(rng))
+        for lanes in (32, 64):
+            assert_same(exe, lanes, False, [], program_words)
+
+
+def test_pk_fmac_forms_match_the_python_model():
+    assert_select_cases([(vop2("v_pk_fmac_f16", 9, V0 + 1, 2), True),
+                         (vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), clamp=1), True),
+                         (vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), op_sel=1), False),
+                         (vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), neg=1), False)])
+
+
 def vop3(name, vdst, sources, op_sel=0, clamp=0, abs_bits=0, neg=0, omod=0):
     low = 0x35 << 26 | OPCODES["VOP3", name] << 16 | vdst | abs_bits << 8 | op_sel << 11 | clamp << 15
     return low, sources[0] | sources[1] << 9 | sources[2] << 18 | omod << 27 | neg << 29
+
+
+def test_vop3_integer_clamp_matches_the_python_model():
+    exe = binary()
+    names = ("v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_add_co_u32",
+             "v_sub_co_u32", "v_subrev_co_u32", "v_ashrrev_i32", "v_add3_u32", "v_mad_u64_u32")
+    for lanes in (32, 64):
+        for name in names:
+            for a, b in ((0xFFFFFFFF, 2), (0, 2), (2, 0xFFFFFFFF)):
+                setup = (vop1("v_mov_b32", 1, LITERAL), a, vop1("v_mov_b32", 2, LITERAL), b)
+                instruction = vop3(name, 8, (V0 + 1, V0 + 2, 128), clamp=1, abs_bits=4)
+                assert_same(exe, lanes, False, [], program(*words(*setup, instruction)))
+
+
+def test_vop3_carry_mask_at_last_scalar_register():
+    exe = binary()
+    instruction = vop3("v_subrev_co_ci_u32", 8, (V0, 128, 128), abs_bits=7, op_sel=15)
+    # SDST uses bits 8-14, including the op_sel bits: all ones designate s127.
+    for lanes in (32, 64):
+        program_words = program(*instruction)
+        assert run_python(lanes, False, [], program_words).startswith("steps" if lanes == 32 else "error untranslated")
+        assert_same(exe, lanes, False, [], program_words)
 
 
 def operand_select_cases():
@@ -1249,6 +1387,22 @@ def compare_operands():
             vop2("v_sub_f32", 4, LITERAL, 3), 0x41000000,
             vop2("v_lshlrev_b32", 5, 144, 4),
             vop2("v_mul_f32", 6, LITERAL, 4), 0x7F7FFFFF]
+
+
+def test_integer16_compares_match_the_python_model():
+    exe = binary()
+    names = [name for name in COMPARE32_NAMES if name.endswith(("_i16", "_u16"))]
+    assert len(names) == 24
+    setup = [vop2("v_mul_u32_u24", 1, LITERAL, 0), 0x80018001,
+             vop2("v_xor_b32", 2, LITERAL, 1), 0xFFFF8000]
+    for lanes in (32, 64):
+        for name in names:
+            for instruction in ((vopc(name, V0 + 1, 2),),
+                                (vopc(name, 0xF9, 2), 1 | 5 << 16 | 4 << 24),
+                                (vopc(name, 0xFA, 2), 0),
+                                vop3(name, 20, (V0 + 1, V0 + 2, 128)),
+                                vop3(name, 20, (V0 + 1, V0 + 2, 128), op_sel=1)):
+                assert_same(exe, lanes, False, [], program(*words(*setup, instruction)))
 
 
 def sdwa_compare_word(rng, lanes, vsrc1):

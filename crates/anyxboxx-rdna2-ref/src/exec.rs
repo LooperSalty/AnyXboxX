@@ -84,7 +84,7 @@ fn execute_vector(
     vector::execute(wave, name, &fields, literal)
 }
 
-/// Runs one VOPC instruction. The 32-bit compares take the SDWA form (`ext_compare`) and refuse DPP16
+/// Runs one VOPC instruction. The integer 16-bit and 32-bit compares take SDWA and refuse DPP16
 /// and DPP8; the 64-bit and class compares read an extension code as a plain source, which fails on the
 /// first active lane, as in the Python (they are dispatched before its SDWA and DPP check).
 fn execute_compare(
@@ -193,6 +193,12 @@ pub fn step(wave: &mut Wave, data: &[u8]) -> Result<bool, Error> {
         // Two words: the offsets, the addresses and the data registers are in the second.
         let wide = u64::from(word) | u64::from(word_at(data, wave.pc + DWORD)) << 32;
         ds::execute(wave, &name, wide)?;
+        wave.pc = next_pc;
+        return Ok(true);
+    }
+    if family == "VOP2" && name == "v_pk_fmac_f16" {
+        // Ahead of the generic VOP2 path: the packed form refuses its own SDWA and DPP sources.
+        crate::pkf16::execute_fmac_vop2(wave, word, literal)?;
         wave.pc = next_pc;
         return Ok(true);
     }

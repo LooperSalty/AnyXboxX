@@ -122,6 +122,8 @@ fn split(name: &str) -> Option<(bool, Test, &'static str)> {
         "f64" if FLOAT_NAMES.contains(&test) => "f64",
         "u32" if INTEGER_NAMES.contains(&test) => "u32",
         "i32" if INTEGER_NAMES.contains(&test) => "i32",
+        "u16" if INTEGER_NAMES[1..7].contains(&test) => "u16",
+        "i16" if INTEGER_NAMES[1..7].contains(&test) => "i16",
         "u64" if INTEGER_NAMES.contains(&test) => "u64",
         "i64" if INTEGER_NAMES.contains(&test) => "i64",
         _ => return None,
@@ -174,20 +176,8 @@ pub fn read64(wave: &Wave, code: u32, lane: usize, is_float: bool) -> Result<u64
     if code < 128 || (128..=208).contains(&code) {
         return Ok(wave.read_scalar(code, None, 2)? & MASK64);
     }
-    let inline_double = match code {
-        240 => Some(0.5),
-        241 => Some(-0.5),
-        242 => Some(1.0),
-        243 => Some(-1.0),
-        244 => Some(2.0),
-        245 => Some(-2.0),
-        246 => Some(4.0),
-        247 => Some(-4.0),
-        248 => Some(std::f64::consts::FRAC_1_PI / 2.0),
-        _ => None,
-    };
-    match inline_double {
-        Some(value) if is_float => Ok(value.to_bits()),
+    match crate::float::inline_double(code) {
+        Some(value) if is_float => Ok(value),
         _ => Err(Error::Untranslated(format!(
             "opérande 64 bits {code} non pris en charge"
         ))),
@@ -209,13 +199,15 @@ pub fn execute(
     let destination = if writes_exec { EXEC_LO } else { VCC_LO };
     let mut mask = 0u64;
     match kind {
-        "f32" | "u32" | "i32" => {
+        "f32" | "u32" | "i32" | "u16" | "i16" => {
             for lane in wave.active()? {
                 let a = wave.read_lane(src0, lane, literal)?;
                 let b = wave.v[vsrc1 as usize][lane];
                 let hit = match kind {
                     "f32" => float_test(test, bits_float(a), bits_float(b)),
                     "u32" => integer_test(test, i128::from(a), i128::from(b)),
+                    "u16" => integer_test(test, i128::from(a as u16), i128::from(b as u16)),
+                    "i16" => integer_test(test, i128::from(a as i16), i128::from(b as i16)),
                     _ => integer_test(test, i128::from(a as i32), i128::from(b as i32)),
                 };
                 mask |= u64::from(hit) << lane;
@@ -277,6 +269,12 @@ pub fn compare32(name: &str) -> Option<(bool, Compare32)> {
     let compare: Box<dyn Fn(u32, u32) -> bool> = match kind {
         "f32" => Box::new(move |a, b| float_test(test, bits_float(a), bits_float(b))),
         "u32" => Box::new(move |a, b| integer_test(test, i128::from(a), i128::from(b))),
+        "u16" => {
+            Box::new(move |a, b| integer_test(test, i128::from(a as u16), i128::from(b as u16)))
+        }
+        "i16" => {
+            Box::new(move |a, b| integer_test(test, i128::from(a as i16), i128::from(b as i16)))
+        }
         "i32" => {
             Box::new(move |a, b| integer_test(test, i128::from(a as i32), i128::from(b as i32)))
         }

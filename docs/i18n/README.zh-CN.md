@@ -12,7 +12,7 @@
 > - 🆕 **世界中约 14 fps（Series X，RTX 4070 SUPER，2026-11-25 测得）**：`third_party/victory` 以 Neptune (VIctory Edit.) 2026-11-25c 为基础，并采用当天测得的一组设置（中位数 13.8 fps，最后一分钟 15.6–17 fps，每帧 72.5 ms；此前在 `main` 的启动器设置下中位数为 10.9 fps，均为 Series X 上的自动 13 分钟运行，无崩溃）。下面的数字是用旧基础 `80d58f8` 测得的。
 > - 🆕 **画质优先模式（维护者于 2026-11-25 实测）**：`tools\lancer_victory.ps1 -Quality`（每帧重新读取窗口副本，使用更小的池）光照和纹理明显更好，约 7-9 fps，纹理拒绝次数大幅减少（51-93，对比约 300）。默认仍是快速配置（约 14-17 fps，使用 PR #272 在世界中 7 分钟的中位数为 13.7）。通过 `-Override @{ VICTORY_X = '...' }`，任何人都可以在不修改启动器的情况下尝试某项设置。
 > - ✅ **船可以浮起来了**（Exorion1er 的 PR #263：海洋高度图会被拷回，供游戏的 CPU 使用）。
-> - 🦀 **Rust 移植，分支 `rust/full`（尚未并入 `main`）**：原生启动器（PR #249）和 GPU 运行器 `anyxboxx_gpu_run.exe`（PR #266）现已改用 Rust；RDNA 2 参考解释器已移植到 Rust（crate `anyxboxx-rdna2-ref`），能逐字节一致地执行 Python 模型执行的所有指令（LLVM 的 1,490 种编码中的 1,060 种），并带有 28 个一致性测试；xgameruntime 的存档、本地存储、商店以及 HDR/DXGI 对象已移植。待移植：HLSL 重编译器、xgameruntime 的其余部分，然后移除 C++ 和 Python。状态：[docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/rust/full/docs/rust-full-status.md)。
+> - 🦀 **Rust 移植，已并入 `main`**：`anyxboxx run`（取代 `tools/lancer_victory.ps1`）和图形启动器 `anyxboxx-launcher`（[安装指南](https://github.com/LooperSalty/AnyXboxX/blob/main/docs/launcher.md)，`launcher-v0.1.0` 发布中提供预编译版）无需 Python 或 C++ 即可启动游戏；原生启动器（PR #249）、GPU 运行器 `anyxboxx_gpu_run.exe`（PR #266）以及运行时 DLL xmem、kernelx、d3d12_xs、anyxboxx_tls 和 XCRDAPI 均为 Rust；RDNA 2 参考解释器（crate `anyxboxx-rdna2-ref`）在 36 个一致性测试中与 Python 模型逐字节一致；xgameruntime 已移植到 Rust 并与 C++ DLL 对照，目前发布的仍是 C++ DLL。待移植：HLSL 重编译器，然后移除 C++ 和 Python。状态：[docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/main/docs/rust-full-status.md)。
 > - ⛔ **已知限制（进行中）**：在 32 GB 内存的 PC 上，系统内存是瓶颈（进程占用约 22-25 GB：游戏自身的内存，加上 CPU 镜像，再加上溢出到共享内存的显存）；12 GB 显卡的纹理空间不足（每次会话数百次拒绝），导致世界流式加载时帧率跌到 1-6 fps。
 > - ✅ GTA VI 的 Xbox Series 1.0.2.1 版本**可以在 PC 上启动**：启动、档案界面、首次运行设置、法律声明界面、加载、暂停菜单。菜单为 30 fps。
 > - ✅ 已**到达游戏世界并显示**：角色可在玩家控制下移动，3D 画面可显示，约 4 分 20 秒的测试中为 4.8 到 5.4 帧/秒，每帧约 6,550 次绘制（维护者实测，Windows 11，RTX 4070 Super，VIctory 日志）。启动动画不再闪烁（观察）。此前从未被点亮的辐照度缓存（过场动画某一帧的 PIX 捕获中调度为 0 次），现在其两个着色 shader 已能翻译，对应的管线在游戏中创建并绑定（观察）。
@@ -35,7 +35,7 @@ AnyXboxX 加载 Xbox GDK 可执行文件（PE32+ x86-64 格式），并用 Unico
 AnyXboxX 专注于一个版本：**Xbox Series 版《Grand Theft Auto VI》，版本 1.0.2.1**。只翻译这款游戏需要的部分（它导入的系统函数、它使用的着色器和 Direct3D 12.x 方法）。待这部分翻译完成后，再尝试其他游戏。本项目基于面向同一版本的 [VIctory](https://github.com/Marvisak/VIctory)（Marvisak，GPL-3.0 或更高版本）：它复制在 `third_party/victory` 中，以分支仓库 `fxceless/victory-fork`（GPL-3.0）的提交 `7b0f736` 为起点。感谢 Marvisak 和这些 pull request 的作者，逐一致谢见 [THIRD_PARTY.md](../../THIRD_PARTY.md)。
 
 > [!IMPORTANT]
-> **游戏目前无法游玩。** 当前进展见本页顶部的方框。本仓库不包含任何游戏文件、密钥或可执行文件，也不说明如何获取它们。
+> **游戏可以运行。** GTA VI 1.0.2.1 能启动、播放过场动画，并以约 14 fps 进入开放世界（Series X 模式，RTX 4070 SUPER，2026-11-25 实测）；部分画面仍缺失，光线追踪已关闭。 当前进展见本页顶部的方框。本仓库不包含任何游戏文件、密钥或可执行文件，也不说明如何获取它们。
 
 在线状态页面（含所需磁盘空间）：**[loopersalty.github.io/AnyXboxX](https://loopersalty.github.io/AnyXboxX/)**。
 
@@ -64,10 +64,6 @@ AnyXboxX 专注于一个版本：**Xbox Series 版《Grand Theft Auto VI》，�
 
 C++ 运行时会为游戏 DXGI 交换链的每次 `Present` 计时，即使 DXGI 是由游戏的某个 DLL（SDL3）动态加载的也一样。它由此得出每秒帧数、单帧平均耗时和“1% 低值”（最慢的 1% 帧的速率，可以反映卡顿）。`--fps` 会把这些数值显示在窗口标题中。`--banc-perf` 测量 N 秒，不计入第一秒（加载），并给出“稳定 60 帧/秒”的结论（未达标时返回码为 2）。不使用这些选项时，不会拦截任何内容。
 
-![SimpleTriangle：每秒帧数](../images/fps-simpletriangle.svg)
-
-![testgdk：每秒帧数](../images/fps-testgdk.svg)
-
 两个测试游戏都在关闭垂直同步的情况下运行：原生模式下，SimpleTriangle 约 11,700 帧/秒，testgdk 约 12,600 帧/秒。
 
 ## 项目进展
@@ -95,7 +91,7 @@ C++ 运行时会为游戏 DXGI 交换链的每次 `Present` 计时，即使 DXGI
 | 396 个 GDK 函数的表：接口和方法编号，提取自 `xgameruntime.lib`（`tools/gdk_interfaces.py`） | ✅ 已完成 |
 | `XTaskQueue`、`XAsync`、`XThread` 由 AnyXboxX 提供：testgdk 无需 Windows 的运行时即可运行 | ✅ 已完成 |
 | 其他 GDK 接口：委托给 Windows 的 GDK 运行时，由跟踪列出名称 | 🟡 进行中 |
-| 1700+ 个自动化测试 | ✅ 已完成 |
+| 1800+ 个自动化测试 | ✅ 已完成 |
 | D3D12.X：`D3D12XboxCreateDevice`、主机的 `ID3D12*` 接口和 `DXGIXPresentArray`，由 TomBox 的 Rust 版 `d3d12_xs.dll` 提供（MIT，48 个已实现导出，用 `tools/build_tombox.py d3d12_xs` 构建，通过 `ANYXBOXX_D3D12_XS=<路径>` 加载）；没有主机可执行文件，此处无法测试 | 🟡 进行中 |
 | 用 TomBox（Rust，GPL-3.0）的主机库补足 AnyXboxX 缺少的部分：`xg_xs`（纹理布局，23 个导出）和完整的 `xmem`（38 个导出），通过 `ANYXBOXX_TOMBOX_DIR=<文件夹>` 使用；由 `tools/build_tombox.py xg_xs xmem` 构建 | 🟡 进行中 |
 | 离线 `XUser`：始终已登录的本地档案、可设置的游戏玩家标签（`ANYXBOXX_GAMERTAG`）、testgdk 登录成功 | ✅ 已完成 |
@@ -114,7 +110,6 @@ C++ 运行时会为游戏 DXGI 交换链的每次 `Present` 计时，即使 DXGI
 | RDNA 2 反汇编器的操作数与 LLVM 文本一致：标量和 VOP1/VOPC 100%、DS 100%、EXP 100%、SMEM 96.5%（最大值：其余编码 LLVM 有两种写法） | ✅ 已完成 |
 | 首个 RDNA 2 顶点着色器和像素着色器已用 D3D12 绘制（`anyxboxx_gpu_run.exe --draw`）：每个顶点和每个像素都与参考解释器一致（GPU 和 WARP） | ✅ 已完成 |
 | 重编译的 RDNA 2 着色器中的纹理：T#/S# 描述符和 `image_sample`（2D、最近纹素、wrap 或 clamp-to-edge、8_8_8_8_UNORM 和 32_32_32_32_FLOAT），包括带纹理的像素着色器在内，在 GPU 和 WARP 上与参考解释器一致；描述符布局来自 Leonida 和 Mesa | ✅ 已完成 |
-| 第二个 RDNA 2 → SPIR-V（Vulkan）转换器：Leonida 的转换器（GPL-3.0），原样复制到 `third_party/leonida/`，由 AnyXboxX 自己的反汇编器提供输入，无需 `llvm-mc`；支持顶点、像素和计算着色器；包中 `XboxBvhBuilder.dll` 自带的 52 个主机着色器中有 51 个可转换（用 `tools/fssm_mesure.py` 在本地测量）（`scarlett.py --rdna2 <shader.bin> --spirv ps`） | 🟡 进行中 |
 | TomBox 更新到最新版本（D3D12.X：按他们的统计 200 个方法中已实现 194 个），并额外构建 4 个主机库，从 `ANYXBOXX_TOMBOX_DIR` 提供：`d3d12_x`（ESRAM）、`XAudio2_9`（XMA 声部）、`xapu`、`xgs12`；`tools/build_tombox.py d3d12_xs xg_xs xmem d3d12_x xaudio2_9 xapu xgs12` | 🟡 进行中 |
 | 将主机 DXIL 转换为 PC DXIL（`dxil-ms-xb2` → `dxil-ms-dx`，无需经过 HLSL）：Xbox2Windows 的工具（MIT），连同其测试原样复制到 `third_party/xbox2windows/`；`python third_party/xbox2windows/tools/dxil_retarget.py <输入> <输出>` 或 `--pe <game.exe>` | ✅ 已完成 |
 | 拉取请求检查：每个拉取请求都运行 lint 并核对 9 个 README 的同步（行、图片、测试数量） | ✅ 已完成 |
@@ -128,17 +123,6 @@ C++ 运行时会为游戏 DXGI 交换链的每次 `Present` 计时，即使 DXGI
 | 在运行时动态加载 DLL（`LoadLibrary` + `DllMain`） | ⏳ 待完成 |
 | 将 D3D12.X 图形转换为 Direct3D 12 / Vulkan | ⏳ 待完成 |
 | 主机 XMA2 音频：由 TomBox 将 FFmpeg 解码器移植到 Rust 的版本解码为 WAV（LGPL，在公开 FATE 样本上与 FFmpeg 最多相差 1）；`anyxboxx_xma <in.xma> <out.wav>`，单流文件 | 🟡 进行中 |
-
-<table>
-<tr>
-<td><img src="../images/demo-virage.png" alt="汽车向右转弯" width="380"></td>
-<td><img src="../images/rapport-compatibilite.png" alt="演示的兼容性报告" width="380"></td>
-</tr>
-<tr>
-<td align="center">演示会响应键盘方向键。</td>
-<td align="center">日志中显示兼容性报告。</td>
-</tr>
-</table>
 
 ## 试用演示
 
@@ -167,8 +151,6 @@ cmake --build runtime/build --config Release
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <dossier ou fichier .exe> [dossiers de DLL…]
 ```
 
-![由 AnyXboxX 以原生模式启动的 SimpleTriangle](../images/simpletriangle-anyxboxx.png)
-
 AnyXboxX 会加载可执行文件本身，并像 Wine 一样直接在处理器上运行它。Xbox 运行时（`xgameruntime.dll`）由 AnyXboxX 提供；窗口和 DirectX 12 则使用电脑自身的。**注意：在原生模式下，程序没有被隔离。** 请仅对可信的程序使用此模式；`--rapport` 和 `--banc` 仍然在 Unicorn 中隔离运行。`ANYXBOXX_TRACE=1` 会显示被拦截的调用。详情：[docs/test-game.md](../test-game.md)。
 
 ## 以隔离模式运行游戏包
@@ -191,15 +173,11 @@ AnyXboxX 会加载可执行文件本身，并像 Wine 一样直接在处理器�
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc <dossier>
 ```
 
-![针对 Scarlett 包中 DLL 的测试台](../images/banc-dll.svg)
-
 详细结果：[docs/progress.md](../progress.md)。与原生运行结果对比的免费测试游戏：[docs/test-game.md](../test-game.md)。目标之后可以再跟一个额外的 DLL 文件夹（例如 Visual C++ 的 DLL）：`--rapport <cible> <dossier>`。
 
 报告会列出导入的函数、已模拟的百分比以及缺失的函数。在界面中，**Open an Xbox folder…**（打开 Xbox 文件夹）按钮会读取 `MicrosoftGame.Config`，显示该报告，然后启动程序；每个未模拟的调用都会出现在日志中。
 
 ## 架构
-
-![AnyXboxX 模块示意图](../images/architecture.svg)
 
 | 模块 | 作用 |
 |---|---|

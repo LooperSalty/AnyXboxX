@@ -89,8 +89,8 @@ def test_literal_and_fused_multiply_add():
 
 
 def test_untranslated_instruction_is_named():
-    data = struct.pack("<3I", 0xF03C_0000, 0, sopp("s_endpgm"))     # image_atomic_swap (famille MIMG)
-    with pytest.raises(rdna2_exec.Untranslated, match="instruction non traduite : image_atomic_swap"):
+    data = struct.pack("<3I", 0xF094_0000, 0, sopp("s_endpgm"))     # image_sample_b (famille MIMG)
+    with pytest.raises(rdna2_exec.Untranslated, match="instruction non traduite : image_sample_b"):
         rdna2_exec.run(data)
 
 

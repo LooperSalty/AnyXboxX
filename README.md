@@ -12,7 +12,7 @@
 > - 🆕 **~14 fps in the world (Series X, RTX 4070 SUPER), measured 2026-11-25**: `third_party/victory` now stands on Neptune (VIctory Edit.) 2026-11-25c with the set measured the same day (median 13.8 fps, 15.6 to 17 fps over the last minute, 72.5 ms a frame; before it, 10.9 fps median with the launcher settings of `main`, from automated 13-minute Series X runs, no crash). The figures below were measured with the previous base `80d58f8`.
 > - 🆕 **Picture-first mode, measured by the maintainer on 2026-11-25**: `tools\lancer_victory.ps1 -Quality` (window copies read fresh each frame, smaller pools) gives clearly better lighting and textures, about 7-9 fps, and far fewer texture refusals (51-93 against about 300). The default stays the fast set (about 14-17 fps, median 13.7 over 7 minutes in the world with PR #272). `-Override @{ VICTORY_X = '...' }` lets anyone try a setting without editing the launcher.
 > - ✅ **Boats float** (PR #263 by Exorion1er: the ocean height maps are copied back for the title's CPU).
-> - 🦀 **Rust port, branch `rust/full` (not yet in `main`)**: the native launcher (PR #249) and the GPU runner `anyxboxx_gpu_run.exe` (PR #266) are now Rust; the RDNA 2 reference interpreter is ported to Rust (crate `anyxboxx-rdna2-ref`) and runs every instruction the Python model runs (1,060 of the 1,490 LLVM encodings), byte for byte, with 28 parity tests; the saves, local storage, store and HDR/DXGI objects of xgameruntime are ported. Still to port: the HLSL recompiler, the rest of xgameruntime, then removing the C++ and Python. Status: [docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/rust/full/docs/rust-full-status.md).
+> - 🦀 **Rust port, now in `main`**: `anyxboxx run` (replaces `tools/lancer_victory.ps1`) and the graphical launcher `anyxboxx-launcher` ([install guide](https://github.com/LooperSalty/AnyXboxX/blob/main/docs/launcher.md), prebuilt in the `launcher-v0.1.0` release) start the game without Python or C++; the native launcher (PR #249), the GPU runner `anyxboxx_gpu_run.exe` (PR #266) and the runtime DLLs xmem, kernelx, d3d12_xs, anyxboxx_tls and XCRDAPI are Rust; the RDNA 2 reference interpreter (crate `anyxboxx-rdna2-ref`) matches the Python model byte for byte in 36 parity tests; xgameruntime is ported to Rust and checked against the C++ DLL, which is still the one shipped. Still to port: the HLSL recompiler, then removing the C++ and Python. Status: [docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/main/docs/rust-full-status.md).
 > - ⛔ **Known limits (work in progress)**: system RAM is the bottleneck on a 32 GB PC (the process holds about 22-25 GB: the title's own memory, plus CPU mirrors, plus VRAM spilled to shared memory), and a 12 GB card runs out of texture room (hundreds of refusals per session), which causes dips to 1-6 fps while the world streams.
 > - ✅ The Xbox Series 1.0.2.1 build of GTA VI **launches** on PC: boot, profile screen, first-run settings, legal screens, loading, pause menu. Menus run at 30 fps.
 > - ✅ It reaches **the world and displays it**: the character moves under the player's control and the 3D image is shown, at 4.8 to 5.4 frames per second with about 6,550 draws per frame (measured by the maintainer, Windows 11, RTX 4070 Super, VIctory log, about 4 min 20). The startup animation does not flicker (observed). The irradiance cache, never lit before (0 dispatch in a PIX capture of a cutscene frame), now has its two shade shaders translated, with their pipelines created and bound in game (observed).
@@ -35,7 +35,7 @@ AnyXboxX loads Xbox GDK executables (PE32+ x86-64 format) and runs their code wi
 AnyXboxX is specialised on one build: **Grand Theft Auto VI for Xbox Series, version 1.0.2.1**. Only what this game needs is translated (the system functions it imports, the shaders and the Direct3D 12.x methods it uses). Other games will be tried once that translation is complete. The project builds on [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 or later), which targets the same build: it is copied into `third_party/victory`, starting from the fork `fxceless/victory-fork` (GPL-3.0) at commit `7b0f736`. Thanks to Marvisak and to the authors of those pull requests, credited one by one in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 > [!IMPORTANT]
-> **The game is not playable.** See the box at the top of this page for where we are. This repository contains no game files, keys or executable, and does not explain how to get them.
+> **The game runs.** GTA VI 1.0.2.1 starts, plays its cutscenes and reaches the open world at about 14 fps (Series X mode, RTX 4070 SUPER, measured on 2026-11-25); some graphics are still missing and ray tracing is off. See the box at the top of this page for where we are. This repository contains no game files, keys or executable, and does not explain how to get them.
 
 Live status page, with the disk space to plan for: **[loopersalty.github.io/AnyXboxX](https://loopersalty.github.io/AnyXboxX/)**.
 
@@ -64,10 +64,6 @@ The chart is regenerated by `scarlett.py --traduction <package folder> docs/imag
 
 The C++ runtime times every `Present` of the game's DXGI swap chain, including when DXGI is loaded dynamically by one of the game's DLLs (SDL3). From this it derives the frames per second, the average frame time and the "1% low" (the rate of the slowest 1% of frames, which reveals stutter). `--fps` shows these values in the window title. `--banc-perf` measures for N seconds, leaving out the first one (loading), and gives a "constant 60 fps" verdict (exit code 2 if the target is missed). Without these options, nothing is intercepted.
 
-![SimpleTriangle: frames per second](docs/images/fps-simpletriangle.svg)
-
-![testgdk: frames per second](docs/images/fps-testgdk.svg)
-
 Both test games run without vertical sync: about 11,700 fps for SimpleTriangle and 12,600 fps for testgdk, in native mode.
 
 ## Project progress
@@ -95,7 +91,7 @@ Both test games run without vertical sync: about 11,700 fps for SimpleTriangle a
 | Table of the 396 GDK functions: interface and method number, extracted from `xgameruntime.lib` (`tools/gdk_interfaces.py`) | ✅ done |
 | `XTaskQueue`, `XAsync`, `XThread` served by AnyXboxX: testgdk runs without the Windows runtime | ✅ done |
 | Other GDK interfaces: delegated to the Windows GDK runtime, named by the trace | 🟡 in progress |
-| 1700+ automated tests | ✅ done |
+| 1800+ automated tests | ✅ done |
 | D3D12.X: `D3D12XboxCreateDevice`, console `ID3D12*` interfaces and `DXGIXPresentArray`, served by TomBox's Rust `d3d12_xs.dll` (MIT, 48 implemented exports, built by `tools/build_tombox.py d3d12_xs`, loaded with `ANYXBOXX_D3D12_XS=<path>`); untestable here without a console executable | 🟡 in progress |
 | Console libraries from TomBox (Rust, GPL-3.0) for what AnyXboxX lacks: `xg_xs` (texture layouts, 23 exports) and full `xmem` (38 exports), with `ANYXBOXX_TOMBOX_DIR=<folder>`; built by `tools/build_tombox.py xg_xs xmem` | 🟡 in progress |
 | Offline `XUser`: always-signed-in local profile, configurable gamertag (`ANYXBOXX_GAMERTAG`), testgdk sign-in succeeds | ✅ done |
@@ -114,7 +110,6 @@ Both test games run without vertical sync: about 11,700 fps for SimpleTriangle a
 | RDNA 2 disassembler operands identical to LLVM's text: scalar and VOP1/VOPC 100%, DS 100%, EXP 100%, SMEM 96.5% (the maximum: LLVM writes the other encodings two ways) | ✅ done |
 | First RDNA 2 vertex and pixel shaders drawn with D3D12 (`anyxboxx_gpu_run.exe --draw`): every vertex and every pixel identical to the reference interpreter, on the GPU and on WARP | ✅ done |
 | Textures in recompiled RDNA 2 shaders: T#/S# descriptors and `image_sample` (2D, nearest texel, wrap or clamp-to-edge, 8_8_8_8_UNORM and 32_32_32_32_FLOAT), identical to the reference interpreter on the GPU and on WARP, including a textured pixel shader; descriptor layout from Leonida and Mesa | ✅ done |
-| Second RDNA 2 → SPIR-V (Vulkan) translator: Leonida's (GPL-3.0), copied unchanged in `third_party/leonida/` and fed by AnyXboxX's own disassembler, without `llvm-mc`; vertex, pixel and compute shaders; 51 of the 52 console shaders shipped in the package's `XboxBvhBuilder.dll` translate, measured locally with `tools/fssm_mesure.py` (`scarlett.py --rdna2 <shader.bin> --spirv ps`) | 🟡 in progress |
 | TomBox updated to its latest version (D3D12.X: 194 of 200 methods by their count) and 4 more of its console libraries built and served from `ANYXBOXX_TOMBOX_DIR`: `d3d12_x` (ESRAM), `XAudio2_9` (XMA voices), `xapu`, `xgs12`; `tools/build_tombox.py d3d12_xs xg_xs xmem d3d12_x xaudio2_9 xapu xgs12` | 🟡 in progress |
 | Console DXIL → PC DXIL retarget (`dxil-ms-xb2` → `dxil-ms-dx`, without going through HLSL): Xbox2Windows' tool (MIT), copied unchanged in `third_party/xbox2windows/` with its test; `python third_party/xbox2windows/tools/dxil_retarget.py <in> <out>` or `--pe <game.exe>` | ✅ done |
 | Pull request checks: lint and the 9 READMEs kept in sync (rows, images, test count) on every pull request | ✅ done |
@@ -128,17 +123,6 @@ Both test games run without vertical sync: about 11,700 fps for SimpleTriangle a
 | Dynamic loading of a DLL at run time (`LoadLibrary` + `DllMain`) | ⏳ to do |
 | D3D12.X graphics to Direct3D 12 / Vulkan | ⏳ to do |
 | Console XMA2 audio: decoded to WAV by TomBox's Rust port of FFmpeg's decoder (LGPL, 1 LSB from FFmpeg on the public FATE sample); `anyxboxx_xma <in.xma> <out.wav>`, single-stream files | 🟡 in progress |
-
-<table>
-<tr>
-<td><img src="docs/images/demo-virage.png" alt="The car turns to the right" width="380"></td>
-<td><img src="docs/images/rapport-compatibilite.png" alt="Compatibility report of the demo" width="380"></td>
-</tr>
-<tr>
-<td align="center">The demo responds to the keyboard arrow keys.</td>
-<td align="center">The log shows the compatibility report.</td>
-</tr>
-</table>
 
 ## Try the demo
 
@@ -167,8 +151,6 @@ The compiled demo program is `PrototypeScarlett/demo.pe`; its source code is `Pr
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <dossier ou fichier .exe> [dossiers de DLL…]
 ```
 
-![SimpleTriangle launched by AnyXboxX in native mode](docs/images/simpletriangle-anyxboxx.png)
-
 AnyXboxX loads the executable itself and runs it directly on the processor, like Wine. The Xbox runtime (`xgameruntime.dll`) is provided by AnyXboxX; the window and DirectX 12 are the PC's. **Warning: in native mode, the program is not isolated.** Reserve this mode for trusted programs; `--rapport` and `--banc` remain isolated inside Unicorn. `ANYXBOXX_TRACE=1` displays the intercepted calls. Details: [docs/test-game.md](docs/test-game.md).
 
 ## Run a package in isolated mode
@@ -191,15 +173,11 @@ The test bench loads every PE module in a folder and runs their initialization:
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc <dossier>
 ```
 
-![Test bench on the DLLs of a Scarlett package](docs/images/banc-dll.svg)
-
 Detailed results: [docs/progress.md](docs/progress.md). Free test game compared with its native execution: [docs/test-game.md](docs/test-game.md). An additional DLL folder (for example the Visual C++ DLLs) can follow the target: `--rapport <cible> <dossier>`.
 
 The report lists the imported functions, the percentage already emulated and the missing functions. In the interface, the **Open an Xbox folder…** button reads `MicrosoftGame.Config`, displays this report, then launches the program; every non-emulated call appears in the log.
 
 ## Architecture
-
-![Module diagram of AnyXboxX](docs/images/architecture.svg)
 
 | Module | Role |
 |---|---|

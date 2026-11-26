@@ -1,32 +1,26 @@
 //! The optional file manifest on the Game folder page: a button, then a progress bar with speed
 //! and time left, a Cancel button, and the result.
 
-use eframe::egui::{self, RichText, Ui, vec2};
+use eframe::egui::{self, Ui};
 
 use crate::app::App;
 use crate::app_check::ManifestState;
 use crate::manifest::manifest_text;
-use crate::theme;
+use crate::{bar, theme, tokens, widgets};
 
 pub fn section(app: &mut App, ui: &mut Ui) {
-    ui.add_space(theme::SP_M);
-    ui.label(
-        RichText::new("File manifest (optional)")
-            .size(18.0)
-            .strong(),
-    );
-    ui.label(
-        RichText::new(
-            "SHA-256 of the required files and the .rpf archives. It reads every byte (minutes for \
+    ui.label(tokens::subtitle("File manifest (optional)"));
+    ui.add_space(tokens::XS);
+    ui.label(tokens::muted(
+        "SHA-256 of the required files and the .rpf archives. It reads every byte (minutes for \
              130 GB, then remembered) and is never needed to play.",
-        )
-        .color(theme::TEXT_MUTED),
-    );
-    ui.add_space(theme::SP_S);
+    ));
+    ui.add_space(tokens::M);
     match app.manifest.clone() {
         ManifestState::Running(progress) => {
-            theme::gradient_bar(ui, Some(progress.fraction()), &progress.describe());
-            if theme::glow_button(ui, true, "Cancel", vec2(0.0, 36.0), false).clicked() {
+            bar::gradient_bar(ui, Some(progress.fraction()), &progress.describe());
+            ui.add_space(tokens::S);
+            if widgets::secondary_button(ui, true, "Cancel").clicked() {
                 app.cancel_manifest();
             }
         }
@@ -47,7 +41,7 @@ pub fn section(app: &mut App, ui: &mut Ui) {
             start_button(app, ui, "Compute again");
         }
         ManifestState::Failed(error) => {
-            ui.colored_label(theme::BAD, format!("The manifest failed: {error}"));
+            ui.label(tokens::body(format!("The manifest failed: {error}")).color(theme::BAD));
             start_button(app, ui, "Try again");
         }
         ManifestState::Cancelled => {
@@ -59,7 +53,7 @@ pub fn section(app: &mut App, ui: &mut Ui) {
 }
 
 fn start_button(app: &mut App, ui: &mut Ui, label: &str) {
-    if theme::glow_button(ui, true, label, vec2(0.0, 36.0), false).clicked() {
+    if widgets::secondary_button(ui, true, label).clicked() {
         app.start_manifest();
     }
 }

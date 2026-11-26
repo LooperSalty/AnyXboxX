@@ -12,7 +12,7 @@
 > - 🆕 **ワールドで約 14 fps（Series X、RTX 4070 SUPER、2026-11-25 計測）**：`third_party/victory` は Neptune (VIctory Edit.) 2026-11-25c をベースに、同日計測の設定一式を適用（中央値 13.8 fps、最後の 1 分間 15.6〜17 fps、1 フレーム 72.5 ms。適用前の `main` の設定では中央値 10.9 fps。Series X での自動 13 分実行、クラッシュなし）。下の数値は従来のベース `80d58f8` で計測したものです。
 > - 🆕 **画質優先モード（2026-11-25 にメンテナーが計測）**：`tools\lancer_victory.ps1 -Quality`（ウィンドウコピーを毎フレーム読み直し、プールを小さくする）で、ライティングとテクスチャが明らかに向上し、約 7-9 fps、テクスチャ拒否は大幅に減少（約 300 に対して 51-93）。既定は高速セットのままです（約 14-17 fps、PR #272 でワールド内 7 分間の中央値 13.7）。`-Override @{ VICTORY_X = '...' }` を使えば、ランチャーを編集せずに誰でも設定を試せます。
 > - ✅ **ボートが浮きます**（Exorion1er による PR #263：海の高さマップをタイトルの CPU 用に書き戻します）。
-> - 🦀 **Rust 移植、ブランチ `rust/full`（まだ `main` には入っていません）**：ネイティブランチャー（PR #249）と GPU ランナー `anyxboxx_gpu_run.exe`（PR #266）は Rust になりました。RDNA 2 リファレンスインタプリタは Rust に移植済み（クレート `anyxboxx-rdna2-ref`）で、Python モデルが実行するすべての命令（LLVM の 1,490 エンコーディングのうち 1,060）をバイト単位で一致させて実行し、パリティテストは 28 件です。xgameruntime のセーブ、ローカルストレージ、ストア、HDR/DXGI オブジェクトも移植済みです。残り：HLSL リコンパイラ、xgameruntime の残り、その後 C++ と Python の削除。状況：[docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/rust/full/docs/rust-full-status.md)。
+> - 🦀 **Rust 移植、`main` に統合済み**：`anyxboxx run`（`tools/lancer_victory.ps1` の後継）とグラフィカルランチャー `anyxboxx-launcher`（[インストールガイド](https://github.com/LooperSalty/AnyXboxX/blob/main/docs/launcher.md)、リリース `launcher-v0.1.0` にビルド済み）は Python も C++ も使わずにゲームを起動します。ネイティブランチャー（PR #249）、GPU ランナー `anyxboxx_gpu_run.exe`（PR #266）、ランタイム DLL の xmem・kernelx・d3d12_xs・anyxboxx_tls・XCRDAPI は Rust です。RDNA 2 リファレンスインタプリタ（クレート `anyxboxx-rdna2-ref`）は 36 件のパリティテストで Python モデルとバイト単位で一致します。xgameruntime は Rust に移植され C++ DLL と照合されていますが、配布されるのは引き続き C++ DLL です。残り：HLSL リコンパイラ、その後 C++ と Python の削除。状況：[docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/main/docs/rust-full-status.md)。
 > - ⛔ **既知の制限（作業中）**：32 GB の PC ではシステム RAM がボトルネックです（プロセスは約 22-25 GB を保持：タイトル自身のメモリ、CPU ミラー、共有メモリにあふれた VRAM）。12 GB のカードではテクスチャの空きが足りなくなり（1 セッションで数百回の拒否）、ワールドのストリーミング中に 1-6 fps まで落ち込みます。
 > - ✅ GTA VI の Xbox Series 1.0.2.1 ビルドは PC で**起動します**。起動、プロフィール画面、初回設定、法的画面、ロード、ポーズメニューまで動作し、メニューは 30 fps です。
 > - ✅ **ワールドに到達して表示します**：キャラクターはプレイヤーの操作で動き、3D 画像が表示されます。約 4 分 20 秒の計測で 4.8〜5.4 フレーム/秒、1 フレームあたり約 6,550 ドロー（メンテナーが計測、Windows 11、RTX 4070 Super、VIctory ログ）。起動アニメーションはちらつきません（観察）。これまで一度も点灯していなかったイラディアンスキャッシュ（ムービーの 1 フレームの PIX キャプチャでディスパッチ 0 回）は、2 つのシェーディング用シェーダーが変換され、パイプラインがゲーム内で作成・バインドされるようになりました（観察）。
@@ -35,7 +35,7 @@ AnyXboxX は Xbox GDK の実行ファイル（PE32+ x86-64 形式）を読み込
 AnyXboxX は 1 つのビルドに特化しています: **Xbox Series 版 Grand Theft Auto VI、バージョン 1.0.2.1**。このゲームが必要とするもの（インポートするシステム関数、使用するシェーダーと Direct3D 12.x メソッド）だけを変換します。ほかのゲームは、この変換が完了してから試します。本プロジェクトは同じビルドを対象とする [VIctory](https://github.com/Marvisak/VIctory)（Marvisak、GPL-3.0 以降）を土台にしています。VIctory は `third_party/victory` にコピーされており、フォーク `fxceless/victory-fork`（GPL-3.0）のコミット `7b0f736` を出発点としています。Marvisak と各プルリクエストの作者に感謝します。個別のクレジットは [THIRD_PARTY.md](../../THIRD_PARTY.md) にあります。
 
 > [!IMPORTANT]
-> **ゲームはプレイできません。** 現在地はこのページ上部のボックスを参照してください。このリポジトリにはゲームファイル、鍵、実行ファイルは含まれず、その入手方法も説明しません。
+> **ゲームは動作します。** GTA VI 1.0.2.1 は起動し、カットシーンを再生し、約 14 fps でオープンワールドに到達します（Series X モード、RTX 4070 SUPER、2026-11-25 計測）。一部のグラフィックはまだ欠けており、レイトレーシングは無効です。 現在地はこのページ上部のボックスを参照してください。このリポジトリにはゲームファイル、鍵、実行ファイルは含まれず、その入手方法も説明しません。
 
 オンラインの状況ページ（必要なディスク容量を含む）: **[loopersalty.github.io/AnyXboxX](https://loopersalty.github.io/AnyXboxX/)**。
 
@@ -64,10 +64,6 @@ AnyXboxX は 1 つのビルドに特化しています: **Xbox Series 版 Grand 
 
 C++ ランタイムは、ゲームの DXGI スワップチェーンの `Present` を 1 回ごとに計測します。DXGI がゲームの DLL（SDL3）によって動的に読み込まれる場合も同様です。ここから、毎秒のフレーム数、1 フレームの平均時間、そして「1% ロー」（最も遅い 1% のフレームの速度で、カクつきが分かります）を求めます。`--fps` はこれらの値をウィンドウのタイトルに表示します。`--banc-perf` は N 秒間計測し（最初の 1 秒は読み込みなので除きます）、「60 fps を維持」の判定を出します（目標に届かなければ終了コードは 2）。これらのオプションを付けなければ、何も横取りしません。
 
-![SimpleTriangle：毎秒のフレーム数](../images/fps-simpletriangle.svg)
-
-![testgdk：毎秒のフレーム数](../images/fps-testgdk.svg)
-
 2 つのテストゲームは垂直同期なしで動作し、ネイティブモードで SimpleTriangle は約 11,700 fps、testgdk は約 12,600 fps です。
 
 ## プロジェクトの進捗
@@ -95,7 +91,7 @@ C++ ランタイムは、ゲームの DXGI スワップチェーンの `Present`
 | 396 個の GDK 関数の表：インターフェースとメソッド番号を `xgameruntime.lib` から抽出（`tools/gdk_interfaces.py`） | ✅ 完了 |
 | `XTaskQueue`、`XAsync`、`XThread` を AnyXboxX が提供：testgdk が Windows のランタイムなしで動作 | ✅ 完了 |
 | その他の GDK のインターフェース：Windows の GDK ランタイムに委譲し、トレースで名前を表示 | 🟡 進行中 |
-| 1700+ 件の自動テスト | ✅ 完了 |
+| 1800+ 件の自動テスト | ✅ 完了 |
 | D3D12.X：`D3D12XboxCreateDevice`、コンソールの `ID3D12*` インターフェース、`DXGIXPresentArray` を TomBox の Rust 製 `d3d12_xs.dll`（MIT、実装済みエクスポート 48 個、`tools/build_tombox.py d3d12_xs` でビルド、`ANYXBOXX_D3D12_XS=<パス>` で読み込み）が提供。コンソール実行ファイルがないためここでは検証不可 | 🟡 進行中 |
 | AnyXboxX にないものを補う TomBox（Rust、GPL-3.0）のコンソールライブラリ：`xg_xs`（テクスチャレイアウト、エクスポート 23 個）と完全な `xmem`（エクスポート 38 個）、`ANYXBOXX_TOMBOX_DIR=<フォルダー>` で使用。`tools/build_tombox.py xg_xs xmem` でビルド | 🟡 進行中 |
 | オフラインの `XUser`：常にサインイン済みのローカルプロファイル、変更可能なゲーマータグ（`ANYXBOXX_GAMERTAG`）、testgdk のサインイン成功 | ✅ 完了 |
@@ -114,7 +110,6 @@ C++ ランタイムは、ゲームの DXGI スワップチェーンの `Present`
 | RDNA 2 逆アセンブラーのオペランドが LLVM のテキストと一致：スカラーと VOP1/VOPC 100 %、DS 100 %、EXP 100 %、SMEM 96.5 %（最大値：残りのエンコーディングは LLVM が 2 通りに書く） | ✅ 完了 |
 | 最初の RDNA 2 頂点シェーダーとピクセルシェーダーを D3D12 で描画（`anyxboxx_gpu_run.exe --draw`）：すべての頂点とピクセルがリファレンスインタープリターと一致（GPU と WARP） | ✅ 完了 |
 | 再コンパイルした RDNA 2 シェーダーのテクスチャ：T#/S# ディスクリプターと `image_sample`（2D、最近傍テクセル、wrap または clamp-to-edge、8_8_8_8_UNORM と 32_32_32_32_FLOAT）、テクスチャ付きピクセルシェーダーを含め GPU と WARP でリファレンスインタープリターと一致；ディスクリプターの配置は Leonida と Mesa による | ✅ 完了 |
-| 2 つ目の RDNA 2 → SPIR-V（Vulkan）トランスレーター：Leonida のもの（GPL-3.0）を `third_party/leonida/` に無変更でコピーし、`llvm-mc` なしで AnyXboxX 自身の逆アセンブラーから入力；頂点・ピクセル・コンピュートシェーダーに対応；パッケージの `XboxBvhBuilder.dll` に含まれるコンソール用シェーダー 52 個のうち 51 個を変換（`tools/fssm_mesure.py` でローカル計測）（`scarlett.py --rdna2 <shader.bin> --spirv ps`） | 🟡 進行中 |
 | TomBox を最新版に更新（D3D12.X：彼らの集計で 200 メソッド中 194）し、さらに 4 つのコンソールライブラリをビルドして `ANYXBOXX_TOMBOX_DIR` から提供：`d3d12_x`（ESRAM）、`XAudio2_9`（XMA ボイス）、`xapu`、`xgs12`；`tools/build_tombox.py d3d12_xs xg_xs xmem d3d12_x xaudio2_9 xapu xgs12` | 🟡 進行中 |
 | コンソールの DXIL を PC の DXIL に変換（`dxil-ms-xb2` → `dxil-ms-dx`、HLSL を経由しない）：Xbox2Windows のツール（MIT）をテストとともに `third_party/xbox2windows/` に無変更でコピー；`python third_party/xbox2windows/tools/dxil_retarget.py <入力> <出力>` または `--pe <game.exe>` | ✅ 完了 |
 | プルリクエストのチェック：lint と 9 つの README の同期（行、画像、テスト数）をプルリクエストごとに確認 | ✅ 完了 |
@@ -128,17 +123,6 @@ C++ ランタイムは、ゲームの DXGI スワップチェーンの `Present`
 | 実行中の DLL の動的読み込み（`LoadLibrary` + `DllMain`） | ⏳ 未着手 |
 | D3D12.X から Direct3D 12 / Vulkan へのグラフィックス変換 | ⏳ 未着手 |
 | コンソールの XMA2 音声：TomBox による FFmpeg デコーダーの Rust 移植（LGPL、公開 FATE サンプルで FFmpeg との差は最大 1）で WAV にデコード。`anyxboxx_xma <in.xma> <out.wav>`、単一ストリームのファイル | 🟡 進行中 |
-
-<table>
-<tr>
-<td><img src="../images/demo-virage.png" alt="車が右に曲がる" width="380"></td>
-<td><img src="../images/rapport-compatibilite.png" alt="デモの互換性レポート" width="380"></td>
-</tr>
-<tr>
-<td align="center">デモはキーボードの矢印キーに反応します。</td>
-<td align="center">ログに互換性レポートが表示されます。</td>
-</tr>
-</table>
 
 ## デモを試す
 
@@ -167,8 +151,6 @@ cmake --build runtime/build --config Release
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <dossier ou fichier .exe> [dossiers de DLL…]
 ```
 
-![AnyXboxX のネイティブモードで起動した SimpleTriangle](../images/simpletriangle-anyxboxx.png)
-
 AnyXboxX は実行ファイル自体を読み込み、Wine と同じようにプロセッサ上で直接実行します。Xbox ランタイム（`xgameruntime.dll`）は AnyXboxX が提供し、ウィンドウと DirectX 12 は PC のものを使います。**注意：ネイティブモードではプログラムは隔離されません。** このモードは信頼できるプログラムにのみ使ってください。`--rapport` と `--banc` は引き続き Unicorn 内で隔離されます。`ANYXBOXX_TRACE=1` を指定すると、傍受した呼び出しが表示されます。詳細：[docs/test-game.md](../test-game.md)。
 
 ## パッケージを隔離モードで起動する
@@ -191,15 +173,11 @@ AnyXboxX は実行ファイル自体を読み込み、Wine と同じようにプ
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc <dossier>
 ```
 
-![Scarlett パッケージの DLL に対するテストベンチ](../images/banc-dll.svg)
-
 詳細な結果：[docs/progress.md](../progress.md)。ネイティブ実行と比較したフリーのテストゲーム：[docs/test-game.md](../test-game.md)。追加の DLL フォルダー（例：Visual C++ の DLL）をターゲットの後ろに指定できます：`--rapport <cible> <dossier>`。
 
 レポートには、インポートされた関数、すでにエミュレートされている割合、不足している関数が一覧表示されます。インターフェースでは、**Open an Xbox folder…**（Xbox フォルダーを開く）ボタンが `MicrosoftGame.Config` を読み取り、このレポートを表示してからプログラムを起動します。エミュレートされていない呼び出しはすべてログに表示されます。
 
 ## アーキテクチャ
-
-![AnyXboxX のモジュール構成図](../images/architecture.svg)
 
 | モジュール | 役割 |
 |---|---|

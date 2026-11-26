@@ -205,6 +205,9 @@ pub fn execute(
     f: &Fields,
     literal: Option<u32>,
 ) -> Result<bool, Error> {
+    if name == "s_version" {
+        return Ok(true);
+    }
     if crate::movrel::scalar(wave, name, f, literal)? {
         return Ok(true);
     }
@@ -220,6 +223,15 @@ pub fn execute(
 fn sop2(wave: &mut Wave, name: &str, f: &Fields, lit: Option<u32>) -> Result<bool, Error> {
     let mut done = true;
     match name {
+        "s_pack_ll_b32_b16" => binary(wave, f, lit, (1, 1, 1), |a, b, _| {
+            ((b & 0xffff) << 16 | (a & 0xffff), None)
+        })?,
+        "s_pack_lh_b32_b16" => binary(wave, f, lit, (1, 1, 1), |a, b, _| {
+            ((b & 0xffff_0000) | (a & 0xffff), None)
+        })?,
+        "s_pack_hh_b32_b16" => binary(wave, f, lit, (1, 1, 1), |a, b, _| {
+            ((b & 0xffff_0000) | (a >> 16), None)
+        })?,
         "s_add_u32" => binary(wave, f, lit, (1, 1, 1), |a, b, _| {
             (a.wrapping_add(b), Some((a + b) >> 32 != 0))
         })?,

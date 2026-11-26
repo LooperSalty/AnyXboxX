@@ -37,6 +37,8 @@ pub struct Access {
     pub store: bool,
     /// The components read or written (x = 1 ... xyzw = 4).
     pub count: usize,
+    pub d16: bool,
+    pub high: bool,
     pub offset: u64,
     pub offen: bool,
     pub idxen: bool,
@@ -51,7 +53,7 @@ pub struct Access {
 
 /// (typed, store, count) of a typed access name, or `None` when the name is not one
 /// (`^(t?)buffer_(load|store)_format_(x|xy|xyz|xyzw)$`).
-pub fn parse_name(name: &str) -> Option<(bool, bool, usize)> {
+pub fn parse_name(name: &str) -> Option<(bool, bool, usize, bool, bool)> {
     let (typed, rest) = match name.strip_prefix('t') {
         Some(rest) => (true, rest),
         None => (false, name),
@@ -62,6 +64,15 @@ pub fn parse_name(name: &str) -> Option<(bool, bool, usize)> {
     } else {
         (true, rest.strip_prefix("store_format_")?)
     };
+    let (d16, rest) = rest
+        .strip_prefix("d16_")
+        .map_or((false, rest), |s| (true, s));
+    let (high, rest) = rest
+        .strip_prefix("hi_")
+        .map_or((false, rest), |s| (true, s));
+    if high && (!d16 || rest != "x") {
+        return None;
+    }
     let count = match rest {
         "x" => 1,
         "xy" => 2,
@@ -69,7 +80,7 @@ pub fn parse_name(name: &str) -> Option<(bool, bool, usize)> {
         "xyzw" => 4,
         _ => return None,
     };
-    Some((typed, store, count))
+    Some((typed, store, count, d16, high))
 }
 
 /// True when `name` is a typed buffer access this module runs.
@@ -83,7 +94,7 @@ fn bit(word: u64, index: u32) -> bool {
 
 /// The fields of the access `name` (`word`: its 64 bits); `Untranslated` for lds and tfe.
 pub fn access(name: &str, word: u64) -> Result<Access, Error> {
-    let (typed, store, count) = parse_name(name).ok_or_else(|| {
+    let (typed, store, count, d16, high) = parse_name(name).ok_or_else(|| {
         Error::Untranslated(format!("instruction non traduite : {name} (accès typé)"))
     })?;
     if !typed && bit(word, MUBUF_LDS_BIT) {
@@ -100,6 +111,8 @@ pub fn access(name: &str, word: u64) -> Result<Access, Error> {
         typed,
         store,
         count,
+        d16,
+        high,
         offset: word & OFFSET_MASK,
         offen: bit(word, OFFEN_BIT),
         idxen: bit(word, IDXEN_BIT),
@@ -166,7 +179,17 @@ pub fn resolve(
     check_descriptor(words)?;
     let word3 = words[3];
     let code = access.fixed.unwrap_or_else(|| descriptor_format(word3));
-    let format = format_for(code, access.store)?;
+    let format = format_for(code, access.store && !access.d16)?;
+    if access.d16
+        && ((access.store
+            && !format.is_integer()
+            && format.kind != crate::buffer_format::Kind::Float)
+            || (!access.store && format.is_integer() && format.widths[0] == 32))
+    {
+        return Err(Error::Untranslated(format!(
+            "{name}: unsupported d16 format"
+        )));
+    }
     let refuse = |what: String| Err(Error::Untranslated(format!("{name} : {what}")));
     if access.typed && access.count > format.count() {
         return refuse(format!(
@@ -205,10 +228,16 @@ mod tests {
     fn names_give_the_form_and_the_component_count() {
         assert_eq!(
             parse_name("tbuffer_load_format_xyz"),
-            Some((true, false, 3))
+            Some((true, false, 3, false, false))
         );
-        assert_eq!(parse_name("buffer_store_format_x"), Some((false, true, 1)));
-        assert_eq!(parse_name("buffer_load_format_d16_x"), None);
+        assert_eq!(
+            parse_name("buffer_store_format_x"),
+            Some((false, true, 1, false, false))
+        );
+        assert_eq!(
+            parse_name("buffer_load_format_d16_x"),
+            Some((false, false, 1, true, false))
+        );
         assert_eq!(parse_name("buffer_load_dword"), None);
     }
 

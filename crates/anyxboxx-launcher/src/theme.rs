@@ -4,9 +4,10 @@
 //! helpers only call it.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, Margin, Rect, RichText, Shadow, Stroke, Ui, epaint::Mesh, pos2,
-    vec2,
+    self, Color32, CornerRadius, Rect, Shadow, Stroke, Ui, epaint::Mesh, pos2, vec2,
 };
+
+use crate::tokens;
 
 pub const NIGHT: Color32 = Color32::from_rgb(0x1a, 0x0b, 0x2e);
 pub const VIOLET: Color32 = Color32::from_rgb(0x4b, 0x1d, 0x6e);
@@ -18,6 +19,26 @@ pub const TEXT_MUTED: Color32 = Color32::from_rgb(0xcf, 0xc0, 0xe6);
 pub const GOOD: Color32 = Color32::from_rgb(0x5d, 0xe0, 0x8a);
 pub const BAD: Color32 = Color32::from_rgb(0xff, 0x7a, 0x8a);
 pub const WARN: Color32 = Color32::from_rgb(0xff, 0xc8, 0x6b);
+/// The keyboard focus ring: a warm light that reads over every surface of the window.
+pub const FOCUS: Color32 = Color32::from_rgb(0xff, 0xe0, 0x9e);
+/// Controls at rest and under the pointer (pills, switches, secondary buttons).
+pub const SURFACE: Color32 = Color32::from_rgb(0x2a, 0x10, 0x46);
+pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x5a, 0x1c, 0x6a);
+/// The status chips' fill.
+pub const CHIP_FILL: Color32 = Color32::from_rgb(0x12, 0x07, 0x20);
+/// The fill of buttons that carry white text (5:1 or better), its hovered form, and a disabled one.
+pub const BUTTON_PINK: Color32 = Color32::from_rgb(0xd4, 0x14, 0x7a);
+pub const BUTTON_PINK_HOVER: Color32 = Color32::from_rgb(0xd9, 0x18, 0x7e);
+pub const BUTTON_OFF: Color32 = Color32::from_rgb(0x3a, 0x22, 0x52);
+/// The error card: a deep red surface with a brighter edge.
+pub const ERROR_FILL: Color32 = Color32::from_rgb(0x3a, 0x0a, 0x1c);
+pub const SUCCESS_FILL: Color32 = Color32::from_rgb(0x0d, 0x2a, 0x22);
+
+/// Darkness of the overlay under the text on a picture (left edge of the hero, bottom of the launch
+/// screen), out of 255: dark enough for AA text even on a white picture. The renderer blends in
+/// linear light, where a dark veil hides less than its alpha suggests; the test models that.
+pub const OVERLAY_RGB: [u8; 3] = [0x0c, 0x04, 0x18];
+pub const OVERLAY_ALPHA: u8 = 236;
 
 /// The card colour (dark, translucent) and its opacity over the gradient.
 pub const CARD_RGB: [u8; 3] = [0x14, 0x08, 0x24];
@@ -99,7 +120,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.extreme_bg_color = Color32::from_rgb(0x10, 0x06, 0x1c);
     visuals.hyperlink_color = Color32::from_rgb(0xff, 0xb3, 0xdd);
     visuals.selection.bg_fill = HOT_PINK.gamma_multiply(0.55);
-    visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.selection.stroke = Stroke::new(2.0_f32, FOCUS);
     let widgets = &mut visuals.widgets;
     widgets.inactive.bg_fill = Color32::from_rgb(0x3a, 0x17, 0x5c);
     widgets.inactive.weak_bg_fill = Color32::from_rgb(0x3a, 0x17, 0x5c);
@@ -108,19 +129,22 @@ pub fn apply(ctx: &egui::Context) {
     widgets.hovered.weak_bg_fill = Color32::from_rgb(0x8a, 0x1f, 0x7a);
     widgets.hovered.corner_radius = CornerRadius::same(10);
     widgets.hovered.bg_stroke = Stroke::new(1.0_f32, HOT_PINK);
-    widgets.active.bg_fill = HOT_PINK;
-    widgets.active.weak_bg_fill = HOT_PINK;
+    widgets.active.bg_fill = BUTTON_PINK;
+    widgets.active.weak_bg_fill = BUTTON_PINK;
     widgets.active.corner_radius = CornerRadius::same(10);
     widgets.open.corner_radius = CornerRadius::same(10);
     ctx.set_visuals(visuals);
     ctx.global_style_mut(|style| {
-        style.spacing.item_spacing = vec2(10.0, 8.0);
-        style.spacing.button_padding = vec2(14.0, 7.0);
+        style.spacing.item_spacing = vec2(tokens::S, tokens::S);
+        style.spacing.button_padding = vec2(tokens::M, tokens::S);
+        style.spacing.interact_size.y = 32.0;
+        style.animation_time = tokens::HOVER_TIME;
         for (text_style, size) in [
-            (egui::TextStyle::Heading, 28.0),
-            (egui::TextStyle::Body, 15.0),
-            (egui::TextStyle::Button, 15.0),
-            (egui::TextStyle::Monospace, 13.0),
+            (egui::TextStyle::Heading, tokens::TITLE),
+            (egui::TextStyle::Body, tokens::BODY),
+            (egui::TextStyle::Button, tokens::BODY),
+            (egui::TextStyle::Small, tokens::CAPTION),
+            (egui::TextStyle::Monospace, tokens::CAPTION),
         ] {
             if let Some(font) = style.text_styles.get_mut(&text_style) {
                 font.size = size;
@@ -159,8 +183,8 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .fill(card_fill())
         .stroke(Stroke::new(1.0_f32, HOT_PINK.gamma_multiply(0.45)))
-        .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::same(16))
+        .corner_radius(tokens::radius(tokens::R_CARD))
+        .inner_margin(tokens::card_margin())
         .shadow(Shadow {
             offset: [0, 0],
             blur: 22,
@@ -174,227 +198,16 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
-/// The page tab as a pill; returns true when clicked.
-pub fn tab_pill(ui: &mut Ui, selected: bool, label: &str) -> bool {
-    let (fill, text) = if selected {
-        (BUTTON_PINK, Color32::WHITE)
-    } else {
-        (Color32::from_rgba_unmultiplied(20, 8, 36, 170), TEXT)
-    };
-    let button = egui::Button::new(RichText::new(label).strong().color(text))
-        .fill(fill)
-        .stroke(Stroke::new(1.0_f32, HOT_PINK.gamma_multiply(0.6)))
-        .corner_radius(CornerRadius::same(255))
-        .min_size(vec2(0.0, 34.0));
-    ui.add(button).clicked()
-}
-
-/// Spacing scale: every gap in the window is one of these.
-pub const SP_XS: f32 = 4.0;
-pub const SP_S: f32 = 8.0;
-pub const SP_M: f32 = 16.0;
-pub const SP_L: f32 = 24.0;
-
-/// The fill of buttons that carry white text (5:1 or better), and its hovered form.
-pub const BUTTON_PINK: Color32 = Color32::from_rgb(0xd4, 0x14, 0x7a);
-pub const BUTTON_PINK_HOVER: Color32 = Color32::from_rgb(0xd9, 0x18, 0x7e);
-const BUTTON_OFF: Color32 = Color32::from_rgb(0x4a, 0x2a, 0x66);
-
-/// The main button: a pink pill that grows and glows under the pointer, and pulses while
-/// `pulsing` (a launch is under way). Returns the response; a disabled one never reports a click.
-pub fn glow_button(
-    ui: &mut Ui,
-    enabled: bool,
-    label: &str,
-    min_size: egui::Vec2,
-    pulsing: bool,
-) -> egui::Response {
-    let font = egui::FontId::proportional(if min_size.y > 48.0 { 24.0 } else { 15.0 });
-    let text = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font, Color32::WHITE);
-    let size = vec2(
-        min_size.x.max(text.size().x + 40.0),
-        min_size.y.max(text.size().y + 16.0),
-    );
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(size, sense);
-    let hover = ui
-        .ctx()
-        .animate_bool_with_time(response.id, enabled && response.hovered(), 0.15);
-    let time = ui.input(|i| i.time);
-    let pulse = if pulsing && enabled {
-        ui.ctx().request_repaint();
-        crate::anim::pulse(time, 1.4)
-    } else {
-        0.0
-    };
-    let body = Rect::from_center_size(rect.center(), size * (1.0 + 0.04 * hover));
-    let radius = CornerRadius::same((body.height() / 2.0).min(255.0) as u8);
-    let painter = ui.painter();
-    if enabled {
-        let strength = 0.22 + 0.5 * hover + 0.5 * pulse;
-        for layer in 1..=5_u8 {
-            let alpha = (strength * 70.0 / f32::from(layer)).min(255.0) as u8;
-            painter.rect_filled(
-                body.expand(f32::from(layer) * 3.5),
-                CornerRadius::same(((body.height() / 2.0) as u8).saturating_add(layer * 3)),
-                Color32::from_rgba_unmultiplied(0xff, 0x2d, 0x95, alpha),
-            );
-        }
-    }
-    let fill = if enabled {
-        lerp_color(BUTTON_PINK, BUTTON_PINK_HOVER, hover)
-    } else {
-        BUTTON_OFF
-    };
-    painter.rect_filled(body, radius, fill);
-    painter.rect_stroke(
-        body,
-        radius,
-        Stroke::new(1.0_f32, Color32::WHITE.gamma_multiply(0.25 + 0.4 * hover)),
-        egui::StrokeKind::Inside,
-    );
-    painter.galley(body.center() - text.size() / 2.0, text, Color32::WHITE);
-    if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        response
-    }
-}
-
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+/// The colour `t` of the way from `a` to `b` (`t` clamped).
+pub(crate) fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let mix = |x: u8, y: u8| {
         (f32::from(x) + (f32::from(y) - f32::from(x)) * t.clamp(0.0, 1.0)).round() as u8
     };
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
-/// A status chip: a coloured dot and a short text on a dark pill.
-pub fn chip(ui: &mut Ui, color: Color32, text: &str) {
-    let font = egui::FontId::proportional(14.0);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, TEXT);
-    let size = vec2(galley.size().x + 38.0, 30.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(15),
-        Color32::from_rgba_unmultiplied(0x10, 0x06, 0x1c, 235),
-    );
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(15),
-        Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
-        egui::StrokeKind::Inside,
-    );
-    painter.circle_filled(pos2(rect.left() + 15.0, rect.center().y), 5.0, color);
-    painter.galley(
-        pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0),
-        galley,
-        TEXT,
-    );
-}
-
-/// An on/off switch that slides; returns true when it was flipped this frame.
-pub fn toggle(ui: &mut Ui, value: &mut bool) -> bool {
-    let size = vec2(46.0, 26.0);
-    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let flipped = response.clicked();
-    if flipped {
-        *value = !*value;
-        response.mark_changed();
-    }
-    let on = ui.ctx().animate_bool_with_time(response.id, *value, 0.14);
-    let track = lerp_color(Color32::from_rgb(0x3a, 0x17, 0x5c), BUTTON_PINK, on);
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(13), track);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(13),
-        Stroke::new(1.0_f32, HOT_PINK.gamma_multiply(0.6)),
-        egui::StrokeKind::Inside,
-    );
-    let x = rect.left() + 13.0 + (rect.width() - 26.0) * on;
-    painter.circle_filled(pos2(x, rect.center().y), 9.5, Color32::WHITE);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    flipped
-}
-
-/// A progress bar filled with a pink-to-orange gradient, with its text on top. A light band
-/// sweeps across the filled part; with no fraction (length unknown) a band slides along the track.
-pub fn gradient_bar(ui: &mut Ui, fraction: Option<f32>, text: &str) {
-    let height = 26.0;
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
-    let radius = CornerRadius::same(13);
-    let time = ui.input(|i| i.time);
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(33));
-    let painter = ui.painter().clone();
-    painter.rect_filled(rect, radius, Color32::from_rgb(0x10, 0x06, 0x1c));
-    let fill = match fraction {
-        Some(f) if f > 0.0 => {
-            let width = (rect.width() * f.clamp(0.0, 1.0))
-                .max(height)
-                .min(rect.width());
-            Some(Rect::from_min_size(rect.min, vec2(width, height)))
-        }
-        Some(_) => None,
-        None => {
-            let (a, b) = crate::anim::moving_band(time, 1.6);
-            let x0 = rect.left() + rect.width() * a;
-            let x1 = rect.left() + rect.width() * b;
-            (x1 - x0 > 1.0)
-                .then(|| Rect::from_min_max(pos2(x0, rect.top()), pos2(x1, rect.bottom())))
-        }
-    };
-    if let Some(fill) = fill {
-        painter.add(egui::Shape::mesh(horizontal_mesh(fill, HOT_PINK, GLOW)));
-        if fraction.is_some() {
-            let (a, b) = crate::anim::moving_band(time, 1.8);
-            let band = Rect::from_min_max(
-                pos2(fill.left() + fill.width() * a, fill.top()),
-                pos2(fill.left() + fill.width() * b, fill.bottom()),
-            );
-            let clear = Color32::from_rgba_unmultiplied(255, 255, 255, 0);
-            let bright = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
-            if band.width() > 1.0 {
-                let mid = band.center().x;
-                painter.add(egui::Shape::mesh(horizontal_mesh(
-                    Rect::from_min_max(band.min, pos2(mid, band.bottom())),
-                    clear,
-                    bright,
-                )));
-                painter.add(egui::Shape::mesh(horizontal_mesh(
-                    Rect::from_min_max(pos2(mid, band.top()), band.max),
-                    bright,
-                    clear,
-                )));
-            }
-        }
-    }
-    painter.rect_stroke(
-        rect,
-        radius,
-        Stroke::new(1.0_f32, HOT_PINK.gamma_multiply(0.5)),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::proportional(14.0),
-        Color32::WHITE,
-    );
-}
-
 /// A quad shaded from `left` to `right`.
-fn horizontal_mesh(rect: Rect, left: Color32, right: Color32) -> Mesh {
+pub(crate) fn horizontal_mesh(rect: Rect, left: Color32, right: Color32) -> Mesh {
     let mut mesh = Mesh::default();
     mesh.colored_vertex(rect.left_top(), left);
     mesh.colored_vertex(rect.left_bottom(), left);
@@ -440,6 +253,62 @@ mod tests {
     fn white_text_on_the_button_pinks_meets_wcag_aa() {
         assert!(contrast_ratio(Color32::WHITE, BUTTON_PINK) >= 4.5);
         assert!(contrast_ratio(Color32::WHITE, BUTTON_PINK_HOVER) >= 4.5);
+    }
+
+    /// Contrast of `text` over the overlay on top of `behind`, blended in linear light (the
+    /// renderer's way, and the worst case for a dark veil over a light picture).
+    fn contrast_over_overlay(text: Color32, behind: Color32) -> f64 {
+        let a = f64::from(OVERLAY_ALPHA) / 255.0;
+        let [r, g, b] = OVERLAY_RGB;
+        let veil = luminance(Color32::from_rgb(r, g, b));
+        let ground = a * veil + (1.0 - a) * luminance(behind);
+        let lt = luminance(text);
+        let (hi, lo) = if lt >= ground {
+            (lt, ground)
+        } else {
+            (ground, lt)
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn text_over_a_picture_meets_wcag_aa_whatever_the_picture() {
+        for behind in [Color32::WHITE, Color32::BLACK, GLOW, HOT_PINK] {
+            assert!(
+                contrast_over_overlay(TEXT, behind) >= 4.5,
+                "text over {behind:?}"
+            );
+            assert!(
+                contrast_over_overlay(TEXT_MUTED, behind) >= 4.5,
+                "muted over {behind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn controls_and_cards_keep_their_text_readable() {
+        for ground in [SURFACE, SURFACE_HOVER, CHIP_FILL, ERROR_FILL, SUCCESS_FILL] {
+            assert!(contrast_ratio(TEXT, ground) >= 4.5, "text on {ground:?}");
+        }
+        assert!(
+            contrast_ratio(TEXT_MUTED, BUTTON_OFF) >= 4.5,
+            "disabled label"
+        );
+        assert!(contrast_ratio(BAD, ERROR_FILL) >= 4.5, "error title");
+        assert!(contrast_ratio(GOOD, SUCCESS_FILL) >= 4.5, "success title");
+        for status in [GOOD, WARN, BAD] {
+            assert!(
+                contrast_ratio(status, CHIP_FILL) >= 3.0,
+                "chip icon (non-text, 3:1)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_focus_ring_stands_out_from_every_surface() {
+        for ground in [NIGHT, VIOLET, MAGENTA, SURFACE, BUTTON_PINK] {
+            assert!(contrast_ratio(FOCUS, ground) >= 3.0, "focus on {ground:?}");
+        }
     }
 
     #[test]

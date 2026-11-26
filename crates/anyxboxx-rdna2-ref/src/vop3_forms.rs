@@ -122,6 +122,12 @@ pub fn operation(
         return Ok(false);
     }
     let float = float_result(name);
+    let saturating = matches!(name, "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32");
+    if fields.clamp && !float && !saturating {
+        return Err(Error::Untranslated(format!(
+            "{name}: clamp on integer result"
+        )));
+    }
     let destination = fields.vdst as usize;
     let k = literal.unwrap_or(0);
     let select = if name == "v_cndmask_b32" {
@@ -134,9 +140,17 @@ pub fn operation(
         let b = if is_vop2 { b } else { 0 };
         let old = wave.v[destination][lane];
         let condition = select.is_some_and(|mask| mask >> lane & 1 == 1);
-        let value = vector::compute(name, a, b, old, k, condition).ok_or_else(|| {
-            Error::Untranslated(format!("instruction non traduite : {name} (VOP3)"))
-        })?;
+        let value = if fields.clamp && saturating {
+            match name {
+                "v_add_nc_u32" => a.saturating_add(b),
+                "v_sub_nc_u32" => a.saturating_sub(b),
+                _ => b.saturating_sub(a),
+            }
+        } else {
+            vector::compute(name, a, b, old, k, condition).ok_or_else(|| {
+                Error::Untranslated(format!("instruction non traduite : {name} (VOP3)"))
+            })?
+        };
         wave.v[destination][lane] = output(fields, u64::from(value), float);
     }
     Ok(true)
@@ -162,7 +176,15 @@ pub fn carry(
         let [a, b, _] = inputs(wave, fields, lane, literal, false)?;
         let (result, carry) = vector::carry(name, u64::from(a), u64::from(b), carry_in >> lane & 1)
             .ok_or_else(|| Error::Operand(format!("retenue inconnue : {name}")))?;
-        wave.v[fields.vdst as usize][lane] = (result & MASK32) as u32;
+        wave.v[fields.vdst as usize][lane] = if fields.clamp && carry {
+            if name.starts_with("v_add") {
+                u32::MAX
+            } else {
+                0
+            }
+        } else {
+            (result & MASK32) as u32
+        };
         carries |= u64::from(carry) << lane;
     }
     wave.write_mask(fields.sdst, carries)?;
@@ -222,6 +244,11 @@ pub fn mad64(
 ) -> Result<bool, Error> {
     if name != "v_mad_u64_u32" && name != "v_mad_i64_i32" {
         return Ok(false);
+    }
+    if fields.clamp {
+        return Err(Error::Untranslated(format!(
+            "{name}: clamp on integer result"
+        )));
     }
     let signed = name == "v_mad_i64_i32";
     if signed && fields.sdst != NULL {

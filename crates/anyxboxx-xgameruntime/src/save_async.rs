@@ -118,3 +118,69 @@ pub fn result(
 pub fn status(block: *mut AsyncBlock) -> HResult {
     xasync::XAsyncGetStatus(block, false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    struct CleanupGate {
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+
+    extern "system" fn gated_provider(op: u32, data: *const ProviderData) -> HResult {
+        if op == OP_CLEANUP {
+            // SAFETY: the test retains the gate until both threads have joined.
+            let gate = unsafe { &*((*data).context.cast::<CleanupGate>()) };
+            gate.entered.send(()).unwrap();
+            gate.resume.lock().unwrap().recv().unwrap();
+        }
+        S_OK
+    }
+
+    #[test]
+    fn waiting_for_status_during_cleanup_cannot_return_pending() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut gate = CleanupGate {
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        };
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            xasync::XAsyncBegin(
+                &mut block,
+                (&mut gate as *mut CleanupGate).cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(gated_provider)
+            ),
+            S_OK
+        );
+        let address = (&mut block as *mut AsyncBlock) as usize;
+        let complete = std::thread::spawn(move || {
+            xasync::XAsyncComplete(address as *mut AsyncBlock, crate::object::E_INVALIDARG, 0)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            result_tx
+                .send(xasync::XAsyncGetStatus(address as *mut AsyncBlock, true))
+                .unwrap();
+        });
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        resume_tx.send(()).unwrap();
+        complete.join().unwrap();
+        waiter.join().unwrap();
+        let result =
+            early.unwrap_or_else(|_| result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(result, crate::object::E_INVALIDARG);
+    }
+}

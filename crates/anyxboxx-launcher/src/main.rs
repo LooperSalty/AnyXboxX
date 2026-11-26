@@ -12,10 +12,14 @@
 // No console window in release builds: the children's output goes to the log drawer.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod about;
 mod anim;
 mod app;
 mod app_check;
+mod app_launch;
+mod bar;
 mod cache;
+mod cover;
 mod detached;
 mod env;
 mod format;
@@ -23,6 +27,7 @@ mod home;
 mod host;
 mod job;
 mod launch;
+mod launch_progress;
 mod loglevel;
 mod manifest;
 mod noconsole;
@@ -33,18 +38,24 @@ mod profile;
 mod progress;
 mod session;
 mod setup;
+mod shade;
 mod splash;
 mod store;
 mod theme;
 mod toast;
+mod tokens;
 mod ui;
 mod ui_chrome;
 mod ui_home;
+mod ui_launch;
 mod ui_manifest;
 mod ui_options;
 mod ui_pages;
+mod ui_play;
+mod ui_states;
 mod verify;
 mod warm_state;
+mod widgets;
 
 use eframe::egui;
 
@@ -61,7 +72,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(|creation| {
             theme::apply(&creation.egui_ctx);
-            let state = app::App::new()?;
+            let mut state = app::App::new()?;
+            state.apply_args(app_launch::parse_args(std::env::args().skip(1)));
             Ok(Box::new(state))
         }),
     )

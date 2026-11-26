@@ -44,7 +44,7 @@ fn narrow(bytes: &[u8]) -> String {
             .map(|&byte| byte as char)
             .collect()
     } else {
-        bytes.iter().map(|&byte| byte as char).collect()
+        String::from_utf8_lossy(bytes).into_owned()
     }
 }
 
@@ -59,6 +59,37 @@ fn element_text(text: &str, name: &str) -> String {
     body.find(&close)
         .map(|end| body[..end].to_string())
         .unwrap_or_default()
+}
+
+/// Package identity name from the Identity element in the game configuration.
+pub fn package_name() -> String {
+    attribute_text(&read_text(), "Identity", "Name")
+}
+
+pub fn package_details() -> (String, String, String, String) {
+    let text = read_text();
+    (
+        attribute_text(&text, "Identity", "Publisher"),
+        attribute_text(&text, "Identity", "Version"),
+        attribute_text(&text, "ShellVisuals", "DefaultDisplayName"),
+        element_text(&text, "StoreId"),
+    )
+}
+
+fn attribute_text(text: &str, element: &str, attribute: &str) -> String {
+    let Some(start) = text.find(&format!("<{element}")) else {
+        return String::new();
+    };
+    let tag = &text[start..];
+    let tag = tag.split('>').next().unwrap_or(tag);
+    let key = format!(" {attribute}=\"");
+    let Some(start) = tag.find(&key) else {
+        return String::new();
+    };
+    let value = &tag[start + key.len()..];
+    value
+        .find('"')
+        .map_or_else(String::new, |end| value[..end].to_owned())
 }
 
 /// The Title ID declared by `<TitleId>` (hexadecimal), or 0 when it is missing or malformed.

@@ -792,6 +792,22 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Format-kind flag for a typed buffer view in the [`SLOT_STRIDES`] table:
+/// `SLOT_TYPED_UINT` for `*_UINT` formats, `SLOT_TYPED_SINT` for `*_SINT`
+/// formats, and `0` for float/normalized/other formats.
+fn typed_int_flag(format: DXGI_FORMAT) -> u32 {
+    match format.0 as u32 {
+        // R32G32B32A32_UINT, R32G32B32_UINT, R16G16B16A16_UINT, R32G32_UINT,
+        // R10G10B10A2_UINT, R8G8B8A8_UINT, R16G16_UINT, R32_UINT, R8G8_UINT,
+        // R16_UINT, R8_UINT
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => victory_shader::emit::SLOT_TYPED_UINT,
+        // R32G32B32A32_SINT, R32G32B32_SINT, R16G16B16A16_SINT, R32G32_SINT,
+        // R8G8B8A8_SINT, R16G16_SINT, R32_SINT, R8G8_SINT, R16_SINT, R8_SINT
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => victory_shader::emit::SLOT_TYPED_SINT,
+        _ => 0,
+    }
+}
+
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
@@ -817,13 +833,19 @@ fn view_stride(view: &View) -> Option<u32> {
             (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
         }
     };
-    Some(if stride > 0 {
+    let bytes = if stride > 0 {
         stride
     } else if raw {
         1
     } else {
         crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
-    })
+    };
+    let flags = if stride == 0 && !raw {
+        typed_int_flag(format)
+    } else {
+        0
+    };
+    Some((bytes & victory_shader::emit::SLOT_STRIDE_MASK) | flags)
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -2034,6 +2056,18 @@ impl HostHeap {
         }
     }
 
+    /// Writes the element-stride / typed-format metadata dword for host heap
+    /// slot `index` into the GPU-visible [`SLOT_STRIDES`] table.
+    fn write_stride_entry(&self, index: u32, entry: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -2041,6 +2075,7 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        self.write_stride_entry(index, view_stride(view).unwrap_or(0));
         self.keep(index, kept.flatten());
     }
 
@@ -2051,6 +2086,7 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
+        self.write_stride_entry(index, 0);
         self.keep(index, None);
     }
 
@@ -2091,6 +2127,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
+        self.write_stride_entry(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -3750,6 +3787,43 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    /// Typed integer buffer views (such as compute_graph_ops's R16G16B16A16_UINT
+    /// and R16_UINT tensor pools) carry SLOT_TYPED_UINT / SLOT_TYPED_SINT in
+    /// their strides-table entry while keeping their byte stride in the low bits.
+    #[test]
+    fn typed_integer_buffer_views_carry_their_format_flag_in_the_strides_table() {
+        use victory_shader::emit::{SLOT_STRIDE_MASK, SLOT_TYPED_SINT, SLOT_TYPED_UINT};
+        let uav_typed = |fmt: u32| View::Unordered(1, 0, Some([fmt, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        let srv_typed = |fmt: u32| View::Shader(1, Some([fmt, 1, 0, 0, 0, 64, 0, 0, 0, 0]));
+
+        // R16G16B16A16_UINT (12): 8-byte elements, UINT flag set.
+        let e = view_stride(&uav_typed(12)).unwrap();
+        assert_eq!(e & SLOT_STRIDE_MASK, 8);
+        assert_eq!(e & (SLOT_TYPED_UINT | SLOT_TYPED_SINT), SLOT_TYPED_UINT);
+
+        // R16_UINT (57): 2-byte elements, UINT flag set (both UAV and SRV).
+        for v in [uav_typed(57), srv_typed(57)] {
+            let e = view_stride(&v).unwrap();
+            assert_eq!(e & SLOT_STRIDE_MASK, 2);
+            assert_eq!(e & (SLOT_TYPED_UINT | SLOT_TYPED_SINT), SLOT_TYPED_UINT);
+        }
+
+        // R16G16B16A16_SINT (14): 8-byte elements, SINT flag set.
+        let e = view_stride(&uav_typed(14)).unwrap();
+        assert_eq!(e & SLOT_STRIDE_MASK, 8);
+        assert_eq!(e & (SLOT_TYPED_UINT | SLOT_TYPED_SINT), SLOT_TYPED_SINT);
+
+        // R16G16B16A16_FLOAT (10) and R16_FLOAT (54): no integer flag.
+        assert_eq!(view_stride(&uav_typed(10)), Some(8));
+        assert_eq!(view_stride(&srv_typed(54)), Some(2));
+
+        // Structured (Format=0, Stride=16) and Raw (Format=39, Flags=1): no integer flag.
+        let structured = View::Unordered(1, 0, Some([0, 1, 0, 0, 64, 16, 0, 0, 0, 0]));
+        let raw = View::Unordered(1, 0, Some([39, 1, 0, 0, 64, 0, 0, 0, 1, 0]));
+        assert_eq!(view_stride(&structured), Some(16));
+        assert_eq!(view_stride(&raw), Some(1));
     }
 
     /// The queue of textures picked by index serves the slots looked at

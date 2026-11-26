@@ -1,6 +1,6 @@
 //! SDWA form of the VOPC compares: port of the VOPC branch of `_exec_sdwa` in `emu/rdna2_exec_ext.py`.
 //!
-//! The 32-bit compares of the Python `VECTOR_COMPARE` table (`v_cmp[x]_<test>_f32/u32/i32`) read their two
+//! The compares of the Python `VECTOR_COMPARE` table read their two
 //! sources through the SDWA selections of the extension word: source 0 is the register of bits 0-7
 //! (an SGPR when bit 23 is set), source 1 the VSRC1 field (an SGPR when bit 31 is set), each with its
 //! byte or word selection, sign extension (integer compares) or abs and neg (float compares). The mask
@@ -60,7 +60,7 @@ impl Source {
     }
 }
 
-/// True when `name` is a compare this module runs in SDWA (a `VECTOR_COMPARE` 32-bit compare).
+/// True when `name` is a `VECTOR_COMPARE` operation supported in SDWA.
 pub fn supports(name: &str) -> bool {
     compare32(name).is_some()
 }
@@ -130,9 +130,10 @@ mod tests {
     }
 
     #[test]
-    fn only_32_bit_compares_are_supported() {
+    fn integer16_and_32_bit_compares_are_supported() {
         assert!(supports("v_cmp_lt_f32"));
         assert!(supports("v_cmpx_ge_i32"));
+        assert!(supports("v_cmp_lt_i16"));
         assert!(!supports("v_cmp_lt_f64"));
         assert!(!supports("v_cmp_class_f32"));
     }

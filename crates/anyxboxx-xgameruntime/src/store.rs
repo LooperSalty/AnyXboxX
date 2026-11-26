@@ -10,8 +10,10 @@
 //!  - subscribing to licence changes succeeds and the callback never runs;
 //!  - every other method is `E_NOTIMPL` (not listed in the table, so the object answers it).
 
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void};
 use std::mem::size_of;
+use std::sync::{Mutex, OnceLock};
 
 use victory_hle::modules::xasync::AsyncBlock;
 
@@ -129,6 +131,18 @@ unsafe extern "system" fn query_game_license_result(
 
 // --- Product queries: an empty result set ---------------------------------------------------
 
+fn queries() -> &'static Mutex<HashSet<usize>> {
+    static QUERIES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    QUERIES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn close_query(query: *mut c_void) {
+    if queries().lock().unwrap().remove(&(query as usize)) {
+        // SAFETY: removal proves this handle is live and only this call frees it.
+        unsafe { close::<()>(query, QUERY_MAGIC) };
+    }
+}
+
 /// Starts a query that completes with an empty query handle.
 ///
 /// # Safety
@@ -139,10 +153,10 @@ unsafe fn begin_query(context: *mut c_void, block: *mut AsyncBlock) -> HResult {
         return E_INVALIDARG;
     }
     let query = new_handle(QUERY_MAGIC, ());
+    queries().lock().unwrap().insert(query as usize);
     let mut completion = Completion::value(S_OK, query);
     completion.discard = Some(Box::new(move || {
-        // SAFETY: the query was never read, so nothing else uses it.
-        unsafe { close::<()>(query, QUERY_MAGIC) };
+        close_query(query);
     }));
     save_async::begin(block, identity(&QUERY_IDENTITY), completion)
 }
@@ -244,8 +258,7 @@ unsafe extern "system" fn enumerate_products_query(
     _context: *mut c_void,
     callback: *mut c_void,
 ) -> HResult {
-    // SAFETY: forwarded to the title's contract.
-    let live = unsafe { checked::<()>(query, QUERY_MAGIC) }.is_some();
+    let live = queries().lock().unwrap().contains(&(query as usize));
     if !live || callback.is_null() {
         return E_INVALIDARG;
     }
@@ -261,8 +274,7 @@ unsafe extern "system" fn products_query_has_more_pages(
 }
 
 unsafe extern "system" fn close_products_query(_this: *mut c_void, query: *mut c_void) {
-    // SAFETY: forwarded to the title's contract.
-    unsafe { close::<()>(query, QUERY_MAGIC) };
+    close_query(query);
 }
 
 // --- Calls that need the store: the console's network error -----------------------------------
@@ -539,13 +551,14 @@ mod tests {
         // SAFETY: both handles are ours and closed once each.
         unsafe {
             close_context(std::ptr::null_mut(), context);
-            close_products_query(std::ptr::null_mut(), query);
+            close::<()>(query, QUERY_MAGIC);
         }
     }
 
     #[test]
     fn a_query_has_no_product_and_refuses_a_missing_callback() {
         let query = new_handle(QUERY_MAGIC, ());
+        queries().lock().unwrap().insert(query as usize);
         // SAFETY: the query is ours; the callback is a placeholder that is never called.
         unsafe {
             assert_eq!(
@@ -568,6 +581,15 @@ mod tests {
             );
             assert!(!products_query_has_more_pages(std::ptr::null_mut(), query));
             close_products_query(std::ptr::null_mut(), query);
+            assert_eq!(
+                enumerate_products_query(
+                    std::ptr::null_mut(),
+                    query,
+                    std::ptr::null_mut(),
+                    std::ptr::dangling_mut::<c_void>()
+                ),
+                E_INVALIDARG
+            );
         }
     }
 

@@ -6422,9 +6422,86 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
+        let raw = self.as_int(f);
+        let mask = self.s.m.i32(super::shader::SLOT_STRIDE_MASK);
+        let v = self.s.m.bin(c, Bin::And, raw, mask);
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// Resolves a heap-backed descriptor `src` into its `(heap_index, per_lane)`
+    /// pair in the current block, for typed buffer loads and stores that need
+    /// to inspect the slot's format kind before picking a float or integer
+    /// typed-buffer handle.
+    fn typed_heap_index(&mut self, src: &Source) -> Result<(V, bool), Why> {
+        match src {
+            Source::Loaded { load, first } => {
+                let index = self.heap_index(*load, *first, false)?;
+                let per_lane = self.x.res.waterfall.loads.contains(load);
+                Ok((index, per_lane))
+            }
+            Source::Phi { block, args } => {
+                let phi = self.descriptor_phi(*block, args, false, 8)?;
+                Ok((phi, false))
+            }
+            Source::Select { scc, args } => {
+                let [
+                    Source::Loaded { load: a, first: fa },
+                    Source::Loaded { load: b, first: fb },
+                ] = args[..]
+                else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.heap_index(a, fa, false)?;
+                let clear = self.heap_index(b, fb, false)?;
+                let index = self.s.m.select(self.cur, cond, set, clear);
+                Ok((index, false))
+            }
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
+                let index = self.lane_heap_index(src, false)?;
+                Ok((index, true))
+            }
+            Source::Constant(_) => Err("a constant resource descriptor"),
+            Source::Built { .. } => Err("a typed root view"),
+        }
+    }
+
+    /// Looks up the typed-buffer format kind for view-heap slot `slot` in
+    /// [`super::shader::SLOT_TYPED`]: returns `(is_int, is_sint)`.
+    fn slot_typed_flags(&mut self, slot: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let clamped = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(clamped, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, clamped, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_TYPED);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        let entry = self.as_int(f);
+        let zero = self.s.m.i32(0);
+        let int_mask = self.s.m.i32(super::shader::SLOT_TYPED_UINT | super::shader::SLOT_TYPED_SINT);
+        let sint_mask = self.s.m.i32(super::shader::SLOT_TYPED_SINT);
+        let is_int_bits = self.s.m.bin(c, Bin::And, entry, int_mask);
+        let is_sint_bits = self.s.m.bin(c, Bin::And, entry, sint_mask);
+        let is_int = self.s.m.cmp(c, pred::NE, is_int_bits, zero);
+        let is_sint = self.s.m.cmp(c, pred::NE, is_sint_bits, zero);
+        (is_int, is_sint)
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -10240,71 +10317,126 @@ impl<'a> Lower<'a> {
         }
         if store {
             let regs = if d16 { count.div_ceil(2) } else { count };
-            let mut vals =
+            let vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
-            if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
-                let mut wide = Vec::new();
-                for k in 0..count {
-                    let mut x = vals[(k / 2) as usize];
-                    if k % 2 == 1 {
-                        let k16 = self.s.m.i32(16);
-                        x = self.s.m.bin(c, Bin::LShr, x, k16);
-                    }
-                    let f32t = self.s.t.f32;
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
-                }
-                vals = wide;
-            }
-            let mut args = Vec::new();
-            let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
+            if typed {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
-                for x in vals {
-                    args.push(self.as_float(x));
-                }
-                (69, "bufferStore.f32")
-            } else {
-                match index {
-                    // A raw buffer (stride 1) written by index: the index is the byte.
-                    Some(index) if used.is_some_and(|u| u.stride == 1) => {
-                        let byte = self.s.m.bin(c, Bin::Add, index, off);
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([byte, iu]);
+                let (heap_idx, per_lane) = self.typed_heap_index(src)?;
+                let idx = index.unwrap_or(self.s.m.i32(0));
+                let at = self.begin_guarded(guard);
+                let (is_int, is_sint) = self.slot_typed_flags(heap_idx);
+                let head = self.cur;
+                let int_bb = self.s.m.new_block();
+                let uint_bb = self.s.m.new_block();
+                let sint_bb = self.s.m.new_block();
+                let flt_bb = self.s.m.new_block();
+                let done_bb = self.s.m.new_block();
+                self.s.m.terminate(head, Term::CondBr(is_int, int_bb, flt_bb));
+
+                let void = self.s.t.void;
+                let mask = self.s.m.i8(0xF);
+
+                // Integer typed buffer (*_UINT / *_SINT): keep raw 16-bit halves
+                // for d16 (no f16->f32 conversion) and emit bufferStore.i32.
+                self.cur = int_bb;
+                // A half goes to a UINT view zero-extended and to a SINT view sign-extended:
+                // the typed store clamps the 32-bit value to the format's range, so a SINT
+                // half zero-extended (-1 as 65,535) was stored as 32,767.
+                let halves = |this: &mut Self, signed: bool| -> Vec<_> {
+                    if !d16 {
+                        return vals.clone();
                     }
-                    Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                    let k16 = this.s.m.i32(16);
+                    let m16 = this.s.m.i32(0xFFFF);
+                    let mut unpacked = Vec::with_capacity(count as usize);
+                    for k in 0..count {
+                        let x = vals[(k / 2) as usize];
+                        let half = match (k % 2 == 1, signed) {
+                            (true, false) => this.s.m.bin(int_bb, Bin::LShr, x, k16),
+                            (true, true) => this.s.m.bin(int_bb, Bin::AShr, x, k16),
+                            (false, false) => this.s.m.bin(int_bb, Bin::And, x, m16),
+                            (false, true) => {
+                                let up = this.s.m.bin(int_bb, Bin::Shl, x, k16);
+                                this.s.m.bin(int_bb, Bin::AShr, up, k16)
+                            }
+                        };
+                        unpacked.push(half);
+                    }
+                    unpacked
+                };
+                let uint_vals = halves(self, false);
+                let sint_vals = halves(self, true);
+                self.s.m.terminate(int_bb, Term::CondBr(is_sint, sint_bb, uint_bb));
+
+                for (bb, comp, int_vals) in [(uint_bb, 0x405u32, &uint_vals), (sint_bb, 0x404u32, &sint_vals)] {
+                    self.cur = bb;
+                    let h = self.s.heap_handle(bb, heap_idx, false, per_lane, (10 | u, comp));
+                    let mut args = vec![h, idx, iu];
+                    args.extend(int_vals);
+                    args.push(mask);
+                    self.s.op(bb, "bufferStore.i32", Attr::NoUnwind, void, 69, &args);
+                    self.s.m.terminate(bb, Term::Br(done_bb));
+                }
+
+                // Float / normalized typed buffer (*_FLOAT / *_UNORM / *_SNORM).
+                self.cur = flt_bb;
+                let flt_vals = if d16 {
+                    let k16 = self.s.m.i32(16);
+                    let f32t = self.s.t.f32;
+                    let mut wide = Vec::with_capacity(count as usize);
+                    for k in 0..count {
+                        let mut x = vals[(k / 2) as usize];
+                        if k % 2 == 1 {
+                            x = self.s.m.bin(flt_bb, Bin::LShr, x, k16);
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        wide.push(self.s.op(flt_bb, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]));
                     }
-                    None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
-                    }
-                }
-                args.extend(&vals);
-                args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
-            };
-            args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
-            if !typed {
-                args.push(self.s.m.i32(4));
+                    wide
+                } else {
+                    vals.iter().map(|&x| self.as_float(x)).collect()
+                };
+                let h = self.s.heap_handle(flt_bb, heap_idx, false, per_lane, (10 | u, 0x409));
+                let mut args = vec![h, idx, iu];
+                args.extend(&flt_vals);
+                args.push(mask);
+                self.s.op(flt_bb, "bufferStore.f32", Attr::NoUnwind, void, 69, &args);
+                self.s.m.terminate(flt_bb, Term::Br(done_bb));
+
+                self.cur = done_bb;
+                self.end_guarded(at, &[]);
+                return Ok(());
             }
+            let mut args = Vec::new();
+            match index {
+                // A raw buffer (stride 1) written by index: the index is the byte.
+                Some(index) if used.is_some_and(|u| u.stride == 1) => {
+                    let byte = self.s.m.bin(c, Bin::Add, index, off);
+                    args.push(self.handle(site, src, false, (11 | u, 0))?);
+                    args.extend([byte, iu]);
+                }
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    args.push(self.handle(site, src, false, (12 | u, stride))?);
+                    args.extend([index, off]);
+                }
+                None => {
+                    args.push(self.handle(site, src, false, (11 | u, 0))?);
+                    args.extend([off, iu]);
+                }
+            }
+            args.extend(&vals);
+            args.resize(3 + 4, iu);
+            args.push(self.s.m.i8((1u8 << count) - 1));
+            args.push(self.s.m.i32(4));
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
-            self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            self.s
+                .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -10321,94 +10453,175 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let r = if typed {
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a buffer result");
+        };
+        if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
-            let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
+            let (heap_idx, per_lane) = self.typed_heap_index(src)?;
+            let idx = index.unwrap_or(self.s.m.i32(0));
+            let (is_int, is_sint) = self.slot_typed_flags(heap_idx);
+            let head = self.cur;
+            let int_bb = self.s.m.new_block();
+            let uint_bb = self.s.m.new_block();
+            let sint_bb = self.s.m.new_block();
+            let int_done_bb = self.s.m.new_block();
+            let flt_bb = self.s.m.new_block();
+            let done_bb = self.s.m.new_block();
+            self.s.m.terminate(head, Term::CondBr(is_int, int_bb, flt_bb));
+
+            let i32t = self.s.t.i32;
+            let regs = if d16 { count.div_ceil(2) } else { count } as usize;
+
+            // Integer typed buffer (*_UINT / *_SINT): load via bufferLoad.i32 and
+            // pack raw 16-bit halves for d16 (no f32->f16 conversion).
+            self.cur = int_bb;
+            self.s.m.terminate(int_bb, Term::CondBr(is_sint, sint_bb, uint_bb));
+
+            let mut int_branch_vals: Vec<(usize, Vec<V>)> = Vec::with_capacity(2);
+            for (bb, comp) in [(uint_bb, 0x405u32), (sint_bb, 0x404u32)] {
+                self.cur = bb;
+                let h = self.s.heap_handle(bb, heap_idx, false, per_lane, (10 | u, comp));
+                let r = self.s.op(
+                    bb,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret_i32,
+                    68,
+                    &[h, idx, iu],
+                );
+                let out = if d16 {
+                    let k16 = self.s.m.i32(16);
+                    let m16 = self.s.m.i32(0xFFFF);
+                    let mut packed = Vec::with_capacity(regs);
+                    for k in 0..count.div_ceil(2) {
+                        let lo = self.s.m.extract(bb, r, 2 * k);
+                        let lo = self.s.m.bin(bb, Bin::And, lo, m16);
+                        let val = if 2 * k + 1 < count {
+                            let hi = self.s.m.extract(bb, r, 2 * k + 1);
+                            let hi = self.s.m.bin(bb, Bin::Shl, hi, k16);
+                            self.s.m.bin(bb, Bin::Or, lo, hi)
+                        } else {
+                            lo
+                        };
+                        packed.push(val);
+                    }
+                    packed
+                } else {
+                    (0..count).map(|k| self.s.m.extract(bb, r, k)).collect()
+                };
+                self.s.m.terminate(bb, Term::Br(int_done_bb));
+                int_branch_vals.push((bb, out));
+            }
+
+            self.cur = int_done_bb;
+            let mut int_res = Vec::with_capacity(regs);
+            for k in 0..regs {
+                let phi = self.s.m.phi(int_done_bb, i32t);
+                let incoming: Vec<(V, usize)> = int_branch_vals.iter().map(|(bb, v)| (v[k], *bb)).collect();
+                self.s.m.set_phi(phi, incoming);
+                int_res.push(phi);
+            }
+            self.s.m.terminate(int_done_bb, Term::Br(done_bb));
+
+            // Float / normalized typed buffer (*_FLOAT / *_UNORM / *_SNORM).
+            self.cur = flt_bb;
+            let h = self.s.heap_handle(flt_bb, heap_idx, false, per_lane, (10 | u, 0x409));
+            let r = self.s.op(
+                flt_bb,
                 "bufferLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 68,
-                &[h, index, iu],
-            )
-        } else {
-            let mask = self.s.m.i8((1u8 << count) - 1);
-            let align = self.s.m.i32(4);
-            match index {
-                // A raw buffer (stride 1) read by index: the index is the byte.
-                Some(index) if used.is_some_and(|u| u.stride == 1) => {
-                    let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, byte, iu, mask, align],
-                    )
-                }
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                &[h, idx, iu],
+            );
+            let flt_res = if d16 {
+                let k16 = self.s.m.i32(16);
+                let mut packed = Vec::with_capacity(regs);
+                for k in 0..count.div_ceil(2) {
+                    let mut x = None;
+                    for ch in (2 * k..(2 * k + 2).min(count)).rev() {
+                        let f = self.s.m.extract(flt_bb, r, ch);
+                        let half = self
+                            .s
+                            .op(flt_bb, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                        x = Some(match x {
+                            Some(hi) => {
+                                let hi = self.s.m.bin(flt_bb, Bin::Shl, hi, k16);
+                                self.s.m.bin(flt_bb, Bin::Or, half, hi)
+                            }
+                            None => half,
+                        });
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
+                    packed.push(x.expect("a channel"));
                 }
-                None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
-            }
-        };
-        let Some(Operand::Vector { reg, .. }) = *data else {
-            return Err("a buffer result");
-        };
-        if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
-            let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
-            for k in 0..count.div_ceil(2) {
-                let mut x = None;
-                for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    x = Some(match x {
-                        Some(hi) => {
-                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                            self.s.m.bin(c, Bin::Or, h, hi)
-                        }
-                        None => h,
-                    });
-                }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                packed
+            } else {
+                (0..count)
+                    .map(|k| {
+                        let x = self.s.m.extract(flt_bb, r, k);
+                        self.as_int(x)
+                    })
+                    .collect()
+            };
+            self.s.m.terminate(flt_bb, Term::Br(done_bb));
+
+            self.cur = done_bb;
+            for k in 0..regs {
+                let phi = self.s.m.phi(done_bb, i32t);
+                self.s.m.set_phi(phi, vec![(int_res[k], int_done_bb), (flt_res[k], flt_bb)]);
+                self.write(inst, Reg::V(reg + k as u8), phi, guard);
             }
             return Ok(());
         }
+        let mask = self.s.m.i8((1u8 << count) - 1);
+        let align = self.s.m.i32(4);
+        let r = match index {
+            // A raw buffer (stride 1) read by index: the index is the byte.
+            Some(index) if used.is_some_and(|u| u.stride == 1) => {
+                let byte = self.s.m.bin(c, Bin::Add, index, off);
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, byte, iu, mask, align],
+                )
+            }
+            Some(index) => {
+                let stride = used.map_or(0, |u| u.stride);
+                if stride < 4 || !stride.is_multiple_of(4) {
+                    return Err("a structured buffer of unknown stride");
+                }
+                let h = self.handle(site, src, false, (12 | u, stride))?;
+                self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, index, off, mask, align],
+                )
+            }
+            None => {
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, off, iu, mask, align],
+                )
+            }
+        };
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);

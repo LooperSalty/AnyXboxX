@@ -7,15 +7,12 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::app::{App, Tab};
-use crate::progress::Progress;
-use crate::{anim, home, splash, theme, toast, ui_chrome, ui_home, ui_pages};
+use crate::{anim, home, theme, toast, tokens, ui_chrome, ui_home, ui_launch, ui_pages};
 
 /// How often the window redraws while a job or a folder check runs.
 const BUSY_REPAINT: Duration = Duration::from_millis(200);
-/// Length of the fade and slide between pages, in seconds.
-const PAGE_TRANSITION: f64 = 0.28;
 /// Distance a page slides up while it fades in.
-const PAGE_SLIDE: f32 = 18.0;
+const PAGE_SLIDE: f32 = 12.0;
 /// Seconds between two looks at the shader cache folder.
 const CACHE_CHECK_EVERY: f64 = 2.0;
 
@@ -33,7 +30,6 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
-        self.splash.poll(&ctx);
         self.handle_drops(&ctx);
         self.refresh_chips(now);
         if let Some(notice) = self.notice.take() {
@@ -41,7 +37,7 @@ impl eframe::App for App {
             self.toasts.push(notice, kind, now);
         }
         theme::paint_background(&ctx);
-        let open_frame = egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 12));
+        let open_frame = egui::Frame::new().inner_margin(egui::Margin::symmetric(24, 16));
         egui::Panel::left("nav")
             .frame(open_frame)
             .exact_size(ui_chrome::SIDEBAR_WIDTH)
@@ -49,10 +45,10 @@ impl eframe::App for App {
             .show_separator_line(false)
             .show_inside(ui, |ui| ui_chrome::sidebar(self, ui));
         egui::Panel::bottom("console_head")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 8)))
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(24, 8)))
             .show_inside(ui, |ui| ui_chrome::console_header(self, ui));
         let drawer = egui::Panel::bottom("console_body")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 0)))
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(24, 0)))
             .exact_size(ui_chrome::console_height())
             .resizable(false);
         let open = self.drawer_open;
@@ -62,7 +58,7 @@ impl eframe::App for App {
             .show_inside(ui, |ui| self.show_page(ui, now));
         ui_pages::confirm_clean(self, &ctx);
         ui_chrome::toasts(self, &ctx);
-        self.show_splash(&ctx);
+        ui_launch::show(self, &ctx);
         self.save_settings_if_changed();
     }
 }
@@ -74,7 +70,7 @@ impl App {
             self.shown_tab = self.tab;
             self.tab_changed_at = now;
         }
-        let progress = anim::eased_progress(now, self.tab_changed_at, PAGE_TRANSITION);
+        let progress = anim::eased_progress(now, self.tab_changed_at, tokens::PAGE_TIME);
         if progress < 1.0 {
             ui.ctx().request_repaint();
             ui.set_opacity(progress);
@@ -87,8 +83,8 @@ impl App {
                 Tab::Home => ui_home::home(self, ui),
                 Tab::Setup => ui_pages::setup(self, ui),
                 Tab::Play => ui_pages::play(self, ui),
-                Tab::Files => theme::card(ui, |ui| ui_pages::files(self, ui)),
-                Tab::Shaders => theme::card(ui, |ui| ui_pages::shaders(self, ui)),
+                Tab::Files => ui_pages::files(self, ui),
+                Tab::Shaders => ui_pages::shaders(self, ui),
             });
     }
 
@@ -98,26 +94,5 @@ impl App {
             self.cache_checked_at = now.max(f64::MIN_POSITIVE);
             self.cache_ready = home::cache_filled(self.cache_dir.as_deref());
         }
-    }
-
-    /// The launch screen: the splash over the window at start-up and while a job runs.
-    fn show_splash(&mut self, ctx: &egui::Context) {
-        let busy = self.running.is_some();
-        if !self.splash.visible(busy) {
-            return;
-        }
-        let progress = self.progress().cloned();
-        let (title, idle) = if busy {
-            (
-                self.step.clone().unwrap_or_else(|| "Working".to_string()),
-                "Working...",
-            )
-        } else {
-            ("AnyXboxX".to_string(), "Starting...")
-        };
-        let status =
-            splash::status_text(progress.as_ref(), self.log.back().map(String::as_str), idle);
-        let fraction = progress.as_ref().map(Progress::fraction);
-        self.splash.show(ctx, busy, &title, &status, fraction);
     }
 }

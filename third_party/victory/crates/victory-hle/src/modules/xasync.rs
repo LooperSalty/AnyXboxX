@@ -474,6 +474,7 @@ struct Call {
     context: usize,
     identity: usize,
     done: Mutex<bool>,
+    cleaning: AtomicBool,
     finished: Condvar,
 }
 
@@ -517,7 +518,12 @@ fn status(block: *mut AsyncBlock) -> HRESULT {
 
 fn release(block: *mut AsyncBlock) {
     // Unlocked before the provider runs: it may call back into us.
-    let removed = lock(&CALLS).remove(&(block as usize));
+    let mut calls = lock(&CALLS);
+    if calls.get(&(block as usize)).is_some_and(|call| call.cleaning.load(Ordering::Acquire)) {
+        return;
+    }
+    let removed = calls.remove(&(block as usize));
+    drop(calls);
     if let Some(call) = removed {
         call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
@@ -544,6 +550,7 @@ pub fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         done: Mutex::new(false),
+        cleaning: AtomicBool::new(false),
         finished: Condvar::new(),
     });
     lock(&CALLS).insert(block as usize, call.clone());
@@ -603,11 +610,21 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    let release_on_completion = result < 0 || required_size == 0;
+    if release_on_completion {
+        // Keep the call discoverable while cleanup runs: a waiting GetStatus must
+        // not observe a missing call with its status still E_PENDING.
+        call.cleaning.store(true, Ordering::Release);
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
+    // Removal and publication are atomic with respect to call().
+    let mut calls = lock(&CALLS);
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
+    if release_on_completion {
+        calls.remove(&(block as usize));
+    }
+    drop(calls);
     *done = true;
     call.finished.notify_all();
     drop(done);

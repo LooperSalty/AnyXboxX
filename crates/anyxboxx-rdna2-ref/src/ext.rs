@@ -190,7 +190,7 @@ fn execute_sdwa(wave: &mut Wave, name: &str, fields: &Fields, ext: u32) -> Resul
     let dst_unused = (ext >> 11) & 3;
     let clamp = (ext >> 13) & 1 == 1;
     let omod = (ext >> 14) & 3;
-    if !destination_float && clamp {
+    if !destination_float && (clamp || omod != 0) {
         return Err(Error::Untranslated(format!(
             "SDWA clamp non pris en charge sur opération entière : {name}"
         )));

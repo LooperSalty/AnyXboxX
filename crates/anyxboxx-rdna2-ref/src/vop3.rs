@@ -347,6 +347,10 @@ pub fn execute(
     word: u64,
     literal: Option<u32>,
 ) -> Result<bool, Error> {
+    if name == "v_pk_fmac_f16" {
+        crate::pkf16::execute_fmac_vop3(wave, word, literal)?;
+        return Ok(true);
+    }
     if crate::wide::execute(
         wave,
         name,
@@ -368,6 +372,14 @@ pub fn execute(
     }
     let fields = Fields::new(word);
     let opcode = ((word >> 16) & 0x3FF) as u32;
+    if (name.ends_with("_u16") || name.ends_with("_i16"))
+        && crate::compare::is_compare(name)
+        && (word >> 11) & 0xf != 0
+    {
+        return Err(Error::Untranslated(format!(
+            "{name}: op_sel on a 16-bit compare"
+        )));
+    }
     if crate::vector::is_no_operation(name) {
         return Ok(true);
     }
@@ -415,6 +427,11 @@ pub fn execute(
     }
     let fields = Fields::new(word);
     let is_float = is_float_result(name);
+    if fields.clamp && !is_float {
+        return Err(Error::Untranslated(format!(
+            "{name}: clamp on integer result"
+        )));
+    }
     let destination = fields.vdst as usize;
     for lane in wave.active()? {
         let mut values = [0u32; 3];

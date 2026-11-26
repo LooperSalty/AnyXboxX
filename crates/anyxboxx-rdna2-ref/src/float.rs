@@ -47,6 +47,22 @@ pub fn inline_constant(code: u32) -> Option<u64> {
     Some(u64::from(float_bits(value)))
 }
 
+/// The double-precision bit patterns of inline float operands 240 to 248.
+pub fn inline_double(code: u32) -> Option<u64> {
+    Some(match code {
+        240 => 0x3fe0_0000_0000_0000,
+        241 => 0xbfe0_0000_0000_0000,
+        242 => 0x3ff0_0000_0000_0000,
+        243 => 0xbff0_0000_0000_0000,
+        244 => 0x4000_0000_0000_0000,
+        245 => 0xc000_0000_0000_0000,
+        246 => 0x4010_0000_0000_0000,
+        247 => 0xc010_0000_0000_0000,
+        248 => 0x3fc4_5f30_6dc9_c882,
+        _ => return None,
+    })
+}
+
 /// Python's `min(a, b)`: `a` unless `b` is smaller (so a NaN in `a` wins).
 pub fn py_min(a: f64, b: f64) -> f64 {
     if b < a { b } else { a }
