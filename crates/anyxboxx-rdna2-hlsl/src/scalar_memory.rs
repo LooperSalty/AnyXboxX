@@ -8,6 +8,9 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     } else {
         return Err(format!("untranslated instruction: {name}"));
     };
+    if let Some(kind) = rest.strip_prefix("atomic_") {
+        return crate::scalar_atomic::statements(name, kind, buffer, word);
+    }
     let (store, width) = if let Some(width) = rest.strip_prefix("load_") {
         (false, width)
     } else if let Some(width) = rest.strip_prefix("store_") {

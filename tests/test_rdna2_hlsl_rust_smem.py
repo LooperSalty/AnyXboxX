@@ -47,8 +47,8 @@ def test_smem_text_and_warp(name, offset, soffset, monkeypatch):
 
 
 def test_smem_atomic_remains_named():
-    result = rust(program(*smem("s_atomic_add", 8, 4)))
-    assert result.returncode != 0 and b"s_atomic_add" in result.stderr
+    result = rust(program(*smem("s_atomic_add_x2", 8, 4)))
+    assert result.returncode != 0 and b"s_atomic_add_x2" in result.stderr
 
 
 @pytest.mark.parametrize("name,dest,offset", [("s_load_dwordx2", 4, 0),

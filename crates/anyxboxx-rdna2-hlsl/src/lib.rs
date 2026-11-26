@@ -3,6 +3,7 @@
 use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
 
 mod scalar;
+mod scalar_atomic;
 mod scalar_binary;
 mod scalar_compare;
 mod scalar_immediate;
