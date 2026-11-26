@@ -1,64 +1,52 @@
 //! The environment `anyxboxx run` gives VIctory: the same variables, values and conditions as
-//! main's `tools/lancer_victory.ps1` (Neptune base). The golden copy of that script is
-//! `tests/fixtures/lancer_victory_neptune.ps1`; `tests/test_anyxboxx_run.py` compares both.
+//! main's `tools/lancer_victory.ps1`, on the Vice-Tay base. The golden copy of that script is
+//! `tests/fixtures/lancer_victory_vicetay.ps1`; `tests/test_anyxboxx_run.py` compares both. (The Neptune-base
+//! script survives as `tests/fixtures/lancer_victory_neptune.ps1`, unused.)
 
 use std::ffi::OsString;
 use std::path::Path;
 
 use super::{Profile, RunArgs};
 
-/// Neptune (VIctory Edit.) 2026-11-25c's play.ps1 for the Series X path, with the measured changes
-/// of 2026-11-25 on top. Applied unless `--no-tuned-settings`, in this order.
+/// Vice-Tay's `scripts/play.ps1 -Machine 4070` (RTX 4070 / 8-core profile), not `-Safe`, windowed, no panel (our
+/// overlay replaces it), in the order of the script's table. Measured 2026-11-26 on an RTX 4070 SUPER + i7-13700KF,
+/// Series X, warm cache: about 20 fps median in the world against 14.2 for the Neptune set it replaces.
+/// Applied unless `--no-tuned-settings`, in this order.
+///
+/// `VICTORY_D3D12_DRED=light` is part of the measured set: on this base it keeps the lists without markers (and only
+/// does anything in the diagnostics build). `--dred` still overrides it with the full mode (`VICTORY_D3D12_DRED=1`):
+/// `base` pushes that after the tuned set, the quality set and `--override`.
 pub const TUNED: &[(&str, &str)] = &[
-    ("VICTORY_CARD_WINDOWS_MB", "1536"),
-    ("VICTORY_BAKE_TEXTURES_MS", "10000"),
-    ("VICTORY_EARLY_TEXTURES_MS", "40"),
-    ("VICTORY_WIDE_MERGE", "1"),
-    ("VICTORY_RELAY_OWN_QUEUE", "1"),
-    ("VICTORY_UNDER_WRITES_WORDS", "1"),
-    ("VICTORY_UNDER_WRITES_RUNS", "100000"),
-    ("VICTORY_UNDER_WRITES_MASKS", "1"),
-    ("VICTORY_RELAY", "2"),
-    ("VICTORY_WIDE_REFRESH", "1"),
-    ("VICTORY_ASK_ONCE", "1"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    ("VICTORY_RELAY", "2"),
+    ("VICTORY_WIDE_BACK", "1"),
     ("VICTORY_CARD_REHASH_RUNS", "1"),
     ("VICTORY_JOIN_COPIES", "1"),
-    ("VICTORY_D3D12_BACKGROUND", "0"),
-    ("VICTORY_LATE_WAIT_LISTS", "1024"),
-    ("VICTORY_WINDOW_TAILS", "1"),
-    ("VICTORY_TEXTURE_STAGE_MB", "512"),
+    ("VICTORY_INDIRECT_WINDOW", "1"),
+    ("VICTORY_RELAY_COPY", "1"),
+    ("VICTORY_CARD_STEPS", "2"),
+    ("VICTORY_TITLE_PRIORITIES", "0"),
+    ("VICTORY_SHOW_AFTER", "1"),
+    ("VICTORY_AMBIENT", "0.8"),
+    ("VICTORY_D3D12_DRED", "light"),
+    // The console wave64 programs a 32-lane card takes only in the wave-wide form.
+    (
+        "VICTORY_WAVE_WIDE_ONLY",
+        "6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291",
+    ),
+    ("VICTORY_THIN_THREADS", "8"),
+    ("VICTORY_UNDER_THREADS", "6"),
+    ("VICTORY_LAND_THREADS", "4"),
+    ("VICTORY_MAP_THREADS", "1"),
+    ("VICTORY_PIPELINE_WORKERS", "3"),
+    ("VICTORY_CARD_RESERVE_BUDGETS", "1"),
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
-    ("VICTORY_ASK_QUIET", "8"),
-    ("VICTORY_COPY_CHANGED", "1"),
-    ("VICTORY_QUIET_BACK", "1"),
-    ("VICTORY_LIST_POOL_MOST", "2048"),
-    ("VICTORY_LIST_POOL_MB", "512"),
-    ("VICTORY_WIDE_THREADS", "12"),
-    ("VICTORY_UNDER_WRITES_MASKS_LEAST", "1"),
-    ("VICTORY_INDIRECT_RAW", "2"),
-    ("VICTORY_TEXTURE_HASH_EVERY", "32"),
-    ("VICTORY_LEVELS_ON_DEMAND", "1"),
-    ("VICTORY_WINDOW_KB", "1024"),
     ("VICTORY_CARD_BUFFERS_MB", "1536"),
-    ("VICTORY_CARD_WINDOW_UPLOAD", "1"),
-    ("VICTORY_DROP_DXIL", "1"),
-    ("VICTORY_DESC_DATA", "1"),
-    ("VICTORY_VRAM_IDLE_MS", "8000,2000,1000"),
-    ("VICTORY_PIPELINE_WAIT_MS", "2500"),
-    ("VICTORY_TEXTURE_ROOM_PERCENT", "93"),
-    ("VICTORY_HEAP_PASS_DIRTY", "1"),
-    ("VICTORY_COPY_COALESCE", "256"),
-    // PR #358 (measured 2026-11-26, RTX 4070 SUPER, Series X): 13.4 -> 15.2 fps median.
-    ("VICTORY_WINDOW_SKIP_SAME", "1"),
-    ("VICTORY_MERGE_SUBMISSIONS", "1"),
-    ("VICTORY_PAGE_WRITES", "5"),
-    // PR #383 (fxceless/victory-gta6 ports), measured 2026-11-26 in one run alternating every 20 s (RTX 4070 SUPER, Series X): 12.7 -> 14.8 fps median, +17 %.
-    ("VICTORY_STEP_INDEX", "1"),
-    ("VICTORY_CARD_SYNC_BATCH", "1"),
-    ("VICTORY_PARALLEL_REFRESH", "1"),
-    // The full scan of kept heap slots every 16 passes instead of every pass, measured 2026-11-26 in one run alternating every 20 s (RTX 4070 SUPER, Series X): 14.2 -> 15.2 fps median, frames over 100 ms 4 -> 1.
-    ("VICTORY_HEAP_SCAN_ALT", "1"),
+    ("VICTORY_CARD_WINDOWS_MB", "1024"),
+    ("VICTORY_THIN", "1"),
+    ("VICTORY_JOIN_PARTS", "8"),
+    ("VICTORY_UPLOAD_AHEAD", "1"),
+    ("VICTORY_INDIRECT_BATCH", "2"),
 ];
 
 /// Linux (Proton) + AMD measured set (PR #199, RX 9070 XT / RADV / vkd3d-proton).
@@ -79,16 +67,14 @@ pub const LINUX_AMD: &[(&str, &str)] = &[
 pub const QUALITY: &[(&str, &str)] = &[
     ("VICTORY_CARD_WINDOWS_MB", "0"),
     ("VICTORY_CARD_BUFFERS_MB", "1024"),
-    ("VICTORY_LIST_POOL_MOST", "256"),
-    ("VICTORY_LIST_POOL_MB", "256"),
     ("VICTORY_TEXTURE_STAGE_MB", "192"),
 ];
 
 /// Set on every launch, before the tuned set (the script sets them first).
-pub const ALWAYS: &[(&str, &str)] = &[("VICTORY_DISCORD", "0"), ("VICTORY_OCEAN_READBACK", "1")];
+pub const ALWAYS: &[(&str, &str)] = &[("VICTORY_DISCORD", "0")];
 
 pub const GAME_DIR: &str = "VICTORY_GAME_DIR";
-/// VIctory turns DRED on when the variable exists, whatever its value: only set when asked.
+/// The tuned set carries `light`; `--dred` sets the full mode `1` after it (and after overrides), so it wins.
 pub const DRED: &str = "VICTORY_D3D12_DRED";
 pub const AUTO_A: &str = "VICTORY_AUTO_A";
 pub const FRAMETIME_DUMP: &str = "VICTORY_FRAMETIME_DUMP";
