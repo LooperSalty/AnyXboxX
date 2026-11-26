@@ -32,12 +32,22 @@ pub struct WarmState {
 }
 
 /// The steps of a launch, in order. `warm_first` also runs the shaders.rpf/exe/DLL preload.
+///
+/// When VIctory is built first, a warm that looked unneeded is still listed: it checks the
+/// fingerprint again once the build is over, because a rebuilt `victory.exe` changes it.
 pub fn play_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> {
     let victory = Victory::locate(&plan.repo, false)?;
     anyxboxx::run::game_exe(&plan.game_dir)?;
-    let mut steps: Vec<Step> = build_step(&victory).into_iter().collect();
-    if let Some(warm) = plan.warm.as_ref().filter(|w| w.needed) {
-        steps.push(warm_step(&victory, plan, marker_of(warm))?);
+    let build = build_step(&victory);
+    let rebuilds = build.is_some();
+    let mut steps: Vec<Step> = build.into_iter().collect();
+    if let Some(warm) = plan.warm.as_ref() {
+        let step = warm_step(&victory, plan, warm.marker.clone())?;
+        if warm.needed {
+            steps.push(step);
+        } else if rebuilds {
+            steps.push(step.with_run_if(stale_after_build(&victory, plan, warm.marker.clone())?));
+        }
     }
     if warm_first {
         steps.push(precompile_step(&victory, plan)?);
@@ -55,16 +65,33 @@ pub fn precompile_steps(plan: &Plan) -> Result<Vec<Step>, RunError> {
     let victory = Victory::locate(&plan.repo, false)?;
     anyxboxx::run::game_exe(&plan.game_dir)?;
     let mut steps: Vec<Step> = build_step(&victory).into_iter().collect();
-    let marker = plan.warm.as_ref().and_then(marker_of);
+    let marker = plan.warm.as_ref().and_then(|warm| warm.marker.clone());
     steps.push(warm_step(&victory, plan, marker)?);
     Ok(steps)
 }
 
-/// The marker path and the fingerprint to write once the warm succeeded.
-fn marker_of(warm: &WarmState) -> Option<(PathBuf, String)> {
-    warm.marker
-        .clone()
-        .map(|path| (path, warm.fingerprint.clone()))
+/// The fingerprint of `exe`, `env` and `archives` as they are now.
+fn fingerprint_now(exe: &Path, env: &Env, archives: &[PathBuf]) -> String {
+    let identities = warm_state::archive_identities(archives);
+    warm_state::fingerprint(&warm_state::build_id(exe), env, &identities)
+}
+
+/// The check of a warm listed after a build: needed when the marker no longer matches.
+fn stale_after_build(
+    victory: &Victory,
+    plan: &Plan,
+    marker: Option<PathBuf>,
+) -> Result<crate::job::RunIf, RunError> {
+    let (exe, env) = (victory.exe.clone(), plan.env.clone());
+    let archives = warm_archives(&plan.game_dir)?;
+    Ok(Box::new(move || {
+        let stored = marker.as_deref().and_then(warm_state::read_marker);
+        warm_state::needs_warm(
+            false,
+            stored.as_deref(),
+            &fingerprint_now(&exe, &env, &archives),
+        )
+    }))
 }
 
 /// The cargo build of VIctory; `None` for a `victory.exe` built beforehand.
@@ -75,12 +102,9 @@ fn build_step(victory: &Victory) -> Option<Step> {
 }
 
 /// `victory warm` on the game folder's own .rpf archives, with the game's environment. After a
-/// success the marker gets the fingerprint, so the next launch skips the warm while nothing changed.
-fn warm_step(
-    victory: &Victory,
-    plan: &Plan,
-    marker: Option<(PathBuf, String)>,
-) -> Result<Step, RunError> {
+/// success the marker gets the fingerprint of that moment (after any build), so the next launch
+/// skips the warm while nothing changed.
+fn warm_step(victory: &Victory, plan: &Plan, marker: Option<PathBuf>) -> Result<Step, RunError> {
     let archives = warm_archives(&plan.game_dir)?;
     let mut command = victory.warm_command(&archives, &plan.env);
     if let Some(jobs) = plan.jobs {
@@ -88,10 +112,13 @@ fn warm_step(
     }
     let step = Step::new("Warming the shader cache", command);
     Ok(match marker {
-        Some((path, fingerprint)) => step.with_after(Box::new(move || {
-            warm_state::write_marker(&path, &fingerprint)
-                .map_err(|e| format!("could not write {}: {e}", path.display()))
-        })),
+        Some(path) => {
+            let (exe, env) = (victory.exe.clone(), plan.env.clone());
+            step.with_after(Box::new(move || {
+                warm_state::write_marker(&path, &fingerprint_now(&exe, &env, &archives))
+                    .map_err(|e| format!("could not write {}: {e}", path.display()))
+            }))
+        }
         None => step,
     })
 }
@@ -115,8 +142,7 @@ pub fn warm_check(
     marker: Option<PathBuf>,
 ) -> Option<WarmState> {
     let archives = warm_archives(game_dir).ok()?;
-    let identities = warm_state::archive_identities(&archives);
-    let fingerprint = warm_state::fingerprint(&warm_state::build_id(victory_exe), env, &identities);
+    let fingerprint = fingerprint_now(victory_exe, env, &archives);
     let stored = marker.as_deref().and_then(warm_state::read_marker);
     let needed = warm_state::needs_warm(always, stored.as_deref(), &fingerprint);
     Some(WarmState {
@@ -184,6 +210,35 @@ mod tests {
         let game_args = args_of(&steps[1].command);
         assert_eq!(game_args.first().map(String::as_str), Some("run"));
         assert!(game_args.iter().any(|a| a == "--execute"));
+    }
+
+    /// A warm that looked unneeded before the build is listed, and decides once the build is over:
+    /// a marker written for another victory.exe makes it run, a marker of this one skips it.
+    #[test]
+    fn a_warm_after_a_build_checks_the_fingerprint_of_the_new_exe() {
+        let (_repo, _game, mut plan) = fixture();
+        let marker_dir = tempfile::tempdir().expect("tempdir");
+        let marker = marker_dir.path().join("warm-state.txt");
+        plan.warm = Some(WarmState {
+            needed: false,
+            marker: Some(marker.clone()),
+            fingerprint: "before the build".to_string(),
+        });
+        let exe = Victory::locate(&plan.repo, false).expect("victory").exe;
+        let archives = warm_archives(&plan.game_dir).expect("archives");
+        let check = |plan: &Plan| {
+            let mut steps = play_steps(plan, false).expect("steps");
+            let warm = steps
+                .iter_mut()
+                .find(|s| s.label == "Warming the shader cache")
+                .expect("warm listed after the build");
+            (warm.run_if.take().expect("decided after the build"))()
+        };
+        warm_state::write_marker(&marker, "fingerprint of the old victory.exe").expect("marker");
+        assert!(check(&plan));
+        warm_state::write_marker(&marker, &fingerprint_now(&exe, &plan.env, &archives))
+            .expect("marker");
+        assert!(!check(&plan));
     }
 
     #[test]

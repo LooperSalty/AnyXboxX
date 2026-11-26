@@ -9,15 +9,15 @@ use crate::error::Error;
 use crate::wave::Wave;
 
 const MASK32: u64 = 0xFFFF_FFFF;
-const VDST_MASK: u64 = 0xFF;
-const SOURCE_SHIFTS: [u32; 3] = [32, 41, 50];
-const SOURCE_MASK: u64 = 0x1FF;
-const NEG_HI_SHIFT: u32 = 8;
-const OP_SEL_SHIFT: u32 = 11;
-const NEG_LO_SHIFT: u32 = 61;
-const OP_SEL_HI_SHIFTS: [u32; 3] = [59, 60, 14];
-const CLAMP_BIT: u32 = 15;
-const THREE_BITS: u64 = 0x7;
+pub(crate) const VDST_MASK: u64 = 0xFF;
+pub(crate) const SOURCE_SHIFTS: [u32; 3] = [32, 41, 50];
+pub(crate) const SOURCE_MASK: u64 = 0x1FF;
+pub(crate) const NEG_HI_SHIFT: u32 = 8;
+pub(crate) const OP_SEL_SHIFT: u32 = 11;
+pub(crate) const NEG_LO_SHIFT: u32 = 61;
+pub(crate) const OP_SEL_HI_SHIFTS: [u32; 3] = [59, 60, 14];
+pub(crate) const CLAMP_BIT: u32 = 15;
+pub(crate) const THREE_BITS: u64 = 0x7;
 
 /// The dot products of this module: element width in bits and whether the elements are signed.
 pub fn operation(name: &str) -> Option<(u32, bool)> {
@@ -86,6 +86,11 @@ pub fn execute(
     word: u64,
     literal: Option<u32>,
 ) -> Result<bool, Error> {
+    if crate::pkf16::execute_packed(wave, name, word, literal)?
+        || crate::pkf16_mix::execute(wave, name, word, literal)?
+    {
+        return Ok(true);
+    }
     if let Some(op) = name.strip_prefix("v_pk_")
         && packed(wave, op, word, literal)?
     {

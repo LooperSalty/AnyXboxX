@@ -196,6 +196,12 @@ pub fn step(wave: &mut Wave, data: &[u8]) -> Result<bool, Error> {
         wave.pc = next_pc;
         return Ok(true);
     }
+    if family == "VOP2" && name == "v_pk_fmac_f16" {
+        // Ahead of the generic VOP2 path: the packed form refuses its own SDWA and DPP sources.
+        crate::pkf16::execute_fmac_vop2(wave, word, literal)?;
+        wave.pc = next_pc;
+        return Ok(true);
+    }
     if flat_family {
         // Two words: the offset, the registers and the GLC bit are in the first, the registers in the second.
         let wide = u64::from(word) | u64::from(word_at(data, wave.pc + DWORD)) << 32;

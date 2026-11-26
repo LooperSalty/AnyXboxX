@@ -110,10 +110,30 @@ pub fn write_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
     std::fs::write(path, format!("{fingerprint}\n"))
 }
 
+/// Deletes the marker (the shader cache was cleaned): the next launch warms again. A missing
+/// marker is not an error.
+pub fn forget_marker(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn a_forgotten_marker_makes_the_next_launch_warm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("warm-state.txt");
+        write_marker(&path, "fp").expect("write");
+        assert!(!needs_warm(false, read_marker(&path).as_deref(), "fp"));
+        forget_marker(&path).expect("forget");
+        assert!(needs_warm(false, read_marker(&path).as_deref(), "fp"));
+        forget_marker(&path).expect("a missing marker is fine");
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Env {
         pairs

@@ -353,11 +353,23 @@ impl App {
             self.notice = Some("No cache folder: LOCALAPPDATA is not set.".to_string());
             return;
         };
-        self.notice = Some(match cache::clean_cache(&dir) {
+        let cleaned = cache::clean_cache(&dir);
+        // With the cache gone, the warm marker would make the next launch skip the warm.
+        let forgotten =
+            match crate::warm_state::marker_path(std::env::var_os("LOCALAPPDATA").as_deref()) {
+                Some(marker) if cleaned.is_ok() => crate::warm_state::forget_marker(&marker)
+                    .map_err(|e| format!(" (could not delete {}: {e})", marker.display())),
+                _ => Ok(()),
+            };
+        let mut notice = match cleaned {
             Ok(cache::CleanOutcome::Removed) => format!("Shader cache removed: {}", dir.display()),
             Ok(cache::CleanOutcome::NothingToClean) => "No shader cache to remove.".to_string(),
             Err(error) => error.to_string(),
-        });
+        };
+        if let Err(warning) = forgotten {
+            notice.push_str(&warning);
+        }
+        self.notice = Some(notice);
     }
 
     /// Drains the results of the threads started earlier.

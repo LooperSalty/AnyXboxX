@@ -22,6 +22,7 @@ from emu.rdna2_exec import VOP2_CARRY, Wave
 from emu.rdna2_exec_cmp64 import COMPARE64
 from emu.rdna2_exec_dot import OPERATIONS as DOT_OPERATIONS
 from emu.rdna2_exec_int16 import PACKED
+from emu.rdna2_exec_pkf16 import PACKED_F16, VOP3P as PKF16_VOP3P
 from emu.rdna2_exec_memory import PAGE
 from emu.rdna2_exec_movrel import SCALAR as MOVREL_SCALAR, VECTOR as MOVREL_VECTOR
 from emu.rdna2_exec_wide import OPERATIONS as WIDE_OPERATIONS
@@ -1240,12 +1241,22 @@ def vop3p_cases():
     """(programme, exécuté) : les VOP3P hors produits scalaires et les produits scalaires avec op_sel,
     neg ou clamp, que le modèle Python refuse, et un produit scalaire sans modificateur."""
     sources = (V0 + 1, V0 + 2, V0 + 1)
-    cases = [(vop3p(name, 9, sources), name in PACKED)
+    cases = [(vop3p(name, 9, sources), name in PACKED or name in PKF16_VOP3P)
              for (family, name) in sorted(OPCODES) if family == "VOP3P" and name not in DOT_OPERATIONS]
     cases += [(vop3p(name, 9, sources, **flags), runs)
               for name in PACKED for flags, runs in (({"op_sel": 5, "op_sel_hi": 2}, True),
                                                       ({"neg_lo": 1}, False),
                                                       ({"clamp": 1}, not any(x in name for x in ("mul", "shr", "shl"))))]
+    # Packed f16 (VOP3P): every modifier is defined, the clamp included.
+    cases += [(vop3p(name, 9, sources, **flags), True)
+              for name in PACKED_F16 for flags in ({"op_sel": 5, "op_sel_hi": 2}, {"neg_lo": 1}, {"neg_hi": 6}, {"clamp": 1})]
+    # Mixed precision and f16 dot product: op_sel[i] needs op_sel_hi[i]; op_sel[2] and neg_hi[2] are refused.
+    cases += [(vop3p("v_fma_mix_f32", 9, sources, op_sel=2), True),
+              (vop3p("v_fma_mixlo_f16", 9, sources, op_sel=1, op_sel_hi=0b110), False),
+              (vop3p("v_fma_mixhi_f16", 9, sources, neg_lo=4, neg_hi=1, clamp=1), True),
+              (vop3p("v_dot2_f32_f16", 9, sources, op_sel=4), False),
+              (vop3p("v_dot2_f32_f16", 9, sources, neg_hi=4), False),
+              (vop3p("v_dot2_f32_f16", 9, sources, neg_lo=4, clamp=1), True)]
     cases += [(vop3p("v_dot4_u32_u8", 9, sources, **flags), False)
               for flags in ({"op_sel": 1}, {"op_sel_hi": 0b011}, {"neg_lo": 2}, {"neg_hi": 4}, {"clamp": 1})]
     return cases + [(vop3p("v_dot2_i32_i16", 9, sources), True)]
@@ -1264,6 +1275,55 @@ def assert_select_cases(cases):
 
 def test_vop3p_forms_match_the_python_model():
     assert_select_cases(vop3p_cases())
+
+
+PKF16_SPECIAL_WORDS = (0x00000000, 0x80000000, 0x3C003C00, 0xBC00BC00, 0x7C007C00, 0xFC00FC00, 0x7E007E00,
+                       0x7BFF7BFF, 0x00010001, 0x83FF83FF, 0x3F800000, 0xBF800000, 0x7F800000, 0xFF800000,
+                       0x7FC00000, 0x7F800001, 0x00800000, 0x7F7FFFFF, 0x3C014000)
+PKF16_VOP3P_NAMES = ("v_pk_fma_f16", "v_pk_add_f16", "v_pk_mul_f16", "v_pk_min_f16", "v_pk_max_f16",
+                     "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16", "v_dot2_f32_f16")
+PKF16_PROGRAMS = 200
+
+
+def pkf16_operand(rng):
+    """A 32-bit operand: halves and f32 values at the edges (NaN, infinities, subnormals, ties) or random bits."""
+    return rng.choice(PKF16_SPECIAL_WORDS) if rng.random() < 0.4 else rng.getrandbits(32)
+
+
+def pkf16_program(rng):
+    """Words of one program: v1 to v3 loaded with operands, then a packed f16 form with random modifiers."""
+    setup = []
+    for index in (1, 2, 3):
+        setup += [vop1("v_mov_b32", index, LITERAL), pkf16_operand(rng)]
+    sources = (V0 + 1, V0 + 2, V0 + 3) if rng.random() < 0.8 else (V0 + 1, rng.choice((240, 242, 245, 248, 128)), V0 + 3)
+    if rng.random() < 0.8:
+        flags = {"op_sel": rng.randrange(8), "op_sel_hi": rng.randrange(8), "neg_lo": rng.randrange(8),
+                 "neg_hi": rng.randrange(8), "clamp": rng.randrange(2)}
+        if rng.random() < 0.5:
+            flags = {"clamp": flags["clamp"]}
+        instruction = vop3p(rng.choice(PKF16_VOP3P_NAMES), 9, sources, **flags)
+    elif rng.random() < 0.5:
+        instruction = vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), op_sel=rng.randrange(16),
+                           clamp=rng.randrange(2), abs_bits=rng.randrange(8), neg=rng.randrange(8))
+    else:
+        instruction = vop2("v_pk_fmac_f16", 9, V0 + 1, 2)
+    return words(*setup, instruction)
+
+
+def test_pkf16_random_programs_match_the_python_model():
+    exe = binary()
+    rng = random.Random(SEED + 3)
+    for _ in range(PKF16_PROGRAMS):
+        program_words = program(*pkf16_program(rng))
+        for lanes in (32, 64):
+            assert_same(exe, lanes, False, [], program_words)
+
+
+def test_pk_fmac_forms_match_the_python_model():
+    assert_select_cases([(vop2("v_pk_fmac_f16", 9, V0 + 1, 2), True),
+                         (vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), clamp=1), True),
+                         (vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), op_sel=1), False),
+                         (vop3("v_pk_fmac_f16", 9, (V0 + 1, V0 + 2, 128), neg=1), False)])
 
 
 def vop3(name, vdst, sources, op_sel=0, clamp=0, abs_bits=0, neg=0, omod=0):

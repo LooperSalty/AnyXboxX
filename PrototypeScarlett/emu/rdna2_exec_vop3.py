@@ -9,7 +9,7 @@ import math
 
 from emu import (rdna2_exec_cmp16, rdna2_exec_cmp64, rdna2_exec_cmpf16, rdna2_exec_div, rdna2_exec_f16,
                  rdna2_exec_int16,
-                 rdna2_exec_movrel, rdna2_exec_sad, rdna2_exec_wide)
+                 rdna2_exec_movrel, rdna2_exec_pkf16, rdna2_exec_sad, rdna2_exec_wide)
 from emu.rdna2_exec_ops import (MASK32, SIXTEEN_BIT_RESULTS, VECTOR, VECTOR_COMPARE, VECTOR_NO_OPERATION,
                                 _float_op, _fma, _legacy_fma, _mul_add, bits_float, float_bits, ldexp, signed)
 
@@ -173,7 +173,8 @@ EXECUTABLE = frozenset(set(VECTOR) - {"v_readfirstlane_b32"} | set(VECTOR_COMPAR
                        | LANE_OPERATIONS | set(rdna2_exec_cmp64.COMPARE64) | MAD64 | VECTOR_NO_OPERATION
                        | set(rdna2_exec_wide.OPERATIONS) | set(rdna2_exec_div.OPERATIONS)
                        | rdna2_exec_movrel.VECTOR | set(rdna2_exec_sad.OPERATIONS)
-                       | set(rdna2_exec_f16.OPERATIONS) | set(rdna2_exec_cmpf16.COMPAREF16) | rdna2_exec_int16.VOP3)
+                       | set(rdna2_exec_f16.OPERATIONS) | set(rdna2_exec_cmpf16.COMPAREF16) | rdna2_exec_int16.VOP3
+                       | rdna2_exec_pkf16.PK_FMAC)
 
 
 class Fields:
@@ -216,6 +217,8 @@ def execute(wave, name, opcode, word, literal):
     fields = Fields(word)
     if name in VECTOR_NO_OPERATION:
         return None
+    if name in rdna2_exec_pkf16.PK_FMAC:
+        return rdna2_exec_pkf16.execute_pk_fmac_vop3(wave, name, fields, literal)
     if name in rdna2_exec_f16.OPERATIONS:
         return rdna2_exec_f16.execute_vop3(wave, name, fields, literal)
     if name in rdna2_exec_int16.VOP3:

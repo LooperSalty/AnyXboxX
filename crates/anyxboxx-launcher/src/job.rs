@@ -44,10 +44,15 @@ pub struct Step {
     pub detach_log: Option<PathBuf>,
     /// Runs after the command exits 0 (e.g. writes the warm marker); an error is shown as a line.
     pub after: Option<AfterSuccess>,
+    /// Asked just before the step starts; `false` skips it (e.g. a warm decided after a build).
+    pub run_if: Option<RunIf>,
 }
 
 /// A hook run after a successful step.
 pub type AfterSuccess = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
+/// A check made when the step is reached: `false` skips the step.
+pub type RunIf = Box<dyn FnOnce() -> bool + Send>;
 
 impl Step {
     /// A step whose output is forwarded to the window.
@@ -57,6 +62,7 @@ impl Step {
             command,
             detach_log: None,
             after: None,
+            run_if: None,
         }
     }
 
@@ -71,6 +77,12 @@ impl Step {
     /// Adds a hook to run once the step succeeded.
     pub fn with_after(mut self, hook: AfterSuccess) -> Self {
         self.after = Some(hook);
+        self
+    }
+
+    /// Runs the step only if `check` says so when the step is reached.
+    pub fn with_run_if(mut self, check: RunIf) -> Self {
+        self.run_if = Some(check);
         self
     }
 }
@@ -99,6 +111,16 @@ fn run_steps(steps: Vec<Step>, tx: &Sender<Event>, cancel: &AtomicBool) -> Event
     for step in steps {
         if cancel.load(Ordering::Relaxed) {
             return Event::Cancelled;
+        }
+        let mut step = step;
+        if let Some(check) = step.run_if.take()
+            && !check()
+        {
+            let _ = tx.send(Event::Line(format!(
+                "{}: skipped, nothing changed",
+                step.label
+            )));
+            continue;
         }
         let _ = tx.send(Event::Started(step.label.clone()));
         let outcome = match step.detach_log {
@@ -233,6 +255,19 @@ mod tests {
         assert_eq!(events.first(), Some(&Event::Started("one".into())));
         assert!(events.contains(&Event::Line("first".into())));
         assert!(events.contains(&Event::Started("two".into())));
+        assert_eq!(events.last(), Some(&Event::Finished(0)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_step_whose_check_says_no_is_skipped_and_the_next_one_runs() {
+        let events = collect(vec![
+            Step::new("skipped", shell("echo never")).with_run_if(Box::new(|| false)),
+            Step::new("kept", shell("echo yes")).with_run_if(Box::new(|| true)),
+        ]);
+        assert!(!events.contains(&Event::Started("skipped".into())));
+        assert!(events.contains(&Event::Line("skipped: skipped, nothing changed".into())));
+        assert!(events.contains(&Event::Line("yes".into())));
         assert_eq!(events.last(), Some(&Event::Finished(0)));
     }
 

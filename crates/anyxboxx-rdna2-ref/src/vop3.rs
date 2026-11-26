@@ -347,6 +347,10 @@ pub fn execute(
     word: u64,
     literal: Option<u32>,
 ) -> Result<bool, Error> {
+    if name == "v_pk_fmac_f16" {
+        crate::pkf16::execute_fmac_vop3(wave, word, literal)?;
+        return Ok(true);
+    }
     if crate::wide::execute(
         wave,
         name,
