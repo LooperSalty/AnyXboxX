@@ -19,6 +19,18 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
             | "v_alignbit_b32"
             | "v_alignbyte_b32"
             | "v_perm_b32"
+            | "v_min3_u32"
+            | "v_max3_u32"
+            | "v_med3_u32"
+            | "v_min3_i32"
+            | "v_max3_i32"
+            | "v_med3_i32"
+            | "v_mul_lo_u32"
+            | "v_mul_hi_u32"
+            | "v_mul_hi_i32"
+            | "v_mad_u32_u24"
+            | "v_mad_i32_i24"
+            | "v_bcnt_u32_b32"
     ) || f.clamp
     {
         return Err(format!("untranslated instruction: {name}"));
@@ -46,6 +58,18 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         "v_alignbit_b32" => format!("AlignBit({a}, {b}, {c})"),
         "v_alignbyte_b32" => format!("AlignBit({a}, {b}, ({c} & 3u) * 8u)"),
         "v_perm_b32" => format!("PermB32({a}, {b}, {c})"),
+        "v_min3_u32" => format!("min(min({a}, {b}), {c})"),
+        "v_max3_u32" => format!("max(max({a}, {b}), {c})"),
+        "v_med3_u32" => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
+        "v_min3_i32" => format!("asuint(min(min(asint({a}), asint({b})), asint({c})))"),
+        "v_max3_i32" => format!("asuint(max(max(asint({a}), asint({b})), asint({c})))"),
+        "v_med3_i32" => format!("asuint(max(min(asint({a}), asint({b})), min(max(asint({a}), asint({b})), asint({c}))))"),
+        "v_mul_lo_u32" => format!("({a} * {b})"),
+        "v_mul_hi_u32" => format!("MulHiU32({a}, {b})"),
+        "v_mul_hi_i32" => format!("MulHiI32({a}, {b})"),
+        "v_mad_u32_u24" => format!("(({a} & 0xFFFFFFu) * ({b} & 0xFFFFFFu) + {c})"),
+        "v_mad_i32_i24" => format!("asuint(((asint({a}) << 8) >> 8) * ((asint({b}) << 8) >> 8) + asint({c}))"),
+        "v_bcnt_u32_b32" => format!("(countbits({a}) + {b})"),
         _ => unreachable!(),
     };
     Ok(format!(

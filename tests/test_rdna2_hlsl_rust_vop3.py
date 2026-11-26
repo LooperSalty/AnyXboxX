@@ -8,7 +8,9 @@ from test_rdna2_exec import LITERAL, V, program, sop1, vop1, vop3
 from test_rdna2_hlsl_rust_parity import rust
 
 OPS = ("v_add3_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32",
-       "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_bfm_b32", "v_alignbit_b32", "v_alignbyte_b32", "v_perm_b32")
+       "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_bfm_b32", "v_alignbit_b32", "v_alignbyte_b32", "v_perm_b32", "v_min3_u32", "v_max3_u32", "v_med3_u32",
+       "v_min3_i32", "v_max3_i32", "v_med3_i32", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32",
+       "v_mad_u32_u24", "v_mad_i32_i24", "v_bcnt_u32_b32")
 
 
 @pytest.mark.parametrize("name", OPS)
