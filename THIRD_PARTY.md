@@ -68,6 +68,7 @@ Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : l
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/97c8783f4a260996b602b75cabfe17568b1d1a26) (AnoHunted) | GPL-3.0 ou ultérieure | | Séparation du format `A8_UNORM` de la famille sans type `R8` |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
 | [JMAN730/victory](https://github.com/JMAN730/victory) (JMAN730 ; commit `b975c652` de fever308) | GPL-3.0 | Non (hors base Neptune) | Idée seule, non portée : copies volumineuses en morceaux sur les fils conservés (`VICTORY_WIDE_COPY`, version réduite écrite contre notre `copy_mapped`) |
+| [geiyiliyabumo/VIctory](https://github.com/geiyiliyabumo/VIctory) (geiyiliyabumo) | GPL-3.0 | | Portage des additions et soustractions VOP3 `i16` de la [PR Marvisak/VIctory #2094](https://github.com/Marvisak/VIctory/pull/2094), avec le [masquage proposé par upipibi](https://github.com/Marvisak/VIctory/pull/2094#issuecomment-7153371416). |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 
