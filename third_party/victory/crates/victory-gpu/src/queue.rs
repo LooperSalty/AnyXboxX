@@ -905,6 +905,8 @@ extern "system" fn present(
     let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(windows)]
+    let book_call = crate::framebook::on().then(std::time::Instant::now);
     let called = crate::timeline::span("the title's Present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -1001,6 +1003,7 @@ extern "system" fn present(
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
             Shown { frame, resource },
+            book_call,
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1032,12 +1035,15 @@ extern "system" fn present(
                     (over_res, over_tex, over_state)
                 })
             });
-        show_planes(
+        let shown = show_planes(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
             Shown { frame, resource: resource as usize },
         );
+        if shown && let Some(start) = book_call {
+            crate::framebook::presented(start, None);
+        }
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
             crate::resource::host_transition(over_res, over_state);
@@ -1091,15 +1097,16 @@ fn show_planes(
     state: u32,
     overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
     what: Shown,
-) {
+) -> bool {
     let Some(host) = crate::host::host() else {
-        return;
+        return false;
     };
     let shown = host.present_planes(texture, state, overlay, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
-    let _ = (shown, what.resource);
+    let _ = what.resource;
+    shown.is_some()
 }
 
 /// Diagnostics: logs a presented frame that is black after one that was

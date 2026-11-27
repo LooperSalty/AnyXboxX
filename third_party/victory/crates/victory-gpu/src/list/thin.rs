@@ -31,7 +31,9 @@
 //! chunks in parallel. Only the recording's owner applies them, in order.
 //! With VICTORY_THIN_STATS=1, every five seconds the log reports each submitted
 //! frame's list sizes, translation times and repeated stream fingerprints.
-//! Both switches are off by default. See the split and stats modules below.
+//! With VICTORY_THIN_TIMES=1, workers time each executed call. A batch of
+//! decoded bindings is timed as one binding operation. All three switches
+//! are off by default.
 
 mod split;
 #[cfg(test)]
@@ -52,6 +54,8 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 const CHUNK: usize = 1024;
 /// Poll before translating each Nth call, including inside a split chunk.
 const ABANDON_POLL: u64 = 64;
+
+pub(crate) mod timing;
 
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
@@ -202,6 +206,7 @@ pub(crate) struct Recording {
     moved: Condvar,
     abandoned: AtomicBool,
     sample: Option<stats::Ticket>,
+    submitted_at: AtomicU64,
 }
 
 #[derive(Default)]
@@ -227,6 +232,7 @@ impl Recording {
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
             sample: stats::ticket(),
+            submitted_at: AtomicU64::new(0),
         }
     }
 
@@ -307,6 +313,12 @@ impl Recording {
             inner.closed = true;
             let kept = std::mem::take(&mut inner.kept);
             let timing = inner.timing;
+            if crate::framebook::on() {
+                let at = self.submitted_at.load(Acquire);
+                if at != 0 {
+                    crate::framebook::translated_after(crate::framebook::now_us().saturating_sub(at));
+                }
+            }
             self.done.store(true, Release);
             self.moved.notify_all();
             drop(inner);
@@ -396,11 +408,19 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .filter_map(|&l| {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+            if crate::framebook::on() && let Some(recording) = &front.recording {
+                // Keep the first submission if the title submits a list again.
+                let _ = recording.submitted_at.compare_exchange(0, crate::framebook::now_us().max(1), Release, Relaxed);
+            }
             front.close();
             front.submitted = true;
             front.recording.clone()
         })
         .collect()
+}
+
+pub(crate) fn translated_us() -> u64 {
+    STATS[1].load(Relaxed)
 }
 
 /// For the frame-rate line.
@@ -409,7 +429,9 @@ pub(crate) fn line(frames: f64) {
         crate::overlay::set_pool_off(crate::overlay::Pool::Thin);
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let s = crate::framebook::for_line(&STATS, &LAST).map(|n| n as f64 / frames);
+    timing::line(frames);
     // The overlay: the work of all threads over the frame's time.
     crate::overlay::set_pool(crate::overlay::Pool::Thin, s[1] / 1000.0, crate::overlay::frame_ms(), THREADS.load(Relaxed));
     tracing::info!(
@@ -751,6 +773,29 @@ fn translate<const SPLIT: bool>(
     plan: &split::Plan,
     left: impl Fn() -> bool,
 ) -> (u64, bool) {
+    if timing::on() {
+        timing::stream(|| {
+            if SPLIT {
+                translate_planned::<true, true>(list, stream, plan, left)
+            } else {
+                translate_stream::<true>(list, stream, left)
+            }
+        })
+    } else {
+        translate_planned::<SPLIT, false>(list, stream, plan, left)
+    }
+}
+
+fn translate_stream<const TIMED: bool>(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+    translate_planned::<false, TIMED>(list, stream, &split::Plan::default(), left)
+}
+
+fn translate_planned<const SPLIT: bool, const TIMED: bool>(
+    list: This,
+    stream: &[u64],
+    plan: &split::Plan,
+    left: impl Fn() -> bool,
+) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut runs = plan.runs.iter().peekable();
     let mut skip = left();
@@ -761,6 +806,7 @@ fn translate<const SPLIT: bool>(
                 skip = left();
             }
             if !skip {
+                let _call = TIMED.then(|| timing::call(stream[i] & 0xffff));
                 with_state(list, |_, state| plan.apply(run, state));
             }
             calls += run.len() as u64;
@@ -774,15 +820,16 @@ fn translate<const SPLIT: bool>(
         if calls % ABANDON_POLL == 0 {
             skip = left();
         }
+        if skip && !matches!(op, CLOSE | RESET | UPLOAD) {
+            continue;
+        }
+        let _call = TIMED.then(|| timing::call(op));
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
-            continue;
-        }
-        if skip && op != CLOSE && op != RESET {
             continue;
         }
         if run_plain(op, list, w) {
