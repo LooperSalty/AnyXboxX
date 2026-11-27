@@ -60,13 +60,14 @@ fn the_tuned_set_is_vice_tay_s_4070_set() {
 
 #[test]
 fn quality_is_applied_after_the_tuned_set_and_before_overrides() {
-    let env = settings::base(&parse(&[
+    let env = environment(&parse(&[
         "--game-dir",
         "G",
         "--quality",
         "--override",
         "VICTORY_RELAY=0",
-    ]));
+    ]))
+    .unwrap();
     assert_eq!(
         value(&env, "VICTORY_CARD_WINDOWS_MB"),
         Some(OsString::from("0"))
@@ -353,8 +354,18 @@ fn pool_sizes_are_the_16_core_set_from_16_logical_cpus() {
     for cpus in [7, 8, 15] {
         assert_eq!(settings::pool_sizes(cpus), None, "{cpus}");
     }
-    for cpus in [16, 24, 32] {
+    for cpus in [16, 20, 23] {
         assert_eq!(settings::pool_sizes(cpus), big, "{cpus}");
+    }
+    let huge = Some(
+        &[
+            ("VICTORY_THIN_THREADS", "12"),
+            ("VICTORY_UNDER_THREADS", "8"),
+            ("VICTORY_LAND_THREADS", "8"),
+        ][..],
+    );
+    for cpus in [24, 32] {
+        assert_eq!(settings::pool_sizes(cpus), huge, "{cpus}");
     }
 }
 
@@ -372,17 +383,17 @@ fn big_pools_come_after_the_tuned_set_and_before_quality_and_overrides() {
     assert_eq!(thin, Some(OsString::from("12")));
     let under = value(&env, "VICTORY_UNDER_THREADS");
     assert_eq!(under, Some(OsString::from("8")));
-    // The user's override is the last entry of the key: it wins over 6 and over the tuned 4.
-    let land = value(&env, "VICTORY_LAND_THREADS");
-    assert_eq!(land, Some(OsString::from("5")));
+    // 24+ CPUs land on 8 threads (#469); the user's override is applied later, at launch.
+    assert_eq!(value(&env, "VICTORY_LAND_THREADS"), Some(OsString::from("8")));
     let positions = |name: &str| -> Vec<usize> {
         (0..env.len()).filter(|i| env[*i].0 == name).collect()
     };
     let land = positions("VICTORY_LAND_THREADS");
     let quality = positions("VICTORY_CARD_WINDOWS_MB");
-    // tuned 4, big 6, user 5; quality's value sits between the big pools and the override.
-    assert_eq!(land.len(), 3);
-    assert!(land[1] < *quality.last().unwrap() && *quality.last().unwrap() < land[2]);
+    assert_eq!(land.len(), 2);
+    assert!(land[1] < *quality.last().unwrap());
+    let launch_env = environment(&args).unwrap();
+    assert_eq!(value(&launch_env, "VICTORY_LAND_THREADS"), Some(OsString::from("5")));
     // Small machines, `--no-tuned-settings` and other profiles keep what they had.
     let small = settings::base_with_cpus(&parse(&["--game-dir", "G"]), 8);
     assert_eq!(

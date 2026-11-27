@@ -20,7 +20,7 @@ Ce dépôt ne contient ni fichier de jeu, ni clé, ni exécutable, et n'explique
 ## Configuration requise
 
 - Windows 10 ou 11, 64 bits, avec un processeur compatible AVX2.
-- Une carte graphique Direct3D 12 avec le shader model 6.6 et les mesh shaders : GeForce RTX série 20 ou plus récente, ou Radeon RDNA 2 ou plus récente. Une carte de 12 Go manque de mémoire pour les textures ; le lanceur propose un préréglage pour les cartes de 8 et 12 Go.
+- Une carte graphique Direct3D 12 avec le shader model 6.6 et les mesh shaders : GeForce RTX série 20 ou plus récente, ou Radeon RDNA 2 ou plus récente. **Le projet est centré sur NVIDIA** : toutes les mesures et les réglages du lanceur visent les cartes NVIDIA (RTX 4070 SUPER). Les cartes AMD marchent aussi, mais moins bien (moins de fps, plus de défauts graphiques), et reçoivent moins d'attention. Une carte de 12 Go manque de mémoire pour les textures ; le lanceur propose un préréglage pour les cartes de 8 et 12 Go.
 - 32 Go de RAM conseillés, et plus de 30 Go libres sur le disque système (le cache des shaders grossit en jouant).
 - Votre propre copie du build Xbox Series 1.0.2.1 : un dossier qui contient `game_scarlett_master.exe`. Il n'est pas fourni.
 - [Rust](https://rustup.rs/) et Visual Studio 2022 ou 2026 Build Tools avec la charge de travail « Développement desktop en C++ ». VIctory est compilé depuis les sources au premier lancement.
@@ -53,7 +53,7 @@ Régénérer : `scarlett.py --carte <dossier du paquet> docs/images/carte-avance
 ![Avancement de la traduction pour Xbox Series X](../images/traduction.svg)
 
 - **Instructions CPU : 100 %.** La Series X utilise un AMD Zen 2 en x86-64, le même jeu d'instructions qu'un PC : le code du jeu tourne tel quel.
-- **Instructions GPU : 89 %.** 1 330 des 1 490 encodages RDNA 2 tournent dans l'interpréteur de référence, et le recompilateur RDNA 2 → DXIL dessine déjà un premier shader de sommet et de pixel avec D3D12.
+- **Instructions GPU : 91 %.** 1 364 des 1 490 encodages RDNA 2 tournent dans l'interpréteur de référence, et le recompilateur RDNA 2 → DXIL dessine déjà un premier shader de sommet et de pixel avec D3D12.
 - **Fonctions système : 66 %** des 1 337 fonctions importées par les DLL du paquet de test sont résolues.
 - **Runtime GDK : 210 fonctions sur 396** sont écrites dans AnyXboxX, en Rust et en C++ : la file de tâches, l'utilisateur hors ligne, l'identité de la Series X, les sauvegardes, le paquet, le Store hors ligne et les invitations. Les autres interfaces sont servies par le runtime GDK de Windows s'il est installé.
 

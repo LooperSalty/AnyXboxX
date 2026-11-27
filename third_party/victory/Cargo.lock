@@ -658,6 +658,7 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
