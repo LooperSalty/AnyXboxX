@@ -63,6 +63,8 @@ VICTORY_INDIRECT_BATCH = "2"
 # on by default in the branch are turned off as in the better run. Stability report kept (cheap).
 VICTORY_FRAME_INTERVAL_MS = "16.667"
 VICTORY_WIDE_COPY = "1"
+# THIN list translation reuses prepared texture reads (#531: -43 % on the synthetic bench).
+VICTORY_THIN_FAST = "1"
 VICTORY_LEAVE_OPEN = "0"
 VICTORY_LET_GO_BESIDE = "0"
 VICTORY_FRAME_TIMES = "1"
