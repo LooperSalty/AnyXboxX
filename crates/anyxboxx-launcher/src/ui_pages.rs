@@ -271,13 +271,7 @@ pub fn xg_row(app: &mut App, ui: &mut egui::Ui) {
 
 /// The plan of the launch: whether it can be made, for the advanced panel.
 pub fn plan_lines(app: &App) -> Option<Vec<String>> {
-    let profile = app.profile().clone();
-    session::make_plan(
-        &app.settings,
-        &app.repo_or_empty(),
-        app.victory_exe.as_deref(),
-        &profile,
-    )
-    .ok()
-    .map(|plan| crate::env::describe(&plan.env))
+    session::launch_environment(&app.settings, &app.settings.game_path()?, app.profile())
+        .ok()
+        .map(|env| crate::env::describe(&env))
 }

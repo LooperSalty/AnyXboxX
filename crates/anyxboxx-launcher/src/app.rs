@@ -273,11 +273,6 @@ impl App {
         self.setup = read_setup(self.adapters.as_deref());
     }
 
-    /// The repository folder, or an empty path when none was found (the plan is then only shown).
-    pub fn repo_or_empty(&self) -> PathBuf {
-        self.repo.clone().unwrap_or_default()
-    }
-
     /// Where VIctory keeps the game's saves (`<data>\<TitleId>\saves`), or the data root when no
     /// game folder is set yet.
     pub fn data_dir_label(&mut self) -> String {
@@ -330,12 +325,19 @@ impl App {
                 return;
             }
         };
-        let plan = match session::make_plan(
-            &self.settings,
-            &repo,
-            self.victory_exe.as_deref(),
-            &profile,
-        ) {
+        let prebuilt = match self
+            .victory_exe
+            .as_deref()
+            .map(anyxboxx::run::Victory::prebuilt)
+            .transpose()
+        {
+            Ok(prebuilt) => prebuilt,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let plan = match session::make_plan(&self.settings, &repo, prebuilt, &profile) {
             Ok(plan) => plan,
             Err(error) => {
                 self.notice = Some(error.to_string());

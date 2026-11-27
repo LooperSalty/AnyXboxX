@@ -225,14 +225,6 @@ fn a_repository_without_victory_is_refused_before_building() {
 }
 
 #[test]
-fn a_prebuilt_victory_has_nothing_to_build() {
-    let exe = std::env::current_exe().unwrap();
-    let victory = Victory::prebuilt(&exe).unwrap();
-    assert_eq!(victory.exe, exe);
-    assert!(victory.build_command().is_none());
-}
-
-#[test]
 fn a_located_victory_is_built_in_release_by_default_and_in_diag_on_request() {
     let repo = std::env::temp_dir().join(format!("anyxboxx-run-located-{}", std::process::id()));
     let victory = repo.join("third_party").join("victory");
@@ -242,10 +234,10 @@ fn a_located_victory_is_built_in_release_by_default_and_in_diag_on_request() {
     let diag = Victory::locate(&repo, true).unwrap();
     std::fs::remove_dir_all(&repo).unwrap();
     assert!(
-        release.exe.ends_with("release/victory.exe")
-            || release.exe.ends_with(r"release\victory.exe")
+        release.exe().ends_with("release/victory.exe")
+            || release.exe().ends_with(r"release\victory.exe")
     );
-    assert!(diag.exe.ends_with(r"diag\victory.exe") || diag.exe.ends_with("diag/victory.exe"));
+    assert!(diag.exe().ends_with(r"diag\victory.exe") || diag.exe().ends_with("diag/victory.exe"));
     let build = release.build_command().unwrap();
     assert_eq!(build.get_program(), "cargo");
     assert!(build.get_args().any(|a| a == "--release"));
@@ -280,30 +272,6 @@ fn warm_archives_are_the_game_folder_rpf_files_only_sorted() {
         .collect();
     assert_eq!(names, ["A.RPF", "b.rpf"]);
     assert!(matches!(none, Err(RunError::NoArchive(_))));
-}
-
-#[test]
-fn a_missing_prebuilt_victory_is_refused_before_anything_runs() {
-    let args = parse(&[
-        "--game-dir",
-        "G",
-        "--victory-exe",
-        "does-not-exist/victory.exe",
-    ]);
-    assert!(matches!(run(&args, None), Err(RunError::NoVictoryExe(_))));
-}
-
-#[test]
-fn a_prebuilt_victory_does_not_need_the_repository() {
-    // The game folder is checked after the exe: reaching NoGame means no repository was asked for.
-    let exe = std::env::current_exe().unwrap();
-    let args = parse(&[
-        "--game-dir",
-        "does-not-exist",
-        "--VictoryExe",
-        exe.to_str().unwrap(),
-    ]);
-    assert!(matches!(run(&args, None), Err(RunError::NoGame(_))));
 }
 
 #[test]

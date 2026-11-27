@@ -3,10 +3,12 @@
 //! of pipes the launcher would have to hold. The launcher then waits briefly and may close.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
+
+use anyxboxx::run::RuntimeCommand;
 
 /// `DETACHED_PROCESS`: the child gets no console of its own and does not share the launcher's.
 pub const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -37,28 +39,21 @@ pub fn game_log_path(dir: &Path, unix_seconds: u64) -> PathBuf {
 
 /// Starts `command` detached, with stdin closed and both output streams written to `log`
 /// (created, or truncated, along with its folder).
-pub fn spawn_game(mut command: Command, log: &Path) -> io::Result<Child> {
+pub fn spawn_game(command: impl Into<RuntimeCommand>, log: &Path) -> io::Result<Child> {
+    let mut command = command.into();
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let file = File::create(log)?;
+    let mut file = File::create(log)?;
+    if let Some(identity) = command.identity_line() {
+        writeln!(file, "{identity}")?;
+    }
     let errors = file.try_clone()?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
-        .stderr(Stdio::from(errors));
-    apply_flags(&mut command);
+    command.stdio(Stdio::null(), Stdio::from(file), Stdio::from(errors));
+    #[cfg(windows)]
+    command.creation_flags(spawn_flags());
     command.spawn()
 }
-
-#[cfg(windows)]
-fn apply_flags(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(spawn_flags());
-}
-
-#[cfg(not(windows))]
-fn apply_flags(_command: &mut Command) {}
 
 /// Waits up to `wait` for the child to be running. `Err` with its exit code when it already
 /// ended (the game died at once: the log says why). `Ok` when it is still alive at the end.
@@ -79,6 +74,7 @@ pub fn wait_until_up(child: &mut Child, wait: Duration) -> io::Result<Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn the_spawn_flags_are_the_three_documented_constants() {

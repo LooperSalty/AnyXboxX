@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyxboxx::run::XgMode;
+use anyxboxx::run::{Env, Victory, XgMode};
 
 use crate::detached;
 use crate::env::{self, EnvError, Xg};
@@ -12,7 +12,6 @@ use crate::options::LaunchOptions;
 use crate::processes::{self, GuardError, ProcessSource};
 use crate::profile::Profile;
 use crate::warm_state;
-use anyxboxx::run::Victory;
 
 /// The window's fields, as typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,26 +75,18 @@ impl Settings {
 pub fn make_plan(
     settings: &Settings,
     repo: &Path,
-    victory_exe: Option<&Path>,
+    prebuilt: Option<Victory>,
     profile: &Profile,
 ) -> Result<Plan, SessionError> {
     let game_dir = settings.game_path().ok_or(SessionError::NoGameFolder)?;
-    let mut overrides = settings.options.env_pairs();
-    overrides.extend(env::parse_overrides(&settings.overrides)?);
-    let xg_text = settings.xg_dll.trim().trim_matches('"');
-    let xg = (!xg_text.is_empty()).then(|| Xg {
-        dll: PathBuf::from(xg_text),
-        mode: settings.xg_mode,
-    });
-    let env = env::build_env(&game_dir, profile, &overrides, xg.as_ref())?;
-    let victory = match victory_exe {
-        Some(exe) => Victory::prebuilt(exe),
-        None => Victory::locate(repo, false),
-    };
-    let warm = victory.ok().and_then(|victory| {
+    let env = launch_environment(settings, &game_dir, profile)?;
+    let victory = prebuilt
+        .clone()
+        .or_else(|| Victory::locate(repo, false).ok());
+    let warm = victory.as_ref().and_then(|victory| {
         let marker = warm_state::marker_path(std::env::var_os("LOCALAPPDATA").as_deref());
         crate::launch::warm_check(
-            &victory.exe,
+            victory,
             &env,
             &game_dir,
             settings.always_rewarm,
@@ -107,13 +98,28 @@ pub fn make_plan(
         .map(|dir| detached::game_log_path(&dir, unix_now()));
     Ok(Plan {
         repo: repo.to_path_buf(),
-        victory_exe: victory_exe.map(Path::to_path_buf),
+        prebuilt,
         game_dir,
         env,
         jobs: settings.jobs_limit(),
         game_log,
         warm,
     })
+}
+
+pub fn launch_environment(
+    settings: &Settings,
+    game_dir: &Path,
+    profile: &Profile,
+) -> Result<Env, EnvError> {
+    let mut overrides = settings.options.env_pairs();
+    overrides.extend(env::parse_overrides(&settings.overrides)?);
+    let xg_text = settings.xg_dll.trim().trim_matches('"');
+    let xg = (!xg_text.is_empty()).then(|| Xg {
+        dll: PathBuf::from(xg_text),
+        mode: settings.xg_mode,
+    });
+    env::build_env(game_dir, profile, &overrides, xg.as_ref())
 }
 
 /// Seconds since the Unix epoch, for the log file name of one launch.
@@ -236,19 +242,23 @@ mod tests {
         assert!(make_plan(&settings, Path::new("repo"), None, &profile()).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn plan_with_prebuilt_victory_exe_computes_warm_state_without_repo() {
         let dir = game_folder();
         std::fs::write(dir.path().join("shaders.rpf"), b"rpf").expect("write");
         let prebuilt_dir = tempfile::tempdir().expect("tempdir");
-        let exe = prebuilt_dir.path().join("victory.exe");
-        std::fs::write(&exe, b"MZ").expect("write");
+        let victory = crate::launch::prebuilt_fixture(prebuilt_dir.path(), 1);
+        let exe = victory.exe().to_path_buf();
         let settings = Settings {
             game_dir: dir.path().display().to_string(),
             ..Settings::default()
         };
-        let plan = make_plan(&settings, Path::new(""), Some(&exe), &profile()).expect("plan");
-        assert_eq!(plan.victory_exe.as_deref(), Some(exe.as_path()));
+        let plan = make_plan(&settings, Path::new(""), Some(victory), &profile()).expect("plan");
+        assert_eq!(
+            plan.prebuilt.as_ref().map(Victory::exe),
+            Some(exe.as_path())
+        );
         assert!(
             plan.warm.is_some(),
             "warm check should fingerprint the prebuilt victory.exe"

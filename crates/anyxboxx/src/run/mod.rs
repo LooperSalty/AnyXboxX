@@ -3,17 +3,20 @@
 //! same build, same environment (`tests/fixtures/lancer_victory_neptune.ps1` is the golden copy),
 //! same exit code. On Vice-Tay, warm and precompile share a pipeline-cache warm.
 
+mod identity;
+#[cfg(windows)]
+mod locked_path;
 mod settings;
 mod steps;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use clap::{Args, ValueEnum};
+use std::path::{Path, PathBuf};
 
+pub use identity::{IdentityError, MANIFEST_PIN_ENV};
 pub use settings::{ALWAYS, LINUX_AMD, QUALITY, TUNED, logical_cpus, pool_sizes};
 pub use steps::{
-    Env, GAME_EXE, PRECOMPILED_DLLS, SHADERS, Victory, environment, game_exe, status, warm_archives,
+    Env, GAME_EXE, PRECOMPILED_DLLS, RuntimeCommand, SHADERS, Victory, environment, game_exe,
+    status, warm_archives,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -105,7 +108,7 @@ pub struct RunArgs {
     pub batch_card_rehash: bool,
     /// Use this victory.exe, built beforehand, and skip the cargo build (for Proton, where there
     /// is no cargo: cross-build VIctory on Linux with `--target x86_64-pc-windows-msvc`).
-    /// The repository is then not needed.
+    /// Requires an adjacent .identity.json and ANYXBOXX_VICTORY_MANIFEST_SHA256.
     #[arg(long, alias = "VictoryExe")]
     pub victory_exe: Option<PathBuf>,
     /// Repository root (default: ANYXBOXX_REPO, then the folders above the binary and the
@@ -127,6 +130,8 @@ pub enum RunError {
     NoVictory,
     #[error("victory.exe not found: {0:?}.")]
     NoVictoryExe(String),
+    #[error(transparent)]
+    PrebuiltIdentity(#[from] IdentityError),
     #[error("repository not found (pass --repo or set ANYXBOXX_REPO).")]
     NoRepo,
     #[error("game_scarlett_master.exe not found in {0:?}.")]
@@ -151,7 +156,11 @@ pub enum RunError {
 /// `--victory-exe` the build is skipped and the repository is not needed.
 pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
     let mut victory = match (&args.victory_exe, repo) {
-        (Some(exe), _) => Victory::prebuilt(exe)?,
+        (Some(exe), _) => {
+            let victory = Victory::prebuilt(exe)?;
+            victory.check_diagnostics(args.uses_diag())?;
+            victory
+        }
         (None, Some(repo)) => Victory::locate(repo, args.uses_diag())?,
         (None, None) => return Err(RunError::NoRepo),
     };
@@ -170,7 +179,7 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
             "release"
         };
         println!("Building VIctory ({profile})...");
-        victory.exe = steps::build_executable(&mut build)?;
+        victory.record_build(&mut build)?;
     }
     if args.warm {
         println!("Warming the host pipeline cache...");
@@ -182,7 +191,7 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
     status(&mut victory.game_command(&args.game_dir, &env), "victory")
 }
 
-fn warm_or_fail(command: &mut Command) -> Result<(), RunError> {
+fn warm_or_fail(command: &mut RuntimeCommand) -> Result<(), RunError> {
     match status(command, "victory")? {
         0 => Ok(()),
         code => Err(RunError::WarmFailed(code)),
@@ -217,5 +226,7 @@ pub fn find_repo(explicit: Option<&Path>) -> Option<PathBuf> {
     })
 }
 
+#[cfg(all(test, windows))]
+mod identity_tests;
 #[cfg(test)]
 mod tests;

@@ -71,4 +71,32 @@ Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profile
 - **The window closed by itself**: the log says `window closed: suspending the title` when you closed it; a crash is written to `crashes.log` under `%LOCALAPPDATA%\victory\data\`.
 - **Windows error 1455 in `crashes.log`**: the paging file is too small; close other applications or enlarge it.
 
-Under Proton or Wine the launcher cannot build VIctory (no cargo): use `anyxboxx run` as described in [running-gta6.md](running-gta6.md).
+### Prebuilt VIctory
+
+On Windows or under Proton, pass `--victory-exe <path>` to either launcher. A prebuilt uses the
+adjacent `<executable-name>.identity.json` and skips Cargo. Set `ANYXBOXX_VICTORY_MANIFEST_SHA256`
+to the SHA-256 of the **exact manifest bytes** obtained independently from your trusted build
+provider, for example from authenticated release metadata. The launcher hashes the manifest and
+the executable before selecting it. Under Proton, keep native-host write access to the runtime
+directory limited to trusted processes.
+
+The UTF-8 manifest is a JSON object limited to 4,096 bytes. Schema 1 requires all of these fields.
+
+| Field | Value |
+| --- | --- |
+| `schema` | `1` |
+| `executable_sha256` | 64 hexadecimal digits for the executable bytes |
+| `executable_size` | Exact executable length in bytes |
+| `source_commit` | Full 40-digit Git commit of the AnyXboxX build |
+| `tombox_gitlink` | Full 40-digit TomBox gitlink from that commit |
+| `target` | `x86_64-pc-windows-msvc` |
+| `profile` | `release` or `diag`. `--diag` and `--dred` require `diag`. |
+| `translator_version` | Positive integer for the build's `victory_shader::TRANSLATOR_VERSION`, the shader-cache ABI |
+
+Warm and run commands retain Windows sharing protection for the verified executable and its
+resolved directory chain through process creation. They also check that the path still identifies
+that file immediately before spawning. The `VICTORY_RUNTIME_IDENTITY=` log line contains the
+manifest fields and adds `manifest_sha256` and `trust` (`pinned-manifest-sha256`). The CLI prints
+this record and the graphical launcher writes it to the job log and the detached game log. Its
+warm marker uses `manifest_sha256` as the build identity. A regular source build in the CLI uses
+the executable reported by Cargo. [Cargo artifact messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#artifact-messages)
