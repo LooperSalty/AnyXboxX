@@ -57,9 +57,8 @@ def test_hlsl_refuses_same_undefined_modifiers_as_interpreter():
             rdna2_hlsl.translate(bad)
 
 
-@gpu
-def test_pkf16_and_fma_mix_match_interpreter_on_gpu():
-    code = with_lane_offset(
+def packed_program():
+    return with_lane_offset(
         vop1("v_mov_b32", 1, LITERAL), pack_f16(1.5, -2.0),
         vop1("v_mov_b32", 2, LITERAL), pack_f16(2.0, 3.0),
         vop1("v_mov_b32", 3, LITERAL), pack_f16(0.25, -1.0),
@@ -81,5 +80,9 @@ def test_pkf16_and_fma_mix_match_interpreter_on_gpu():
         *store_lane(9, 4), *store_lane(10, 5), *store_lane(11, 6), *store_lane(12, 7),
         *store_lane(13, 8),
     )
-    expected, actual = compare(code)
+
+
+@gpu
+def test_pkf16_and_fma_mix_match_interpreter_on_gpu():
+    expected, actual = compare(packed_program())
     assert actual == expected

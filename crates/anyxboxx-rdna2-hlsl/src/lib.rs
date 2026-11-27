@@ -14,6 +14,7 @@ mod int16;
 mod int16_templates;
 mod lds;
 mod lds_lanes;
+mod packed_half;
 mod sad;
 mod scalar;
 mod scalar_atomic;
@@ -149,6 +150,12 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "VOP2" | "VOP3" | "VOP3P" if packed_half::supports(name) => packed_half::statement(
+            name,
+            family,
+            pair,
+            if family == "VOP2" { second } else { literal },
+        )?,
         "VOP3" if sad::supports(name) => sad::statement(name, pair, literal)?,
         "VOP3" | "VOP3P" if int16::supports(name) => {
             int16::statement(name, family == "VOP3P", pair, literal)?

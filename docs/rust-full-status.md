@@ -118,6 +118,8 @@ Wave64 compute now shares the wave32 ALU helpers and emits a 64-thread group. WA
 
 The Rust graphics emitter supports vertex and pixel stages, EXP and all three VINTRP operations. Draw tests compare vertex exports, interpolated pixel exports, partial channel masks and multiple render targets against the interpreter on WARP.
 
+Packed f16 now covers all five packed operators, the VOP2 and VOP3 accumulating forms, the three mixed-precision FMAs and the two-element f16 dot product. WARP verifies their combined output against interpreter memory.
+
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.
