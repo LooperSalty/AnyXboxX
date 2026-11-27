@@ -1893,8 +1893,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        with_state(this, |list, s| s.draw(list, vertices, instances, first, first_instance));
+    }
+
+    pub(super) fn draw_at(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32, frame: u64) {
+        super::count_draw();
         with_state(this, |list, s| {
-            s.draw(list, vertices, instances, first, first_instance)
+            s.draw_at(list, vertices, instances, first, first_instance, Some(frame))
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {

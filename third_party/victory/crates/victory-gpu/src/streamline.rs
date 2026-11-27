@@ -36,7 +36,7 @@ use device::{COPY_DEST, texture};
 pub(crate) use frames::submitted;
 use frames::*;
 use hudless::*;
-pub(crate) use hudless::{before_target_draw, hudless_submitted, hudless_wanted};
+pub(crate) use hudless::{before_target_draw, before_target_draw_at, hudless_frame, hudless_submitted, hudless_wanted};
 pub(crate) use present::{Planes, present_begins, present_ends, resizing};
 use stats::*;
 pub(crate) use stats::{line, present_called, present_returned};

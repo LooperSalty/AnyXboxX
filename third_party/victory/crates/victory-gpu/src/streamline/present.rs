@@ -12,6 +12,8 @@ pub(crate) struct Planes<'a> {
 pub(crate) struct Presenting {
     token: *mut abi::FrameToken,
     frame: u32,
+    /// Streamline may read the tag until DXGI Present returns.
+    _hudless: Option<ID3D12Resource>,
 }
 
 /// Before our swap chain's Present of title frame `frame`: with frame
@@ -31,6 +33,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     }
     // Where the interface is no plane of its own (Series X): the copy of
     // this texture taken in front of the title's interface composite.
+    if hudless_wanted() {
+        begin_hudless_present(frame);
+    }
     let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
     let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
@@ -82,8 +87,6 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             // destination; Streamline holds it until the tags of the frame
             // go).
             resources.push((abi::Resource::texture(copy.as_raw(), COPY_DEST), abi::BUFFER_HUDLESS_COLOR, planes.size));
-        } else if hudless_wanted() {
-            HUD_COUNTS[HUD_MISSING].fetch_add(1, Relaxed);
         }
         let tags: Vec<abi::ResourceTag> = resources
             .iter_mut()
@@ -95,28 +98,27 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         if code != 0 {
             once!(warn, "frame generation: slSetTagForFrame: {} ({code})", abi::result_name(code));
         }
-        if code == 0 && constants_code == 0 && hudless.is_some() {
-            HUD_COUNTS[HUD_TAGGED].fetch_add(1, Relaxed);
-            HUD_TAGGED_ALL.fetch_add(1, Relaxed);
+        let tagged = constants_code == 0 && code == 0;
+        if tagged {
+            once!(
+                info,
+                render = ?camera.render,
+                output = ?camera.output,
+                back_buffer = ?planes.size,
+                interface_plane = planes.overlay.is_some(),
+                interface_free_copy = hudless.is_some(),
+                depth_state = format_args!("{:#x}", resources[0].0.state),
+                motion_state = format_args!("{:#x}", resources[1].0.state),
+                near = constants.camera_near,
+                far = constants.camera_far,
+                fov = constants.camera_fov,
+                depth_inverted = camera.depth_inverted(),
+                jitter = ?constants.jitter_offset,
+                mvec_scale = ?constants.mvec_scale,
+                "DLSS Frame Generation: first frame with depth and motion vectors tagged"
+            );
         }
-        once!(
-            info,
-            render = ?camera.render,
-            output = ?camera.output,
-            back_buffer = ?planes.size,
-            interface_plane = planes.overlay.is_some(),
-            interface_free_copy = hudless.is_some(),
-            depth_state = format_args!("{:#x}", resources[0].0.state),
-            motion_state = format_args!("{:#x}", resources[1].0.state),
-            near = constants.camera_near,
-            far = constants.camera_far,
-            fov = constants.camera_fov,
-            depth_inverted = camera.depth_inverted(),
-            jitter = ?constants.jitter_offset,
-            mvec_scale = ?constants.mvec_scale,
-            "DLSS Frame Generation: first frame with depth and motion vectors tagged"
-        );
-        constants_code == 0 && code == 0
+        tagged
     } else {
         if calls.framegen_on {
             // No upscaling this frame (a menu, a load): what was tagged may
@@ -143,6 +145,14 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         }
     }
     if calls.framegen_on {
+        if on && planes.overlay.is_none() && hudless_wanted() {
+            if hudless.is_some() {
+                HUD_COUNTS[HUD_TAGGED].fetch_add(1, Relaxed);
+                HUD_TAGGED_ALL.fetch_add(1, Relaxed);
+            } else {
+                HUD_COUNTS[HUD_MISSING].fetch_add(1, Relaxed);
+            }
+        }
         FG_ON.fetch_add(1, Relaxed);
         // What it takes of the card's memory: before its first present and
         // some seconds of presents later.
@@ -163,7 +173,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     drop(calls);
     mark(abi::PRESENT_START);
     spent(T_BEFORE, began);
-    Some(Presenting { token, frame })
+    Some(Presenting { token, frame, _hudless: hudless })
 }
 
 unsafe extern "C" fn present_error(error: *const i32) {
@@ -175,7 +185,7 @@ unsafe extern "C" fn present_error(error: *const i32) {
 /// After our swap chain's Present: the frame's last marker, the next
 /// frame's first, and what frame generation reports.
 pub(crate) fn present_ends(presenting: Option<Presenting>) {
-    let Some(Presenting { token, frame }) = presenting else { return };
+    let Some(Presenting { token, frame, .. }) = presenting else { return };
     let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return };
     let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state) else { return };
     let began = std::time::Instant::now();

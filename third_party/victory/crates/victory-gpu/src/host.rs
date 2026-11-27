@@ -2407,6 +2407,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Keeps this recording's HUD-less destination out of the reusable pair
+    /// until the list is reset, including after a submission or replay.
+    hudless_texture: Option<std::sync::Arc<ID3D12Resource>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -7711,6 +7714,10 @@ impl HostList {
     /// (`crate::streamline`, frame generation).
     pub(crate) fn mark_hudless(&self, id: u64) {
         self.hudless.store(id, Ordering::Relaxed);
+    }
+
+    pub(crate) fn keep_hudless(&self, copy: &std::sync::Arc<ID3D12Resource>) {
+        self.deferred().hudless_texture = Some(copy.clone());
     }
 
     /// The copy the list recorded (0 for none).

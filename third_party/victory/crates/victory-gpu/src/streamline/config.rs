@@ -53,7 +53,7 @@ impl Asked {
             mvec: plan::pair(var("VICTORY_DLSS_MV").as_deref()),
             reactive: var("VICTORY_DLSS_REACTIVE").is_none_or(|v| v.trim() != "0"),
             log_dir: var("VICTORY_STREAMLINE_LOG").filter(|v| !v.trim().is_empty() && v.trim() != "0").map(PathBuf::from),
-            hudless: var("VICTORY_FRAMEGEN_HUDLESS").is_none_or(|v| v.trim() != "0"),
+            hudless: hudless_option(var("VICTORY_FRAMEGEN_HUDLESS").as_deref()),
             present_hook: on("VICTORY_STREAMLINE_PRESENT"),
         })
     }
@@ -69,6 +69,18 @@ impl Asked {
 pub struct Available {
     pub dlss: bool,
     pub framegen: bool,
+}
+
+fn hudless_option(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+#[cfg(test)]
+#[test]
+fn hudless_is_enabled_by_default_and_zero_disables_it() {
+    assert!(hudless_option(None));
+    assert!(hudless_option(Some("1")));
+    assert!(!hudless_option(Some(" 0 ")));
 }
 
 fn streamline_dir() -> Result<PathBuf, String> {

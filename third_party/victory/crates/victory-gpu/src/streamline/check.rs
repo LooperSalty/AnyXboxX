@@ -179,10 +179,12 @@ fn exercise(host: &crate::host::Host, asked: &Asked, output: [u32; 2], present: 
         // A stand-in for the colour without the interface, tagged as the
         // copies in front of the title's interface composite are: ours, a
         // copy's destination, of the back buffer's size and format.
-        let copy = {
+        let copy = if asked.hudless {
             use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
-            texture(device, output, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, COPY_DEST).ok()
-        };
+            let stand_in = texture(device, output, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, COPY_DEST)
+                .map_err(|e| format!("could not create the synthetic HUD-less colour: {e}"))?;
+            Some(stand_in)
+        } else { None };
         let tagged = HUD_TAGGED_ALL.load(Relaxed);
         for frame in 1..=180u64 {
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;

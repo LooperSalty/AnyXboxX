@@ -4141,12 +4141,21 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        self.draw_at(list, vertices, instances, first, first_instance, None);
+    }
+
+    pub(crate) fn draw_at(
+        &mut self,
+        list: &HostList,
+        vertices: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+        frame: Option<u64>,
+    ) {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        if crate::streamline::hudless_wanted() {
-            self.before_shown_target(list, vertices == 3 && instances == 1);
-        }
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4161,6 +4170,9 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            if crate::streamline::hudless_wanted() {
+                self.before_shown_target(list, vertices == 3 && instances == 1, frame);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4184,11 +4196,9 @@ impl State {
     /// With frame generation (`crate::streamline`), before a draw into one
     /// colour target without depth: if the target is one the title presents,
     /// the draw is told there, where the colour without the interface is
-    /// copied in front of the title's interface composite. `triangle`: one
-    /// triangle, one instance (the composite's shape). Only copies and
-    /// barriers are recorded; the target is moved back to a render target by
-    /// the draw's own preparation.
-    fn before_shown_target(&self, list: &HostList, triangle: bool) {
+    /// copied in front of the title's interface composite. THIN supplies
+    /// the present number recorded by the title thread.
+    fn before_shown_target(&self, list: &HostList, triangle: bool, frame: Option<u64>) {
         if self.depth != 0 {
             return;
         }
@@ -4201,7 +4211,10 @@ impl State {
         if p.compute || p.mesh {
             return;
         }
-        crate::streamline::before_target_draw(list, target as This, p, triangle);
+        match frame {
+            Some(frame) => crate::streamline::before_target_draw_at(list, target as This, p, frame),
+            None => crate::streamline::before_target_draw(list, target as This, p, triangle),
+        }
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -4285,7 +4298,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if crate::streamline::hudless_wanted() {
-            self.before_shown_target(list, false);
+            self.before_shown_target(list, false, None);
         }
         // Indexed rectangles are drawn by the rectangle geometry stage
         // alone (nothing expands them on the CPU).

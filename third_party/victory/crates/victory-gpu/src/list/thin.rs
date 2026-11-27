@@ -436,7 +436,8 @@ plain! {
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
     SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
-    DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
+    DRAW draw_plain = draw_without_capture, (vertices: u32, instances: u32, first: u32, first_instance: u32);
+    HUDLESS_DRAW draw_at = state::draw_at, (vertices: u32, instances: u32, first: u32, first_instance: u32, frame: u64);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
     DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
     DISPATCH_X dispatch_x = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
@@ -458,6 +459,21 @@ plain! {
 
 const fn after(n: u64) -> u64 {
     Plain::END as u64 + n
+}
+
+fn draw_without_capture(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+    state::draw_at(this, vertices, instances, first, first_instance, 0);
+}
+
+extern "system" fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+    // Stamp the title's next present here. Translation can run after the
+    // title has queued another present, or out of order across lists.
+    let frame = crate::streamline::hudless_frame(vertices, instances);
+    if frame == 0 {
+        draw_plain(this, vertices, instances, first, first_instance);
+    } else {
+        draw_at(this, vertices, instances, first, first_instance, frame);
+    }
 }
 const RESET: u64 = after(0);
 const CLOSE: u64 = after(1);
