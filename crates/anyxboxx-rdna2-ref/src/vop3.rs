@@ -274,7 +274,7 @@ fn compute(name: &str, a: u32, b: u32, c: u32) -> Option<u64> {
     let fa = bits_float(a);
     let result = match name {
         "v_fma_f32" => float3(a, b, c, float::fma),
-        "v_mad_f32" => float3(a, b, c, |x, y, z| x * y + z),
+        "v_mad_f32" => float3(a, b, c, float::mul_add),
         "v_fma_legacy_f32" => float3(a, b, c, float::legacy_fma),
         "v_min3_f32" => float3(a, b, c, min3),
         "v_max3_f32" => float3(a, b, c, max3),
