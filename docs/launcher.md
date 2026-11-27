@@ -31,6 +31,15 @@ Either option works:
 
 The launcher needs your AnyXboxX clone (the folder holding `third_party\victory\Cargo.toml`). It looks, in this order, at: the folder you chose in **Setup → AnyXboxX folder** (saved in `settings.toml`; a folder without `third_party\victory\Cargo.toml` is refused with an explanation), `ANYXBOXX_REPO`, the launcher's own folder and each parent (also the current folder), then a few usual places: the launcher's parent folder and its neighbours named `AnyXboxX*`, `%USERPROFILE%\AnyXboxX`, `Documents\AnyXboxX`, `source\repos\AnyXboxX`, `Desktop\AnyXboxX` and `Downloads\AnyXboxX*`. The Setup page shows the folder in use and where it came from. If the executable is outside the clone (for example in Downloads), either put it inside the clone or choose the clone folder once in Setup. Without a clone, PLAY opens Setup and says "AnyXboxX folder not found".
 
+### Windows 10 only: the D3D12 Agility SDK runtime
+
+Windows 10's own Direct3D 12 runtime has no shader model 6.6, so on Windows 10 every root signature the game asks for is refused (`host root signature refused error=The parameter is incorrect. (0x80070057)`, after `Unsupported bit-flag set (root signature flags c01)`) and the game ends a few seconds after starting. `victory.exe` exports `D3D12SDKVersion` and `D3D12SDKPath` (`.\D3D12\`), so Microsoft's newer runtime placed beside it is used instead: at startup it asks Windows for the version of the `D3D12Core.dll` it finds there, and for Windows' own runtime when there is none. Windows 11 does not need this step.
+
+1. Download Microsoft's [Microsoft.Direct3D.D3D12 1.620.2](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2) package ("Download package"), and open the `.nupkg` as a zip file. Use a 1.620.x release: 1.620.2 is the newest stable one and the one tested; the newer 1.7xx packages are previews and are not tested.
+2. Copy `build\native\bin\x64\D3D12Core.dll` (and `d3d12SDKLayers.dll` if you want the debug layer) into a `D3D12` folder beside `victory.exe`: `third_party\victory\target\release\D3D12\` (and `third_party\victory\target\diag\D3D12\` for diagnostics builds). Create the folder after the first build, or before it: cargo does not remove it.
+
+The game's log then has no `root signature refused` line at startup. `cargo clean` deletes the folder with the rest of `target`: copy it again afterwards.
+
 ### 3. First start
 
 1. Double-click `anyxboxx-launcher.exe`.

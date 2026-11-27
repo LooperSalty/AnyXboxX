@@ -31,6 +31,15 @@ Au choix :
 
 Le lanceur a besoin de votre clone AnyXboxX (le dossier qui contient `third_party\victory\Cargo.toml`). Il regarde, dans cet ordre : le dossier choisi dans **Setup → AnyXboxX folder** (enregistré dans `settings.toml` ; un dossier sans `third_party\victory\Cargo.toml` est refusé avec une explication), `ANYXBOXX_REPO`, son propre dossier et chaque parent (ainsi que le dossier courant), puis quelques emplacements usuels : le dossier parent du lanceur et ses voisins nommés `AnyXboxX*`, `%USERPROFILE%\AnyXboxX`, `Documents\AnyXboxX`, `source\repos\AnyXboxX`, `Desktop\AnyXboxX` et `Downloads\AnyXboxX*`. La page Setup montre le dossier utilisé et d'où il vient. Si l'exécutable est hors du clone (par exemple dans Téléchargements), rangez-le dans le clone ou choisissez une fois le dossier du clone dans Setup. Sans clone, JOUER ouvre Setup et affiche « AnyXboxX folder not found ».
 
+### Windows 10 seulement : le runtime D3D12 Agility SDK
+
+Le runtime Direct3D 12 de Windows 10 n'a pas le shader model 6.6 : sous Windows 10, toutes les root signatures du jeu sont refusées (`host root signature refused error=The parameter is incorrect. (0x80070057)`, après `Unsupported bit-flag set (root signature flags c01)`) et le jeu s'arrête quelques secondes après son lancement. `victory.exe` exporte `D3D12SDKVersion` et `D3D12SDKPath` (`.\D3D12\`) : le runtime plus récent de Microsoft placé à côté de lui est alors utilisé à la place. Au démarrage, il demande à Windows la version du `D3D12Core.dll` qu'il y trouve, et le runtime de Windows lui-même s'il n'y en a pas. Windows 11 n'a pas besoin de cette étape.
+
+1. Téléchargez le paquet [Microsoft.Direct3D.D3D12 1.620.2](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2) de Microsoft (« Download package »), et ouvrez le `.nupkg` comme un fichier zip. Prenez une version 1.620.x : 1.620.2 est la plus récente des versions stables et celle qui a été testée ; les paquets 1.7xx plus récents sont des préversions, non testées.
+2. Copiez `build\native\bin\x64\D3D12Core.dll` (et `d3d12SDKLayers.dll` pour la couche de débogage) dans un dossier `D3D12` à côté de `victory.exe` : `third_party\victory\target\release\D3D12\` (et `third_party\victory\target\diag\D3D12\` pour les builds de diagnostic). Le dossier peut être créé avant ou après la première compilation : cargo ne le supprime pas.
+
+Le journal du jeu n'a alors plus de ligne `root signature refused` au démarrage. `cargo clean` supprime le dossier avec le reste de `target` : recopiez-le ensuite.
+
 ### 3. Premier démarrage
 
 1. Double-cliquez sur `anyxboxx-launcher.exe`.

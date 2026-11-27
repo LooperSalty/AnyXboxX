@@ -175,16 +175,10 @@ at a time. The defaults are 40 pipelines per worker process and idle priority.
 
 For a Windows runtime that rejects root signature flags `c00` or `c01`, use the application-local [Microsoft.Direct3D.D3D12 1.620.2 package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2).
 
-1. Open the `.nupkg` as a ZIP and copy `build/native/bin/x64/D3D12Core.dll` to `target\diag\D3D12\`. The optional debug layer uses `D3D12SDKLayers.dll` from the same package.
-2. Build with the Agility SDK exports enabled.
+1. Open the `.nupkg` as a ZIP and copy `build/native/bin/x64/D3D12Core.dll` to `target\release\D3D12\` (`target\diag\D3D12\` for a diagnostics build). The optional debug layer uses `D3D12SDKLayers.dll` from the same package.
+2. Launch with `scripts\play.ps1`. Keep the `D3D12` folder beside the executable.
 
-   ```powershell
-   $env:VICTORY_AGILITY_SDK = '1'
-   try { cargo build --locked --profile diag -p victory --features diagnostics }
-   finally { Remove-Item Env:VICTORY_AGILITY_SDK }
-   ```
-
-3. Launch with `scripts\play.ps1`. Keep the `D3D12` folder beside the executable. For a release build, use `target\release\D3D12\` and build with `--release`.
+Every x64 Windows MSVC build exports `D3D12SDKVersion` and `D3D12SDKPath` (`apps/victory/build.rs`). At startup `victory` sets `D3D12SDKVersion` to the Agility SDK version of `D3D12\D3D12Core.dll`, or to Windows' own runtime's when the file is missing (`apps/victory/src/agility.rs`): the loader takes the folder's runtime only when the two match exactly, and otherwise refuses Direct3D 12 with `0x887E0003` instead of falling back. `VICTORY_AGILITY_SDK=0` builds without the exports; `VICTORY_AGILITY_SDK=1` makes a missing `D3D12Core.dll` an error at startup.
 
 </details>
 
