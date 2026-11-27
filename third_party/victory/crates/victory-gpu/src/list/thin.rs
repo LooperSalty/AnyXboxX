@@ -56,6 +56,9 @@ const CHUNK: usize = 1024;
 const ABANDON_POLL: u64 = 64;
 
 pub(crate) mod timing;
+pub(crate) mod fast;
+#[cfg(test)]
+mod bench;
 
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
@@ -773,17 +776,31 @@ fn translate<const SPLIT: bool>(
     plan: &split::Plan,
     left: impl Fn() -> bool,
 ) -> (u64, bool) {
-    if timing::on() {
-        timing::stream(|| {
-            if SPLIT {
-                translate_planned::<true, true>(list, stream, plan, left)
-            } else {
-                translate_stream::<true>(list, stream, left)
-            }
-        })
-    } else {
-        translate_planned::<SPLIT, false>(list, stream, plan, left)
-    }
+    fast::scope(fast::wanted(), || {
+        if timing::on() {
+            timing::stream(|| {
+                if SPLIT {
+                    translate_planned::<true, true>(list, stream, plan, left)
+                } else {
+                    translate_stream::<true>(list, stream, left)
+                }
+            })
+        } else {
+            translate_planned::<SPLIT, false>(list, stream, plan, left)
+        }
+    })
+}
+
+/// The unsplit path with `fast` chosen by the caller (the bench compares both).
+#[cfg_attr(not(test), allow(dead_code))]
+fn translate_with(list: This, stream: &[u64], left: impl Fn() -> bool, fast: bool) -> (u64, bool) {
+    fast::scope(fast, || {
+        if timing::on() {
+            timing::stream(|| translate_stream::<true>(list, stream, left))
+        } else {
+            translate_stream::<false>(list, stream, left)
+        }
+    })
 }
 
 fn translate_stream<const TIMED: bool>(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
