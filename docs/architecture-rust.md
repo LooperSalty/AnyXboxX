@@ -147,10 +147,15 @@ exact executable. The tool checks the checkout again before writing the records 
 `victory.exe.identity.json` supplies schema 1 for OPT-SEC-001. The separate
 `victory.exe.build.json` records the manifest digest, source commit, TomBox gitlink,
 VIctory tree, both lockfile SHA-256 values, Rust and Cargo versions, Windows SDK, compiler,
-linker and DXC versions and hashes, target, and profile. Compare the executable SHA-256
-values across builds and use the evidence files to attribute any difference. The launcher pin
-is the tool's printed manifest SHA-256. Distribute that value through the authenticated build
-channel used by the launcher operator.
+linker and DXC versions and hashes, target, and profile. Each executable SHA-256 identifies
+one build. PE timestamps and the CodeView GUID can differ between builds with the same
+recorded inputs. Compare the source, toolchain, and lockfile evidence across builds, and
+generate a new manifest for each executable. The launcher pin is the tool's printed
+manifest SHA-256. Distribute that value through the authenticated build channel used by
+the launcher operator.
+
+Source builds from the launchers also use Cargo's `--locked` flag. If a dependency change
+requires updating `Cargo.lock`, regenerate the lockfile before launching.
 
 ## Parity method
 

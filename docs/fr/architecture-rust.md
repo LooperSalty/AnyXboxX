@@ -134,6 +134,37 @@ de `victory-hle` deviennent de fins adaptateurs (décision D3).
 - **`rust/` rejoint `crates/`** en phase 1 ; `rust/Cargo.toml` est alors supprimé.
 - **Un seul dossier de compilation**, `target/` à la racine (ignoré par git).
 
+## Attester une compilation de VIctory
+
+Depuis un terminal de développement Visual Studio x64 avec le SDK Windows, utilisez un
+dépôt propre et initialisez le sous-module TomBox. Prenez un nouveau dossier cible pour
+chaque compilation.
+
+```powershell
+python tools/build_victory_identity.py --target-dir target/victory-release-a --offline
+python tools/build_victory_identity.py --target-dir target/victory-release-b --offline
+```
+
+Retirez `--offline` si Cargo doit télécharger les dépendances décrites par le fichier de
+verrouillage. Pour une compilation avec diagnostics, passez `--profile diag`. Cargo utilise
+le fichier de verrouillage de VIctory et indique l'exécutable exact. L'outil vérifie de
+nouveau le dépôt avant d'écrire les attestations à côté de l'exécutable.
+[Options de compilation de Cargo](https://doc.rust-lang.org/cargo/commands/cargo-build.html)
+
+`victory.exe.identity.json` fournit le schéma 1 pour OPT-SEC-001.
+`victory.exe.build.json` consigne le SHA-256 du manifeste, le commit source, le gitlink
+TomBox, l'arbre de VIctory, le SHA-256 des deux fichiers de verrouillage, les versions de
+Rust et Cargo, le SDK Windows, les versions et empreintes du compilateur, de l'éditeur de
+liens et de DXC, ainsi que la cible et le profil. Chaque SHA-256 d'exécutable correspond à
+une compilation. Les horodatages PE et le GUID CodeView peuvent varier même avec les
+mêmes entrées. Comparez les sources, les outils et les fichiers de verrouillage consignés
+et générez un manifeste pour chaque exécutable. L'empreinte épinglée par le lanceur est
+le SHA-256 du manifeste affiché par l'outil. Transmettez cette valeur via le canal de
+compilation authentifié utilisé par l'opérateur du lanceur.
+
+Les lanceurs utilisent aussi l'option `--locked` de Cargo pour compiler depuis les sources.
+Si une dépendance exige de modifier `Cargo.lock`, régénérez d'abord ce fichier.
+
 ## Méthode de parité
 
 - Chaque portage fournit une petite ligne de commande (`anyxboxx-pe <image> [--base] [--pages]`,
