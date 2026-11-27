@@ -18,6 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindow
 
 use super::{Host, HostList, transition};
 use crate::cpucores::CpuMeter;
+use crate::frame_rate::{FrameCounts, FrameGeneration, FrameRate};
 
 mod gpu_load;
 
@@ -127,6 +128,9 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         b':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
         b' ' => [0; 7],
+        b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        b')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        b',' => [0, 0, 0, 0, 0, 0b00100, 0b01000],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
 }
@@ -397,7 +401,7 @@ impl Counters {
 
 /// Snapshot of data rendered onto the HUD canvas.
 struct Snapshot {
-    fps: f64,
+    rate: FrameRate,
     frame_ms: f64,
     gpu_ms: f64,
     gpu_pct: u32,
@@ -460,22 +464,31 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     c.border(0, 0, BASE_W, BASE_H, BORDER);
 
     // 1. Large coloured FPS header.
-    let fps_str = format!("{:.0} FPS", s.fps.round());
-    c.text(14, 12, 4, fps_color(s.fps), &fps_str);
-    // Subtle FPS decimal & ms badge on the right of the header.
-    let badge = format!("{:.1} FPS", s.fps);
-    c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
+    let mut fps_str = format!("{:.0} FPS", s.rate.shown.round());
+    let badge = if s.rate.active {
+        fps_str.push(' ');
+        fps_str.push_str(s.rate.shown_label());
+        s.rate.rendered_detail(0)
+    } else {
+        format!("{:.1} FPS", s.rate.rendered)
+    };
+    let badge_x = BASE_W - 14 - badge.len() as u32 * 12;
+    let scale = ((badge_x - 20) / (6 * fps_str.len() as u32)).clamp(1, 4);
+    c.text(14, 12, scale, fps_color(s.rate.shown), &fps_str);
+    c.text(badge_x, 24, 2, MUTED, &badge);
 
     // 2. Resolution | draws | GPU ms.
     let row2 = format!("{}X{} | {} DRAWS | GPU EST {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
     c.text_sep(14, 48, 2, WHITE, &trunc(&row2, 43));
 
     // 3. Frame | submit | 1% low | max.
-    let row3 = format!(
-        "FRAME {:.1} | SUB {:.1} | 1% {:.0} | MAX {:.0}",
-        s.frame_ms, s.submit_ms, s.low1_fps, s.max_ms
-    );
-    c.text_sep(14, 68, 2, MUTED, &trunc(&row3, 43));
+    let low_label = if s.rate.active { "1% RENDERED" } else { "1%" };
+    let row3 = format!("FRAME {:.1} | SUB {:.1} | {low_label} {:.0} | MAX {:.0}", s.frame_ms, s.submit_ms, s.low1_fps, s.max_ms);
+    if s.rate.active && row3.len() > 43 {
+        c.text_sep(14, 68, 1, MUTED, &row3);
+    } else {
+        c.text_sep(14, 68, 2, MUTED, &trunc(&row3, 43));
+    }
 
     // 4. Live frame-time sparkline graph.
     let (gx, gy, gw, gh) = (12u32, 90u32, BASE_W - 24, 76u32);
@@ -655,7 +668,7 @@ pub(super) struct PanelCopy {
 /// The panel of a presenter.
 pub(super) struct Panel {
     since: Instant,
-    frames: u32,
+    frames: FrameCounts,
     last: Instant,
     worst: f64,
     /// What this took since the last text.
@@ -675,7 +688,7 @@ impl Panel {
         let now = Instant::now();
         Panel {
             since: now,
-            frames: 0,
+            frames: FrameCounts::default(),
             last: now,
             worst: 0.0,
             cost: Duration::ZERO,
@@ -692,19 +705,18 @@ impl Panel {
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
-    pub(super) fn frame(&mut self, line: bool) {
+    pub(super) fn frame(&mut self, line: bool, fg: FrameGeneration) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
         if !shown().load(Ordering::Relaxed) {
-            self.frames = 0;
+            self.frames = FrameCounts::default();
             return;
         }
         let now = Instant::now();
         let dt_ms = (now - self.last).as_secs_f64() * 1e3;
-        if self.frames == 0 && now - self.last > 2 * EVERY {
+        if self.frames.rendered == 0 && now - self.last > 2 * EVERY {
             (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
-            self.frames = 0;
             self.cpu.sample();
         } else {
             if self.history.len() == HISTORY {
@@ -714,20 +726,21 @@ impl Panel {
             self.worst = self.worst.max(dt_ms);
             self.last = now;
         }
-        self.frames += 1;
+        self.frames.record(fg);
         let elapsed = now - self.since;
         if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
         }
         let Some(host) = super::host() else { return };
         self.cpu.sample();
-        let frames = f64::from(self.frames);
+        let counts = std::mem::take(&mut self.frames);
+        let frames = f64::from(counts.rendered);
+        let rate = counts.rates(elapsed);
         let counters = Counters::now();
         let c = counters.since(self.before, frames);
         self.before = counters;
 
         let ms = elapsed.as_secs_f64() * 1e3 / frames;
-        let fps = 1e3 / ms.max(0.001);
         let idle = (c[1] / 1e3).min(ms);
         let gpu_ms = (ms - idle).max(0.0);
         let measured = gpu_load::latest(&host.device);
@@ -741,7 +754,7 @@ impl Panel {
             let idx = (sorted.len() * 99 / 100).min(sorted.len() - 1);
             1e3 / f64::from(sorted[idx]).max(0.001)
         } else {
-            fps
+            rate.rendered
         };
 
         let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
@@ -759,7 +772,7 @@ impl Panel {
         let (gpu_name, _) = gpu_info(host);
 
         self.snap = Some(Snapshot {
-            fps,
+            rate,
             frame_ms: ms,
             gpu_ms,
             gpu_pct,
@@ -790,7 +803,7 @@ impl Panel {
             history_ms: self.history.iter().copied().collect(),
         });
         self.changed = true;
-        (self.since, self.frames, self.worst) = (now, 0, 0.0);
+        (self.since, self.worst) = (now, 0.0);
         self.cost = now.elapsed();
     }
 
@@ -918,7 +931,7 @@ mod tests {
     /// Every character the HUD uses has its own picture, and no two look alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./-|%: ").collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./-|%: (),").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
@@ -931,7 +944,11 @@ mod tests {
     #[test]
     fn a_box_is_painted() {
         let snap = Snapshot {
-            fps: 32.0,
+            rate: {
+                let mut frames = FrameCounts::default();
+                frames.record(FrameGeneration::Reported(2));
+                frames.rates(Duration::from_millis(62))
+            },
             frame_ms: 31.2,
             gpu_ms: 28.7,
             gpu_pct: 92,

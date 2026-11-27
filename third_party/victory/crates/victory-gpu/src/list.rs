@@ -162,6 +162,51 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// Work of ours at a place in a title list (DLSS in place of the title's
+/// FidelityFX upscaling, `crate::streamline`): it is given the host list
+/// there and says whether it recorded into it; if it did, what the title set
+/// is set again before the title's next draw or dispatch.
+#[cfg(windows)]
+pub(crate) type External = Box<dyn FnOnce(&crate::host::HostList) -> bool + Send>;
+
+/// Runs `work` at this place of title list `this`: now, or, with
+/// `VICTORY_THIN=1`, when the list's calls are translated (in their order).
+/// False if the list records nowhere.
+#[cfg(windows)]
+pub(crate) fn external(this: This, work: External) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // FidelityFX needs the actual recording result on the title thread.
+    // Flush just this prefix of the thin stream; subsequent calls (including
+    // the title's fallback) still record on the same underlying list.
+    let (reply, result) = std::sync::mpsc::channel();
+    let checked: External = Box::new(move |host| {
+        let recorded = work(host);
+        let _ = reply.send(recorded);
+        recorded
+    });
+    let work = match thin::put_external(this, checked) {
+        Ok(()) => return result.recv().unwrap_or(false),
+        Err(work) => work,
+    };
+    if host_list(this).is_none() {
+        return false;
+    }
+    run_external(this, work);
+    result.recv().unwrap_or(false)
+}
+
+/// [`external`]'s work on the list that records `this`'s calls.
+#[cfg(windows)]
+fn run_external(this: This, work: External) {
+    with_state(this, |host, state| {
+        work(host);
+        // Even a failed evaluation may have touched the command list.
+        state.replay(host);
+    });
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -883,10 +928,23 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+    // One host texture for the whole move (the texture's copy may be let
+    // go meanwhile; this list then holds it).
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        ensure_held_state(list, &copy, state);
+    }
+}
+
+/// [`ensure_state`] of a host copy the caller holds.
+#[cfg(windows)]
+pub(crate) fn ensure_held_state(
+    list: &crate::host::HostList,
+    copy: &std::sync::Arc<crate::resource::HostTexture>,
+    state: u32,
+) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
-        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+    if let Some((before, state)) = list.transition_held(copy, state) {
+        let barrier = crate::host::transition(&copy.texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture (the list's states hold
         // it).
         unsafe { list.list.barriers(&[barrier]) };
@@ -971,6 +1029,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        // (Every level of both, before their host copies are asked for:
+        // `crate::resource::keep_whole`.)
+        crate::resource::keep_whole(dst);
+        crate::resource::keep_whole(src);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1069,6 +1131,10 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        // Subresources are named by level: every level of both textures
+        // (`crate::resource::keep_whole`; buffers are left alone).
+        crate::resource::keep_whole(dst.resource);
+        crate::resource::keep_whole(src.resource);
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1341,6 +1407,12 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
+        && {
+            // (Every level of both: `crate::resource::keep_whole`.)
+            crate::resource::keep_whole(dst);
+            crate::resource::keep_whole(src);
+            true
+        }
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),

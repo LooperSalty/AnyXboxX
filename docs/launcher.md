@@ -43,6 +43,8 @@ The first run after a new build or a new setting recompiles hundreds of pipeline
 
 ## Options
 
+On **Play → NVIDIA DLSS**, choose a Streamline folder, enable Super Resolution and select its quality mode. Frame Generation 2x has its own switch and requires a GeForce RTX 40 or 50 series card with hardware-accelerated GPU scheduling enabled. Both switches start off. [NVIDIA files, setup and measured frame rates](dlss.md).
+
 - Resolution and window mode (windowed or borderless).
 - Keyboard layout: automatic, QWERTY, AZERTY or QWERTZ (`VICTORY_KEYBOARD`).
 - Fast (default, measured set), Quality (better lighting and textures, lower frame rate), 12 GB card or 8 GB card. The Fast profile's reserves on the card (1536 MB of draw-data windows and of buffer copies) were sized on 12 to 16 GB cards; on an RTX 5060 8 GB it stood at 8,010 MB in use against a 6,823 MB budget, Windows moved the rest into the PC's memory and the texture queue was refused. The two card presets cut those reserves (1024 MB, or 512 MB with a 256 MB list pool) and cap the title's textures with `VICTORY_TEXTURE_MAX_SIZE` (2048, or 1024 texels): the levels of a texture over the cap get no memory on the card and its views start at the first level within it, so every texture fits, slightly less sharp up close. The 12 GB preset is not measured on a 12 GB card yet.
@@ -70,5 +72,6 @@ Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profile
 - **A game is already running**: the launcher allows one game at a time, because two would share the save folder.
 - **The window closed by itself**: the log says `window closed: suspending the title` when you closed it; a crash is written to `crashes.log` under `%LOCALAPPDATA%\victory\data\`.
 - **Windows error 1455 in `crashes.log`**: the paging file is too small; close other applications or enlarge it.
+- **The launcher never opens its window** (the process stays in Task Manager): its window is drawn with Direct3D 12 on Windows. To try another graphics API, start it from a Command Prompt after `set WGPU_BACKEND=vulkan` (or `dx12`, the default); see issue #483.
 
 Under Proton or Wine the launcher cannot build VIctory (no cargo): use `anyxboxx run` as described in [running-gta6.md](running-gta6.md).

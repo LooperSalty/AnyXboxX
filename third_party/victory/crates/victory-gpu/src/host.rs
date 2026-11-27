@@ -162,23 +162,37 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
+/// `room_percent` is the share up to which the texture queue makes new
+/// copies (`crate::resource::room`, `VICTORY_TEXTURE_ROOM_PERCENT`). Under
+/// 88 the letting go starts there, and comes down to 3 below it: from 85
+/// to 88 % the 8 GB preset's 85 refused every new texture while idle ones
+/// were kept for ten minutes (#449). The 95 % line stays.
+///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
-pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+pub(crate) fn vram_keep(budget: u64, used: u64, room_percent: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
+    /// Where letting go starts when the queue's share is above it.
+    const START: u64 = 88;
+    /// How far under the start the letting go comes down to.
+    const BELOW: u64 = 3;
+    /// From here idle copies go after [`SHORT_MS`].
+    const SHORT_FROM: u64 = 95;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    let start = room_percent.min(START);
+    let target = start.saturating_sub(BELOW);
+    if used < share(start) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(SHORT_FROM) {
+        (IDLE_MS, used - share(target))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(target))
     }
 }
 
@@ -1061,10 +1075,16 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        // Streamline is given the device (DLSS, `VICTORY_DLSS`); for frame
+        // generation (`VICTORY_FRAMEGEN`) the direct queue is made through
+        // its device proxy.
+        let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
+            Some(queue) => queue,
+            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?,
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -1331,6 +1351,12 @@ pub(crate) struct HostList {
     /// A fresh replacement held by a logically closed title list. Only its
     /// next reset may reuse this open recording without resetting D3D12.
     left_open: std::sync::atomic::AtomicBool,
+    /// The upscaling (`crate::streamline`) recorded in the list, noted for
+    /// the present after its submission.
+    upscale: OnceLock<Mutex<Option<crate::streamline::Noted>>>,
+    /// The copy of the colour without the interface (`crate::streamline`)
+    /// recorded in the list, noted likewise.
+    hudless: OnceLock<Mutex<Option<crate::streamline::Copied>>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4450,6 +4476,8 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 left_open: false.into(),
+                upscale: OnceLock::new(),
+                hudless: OnceLock::new(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5863,6 +5891,13 @@ impl Host {
                 list.close();
             }
         }
+        // Upscalings these lists recorded, in submission order: the next
+        // present tags the latest (frame generation).
+        if crate::streamline::tracking_frames() {
+            for run in runs {
+                run.submit_frame_inputs();
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6760,6 +6795,8 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.take_upscale();
+        self.take_hudless();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6825,14 +6862,24 @@ impl HostList {
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let copy = crate::resource::host_copy(resource)?;
+        let (before, _) = self.transition_held(&copy, wanted)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
-        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        Some((unsafe { &*std::ptr::from_ref(&copy.texture) }, before))
+    }
+
+    /// [`HostList::transition`] of a host copy the caller holds: the state
+    /// it leaves and the (legal) state it takes, if that is a change.
+    pub(crate) fn transition_held(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(u32, u32)> {
         let wanted = legal_for(copy.flags(), wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 self.changed_something();
                 None
             }
@@ -6841,7 +6888,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((before, wanted))
             }
         }
     }
@@ -6896,18 +6943,28 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
-        const UNORDERED_ACCESS: u32 = 0x8;
         // Asked for every texture a draw reads: most have no twin.
-        let Some(twin) = crate::resource::twin(resource) else {
+        let Some((depth, Some(twin))) = crate::resource::host_side(resource) else {
             return false;
         };
-        let Some(depth) = crate::resource::host_copy(resource) else {
-            return false;
-        };
+        self.twin_use_held(&depth, &twin, colour, write);
+        true
+    }
+
+    /// [`HostList::twin_use`] of a depth texture's host copy `depth` and
+    /// colour twin `twin`, both held by the caller.
+    pub(crate) fn twin_use_held(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &std::sync::Arc<crate::resource::Twin>,
+        colour: bool,
+        write: bool,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
-            .entry(std::sync::Arc::as_ptr(&twin) as usize)
+            .entry(std::sync::Arc::as_ptr(twin) as usize)
             .or_insert_with(|| TwinUse {
                 depth: depth.clone(),
                 twin: twin.clone(),
@@ -6947,7 +7004,7 @@ impl HostList {
         }
         drop(twins);
         if copy {
-            self.twin_copy(&depth, &twin, colour);
+            self.twin_copy(depth, twin, colour);
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -6955,7 +7012,6 @@ impl HostList {
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
-        true
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
@@ -7695,6 +7751,42 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    pub(crate) fn submit_frame_inputs(&self) {
+        // Executing a closed list twice submits two upscales or copies. The
+        // recording keeps its inputs until reset; the present gets a reference.
+        if let Some(slot) = self.upscale.get()
+            && let Some(noted) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        {
+            crate::streamline::submitted(noted);
+        }
+        if let Some(slot) = self.hudless.get()
+            && let Some(copied) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        {
+            crate::streamline::hudless_submitted(copied);
+        }
+    }
+
+    /// Keep the resources with their recording until it is submitted or reset.
+    pub(crate) fn mark_upscale(&self, noted: crate::streamline::Noted) {
+        *self.upscale.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()) = Some(noted);
+    }
+
+    pub(crate) fn take_upscale(&self) -> Option<crate::streamline::Noted> {
+        self.upscale.get()?.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    pub(crate) fn mark_hudless(&self, copied: crate::streamline::Copied) {
+        *self.hudless.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()) = Some(copied);
+    }
+
+    pub(crate) fn hudless(&self) -> u64 {
+        self.hudless.get().and_then(|copy| copy.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.id)).unwrap_or(0)
+    }
+
+    pub(crate) fn take_hudless(&self) -> Option<crate::streamline::Copied> {
+        self.hudless.get()?.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -9348,7 +9440,7 @@ impl Host {
 
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -9358,7 +9450,7 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+pub(crate) const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -9418,10 +9510,12 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+use crate::frame_rate::{FrameCounts, FrameGeneration};
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
-    frames: u32,
+    frames: FrameCounts,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -9434,7 +9528,7 @@ impl Meter {
         Meter {
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
-            frames: 0,
+            frames: FrameCounts::default(),
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -9449,7 +9543,7 @@ impl Meter {
     }
 
     /// Record a frame once the swap chain has accepted it.
-    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
+    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT, fg: FrameGeneration) -> bool {
         use windows::Win32::Foundation::S_OK;
         if status != S_OK && status != self.last_present {
             tracing::warn!(?status, "swap chain did not present the frame");
@@ -9458,19 +9552,19 @@ impl Meter {
         if status != S_OK {
             return false;
         }
-        self.frame(hwnd);
+        self.frame(hwnd, fg);
         true
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, fg: FrameGeneration) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         // `VICTORY_FRAMETIME_DUMP`: times every present, before the one-second gate below.
         crate::frametime::tick();
-        self.frames += 1;
+        self.frames.record(fg);
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9480,12 +9574,14 @@ impl Meter {
             return;
         }
         let drawn = crate::draw::drawn();
-        let frames = f64::from(self.frames);
-        let fps = frames / elapsed.as_secs_f64();
+        let counts = std::mem::take(&mut self.frames);
+        let frames = f64::from(counts.rendered);
+        let rate = counts.rates(elapsed);
+        let fps = rate.rendered;
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        crate::overlay::set_frame(fps, ms, draws);
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        crate::overlay::set_frame(rate, ms, draws);
+        (self.since, self.drawn) = (std::time::Instant::now(), drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -9522,6 +9618,7 @@ impl Meter {
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
+            crate::streamline::line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
@@ -9692,6 +9789,12 @@ impl Meter {
                             / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
                         crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
                     );
+                    if let Some(cap) = crate::tiles::max_size() {
+                        tracing::info!(
+                            "texture size cap {cap} (VICTORY_TEXTURE_MAX_SIZE): lifted from {} textures the card copies into or out of",
+                            crate::resource::CAP_LIFTED.load(Ordering::Relaxed)
+                        );
+                    }
                 }
                 {
                     let mode = crate::watch::page_writes();
@@ -9781,7 +9884,8 @@ impl Meter {
                 }
         });
         let caption: Vec<u16> = crate::WINDOW_NAME.encode_utf16().collect();
-        let text = format!(" | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let ms_unit = if rate.active { "ms/render" } else { "ms/frame" };
+        let text = format!(" | {} {ms:.1} {ms_unit} {draws:.0} draws/frame", rate.caption());
         let mut text: Vec<u16> = caption.into_iter().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9811,19 +9915,21 @@ impl Meter {
 
 #[cfg(test)]
 mod present_status_tests {
-    use super::{HWND, Meter};
+    use super::{FrameGeneration, HWND, Meter};
     use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
 
     #[test]
     fn the_meter_counts_successful_presents_across_a_failure() {
         let mut meter = Meter::new();
         let hwnd = HWND::default();
-        assert!(meter.record_present(hwnd, S_OK));
-        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
-        assert!(!meter.record_present(hwnd, E_FAIL));
-        assert!(!meter.record_present(hwnd, E_FAIL));
-        assert!(meter.record_present(hwnd, S_OK));
-        assert_eq!(meter.frames, 2);
+        let fg = FrameGeneration::Reported(2);
+        assert!(meter.record_present(hwnd, S_OK, fg));
+        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED, fg));
+        assert!(!meter.record_present(hwnd, E_FAIL, fg));
+        assert!(!meter.record_present(hwnd, E_FAIL, fg));
+        assert!(meter.record_present(hwnd, S_OK, FrameGeneration::Off));
+        assert_eq!(meter.frames.rendered, 2);
+        assert_eq!(meter.frames.rates(std::time::Duration::from_secs(1)).shown, 3.0);
         assert_eq!(meter.last_present, S_OK);
     }
 }
@@ -9845,6 +9951,17 @@ impl Host {
         state: u32,
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
+    ) -> Option<bool> {
+        self.present_planes_for_frame(texture, state, overlay, frame, frame)
+    }
+
+    pub(crate) fn present_planes_for_frame(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+        token: u64,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -9886,13 +10003,14 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes_for_frame(texture, state_u32, None, frame, token);
                 }
             }
         }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            if !crate::streamline::resizing() { return None; }
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -9903,6 +10021,7 @@ impl Host {
                     if p.format != format {
                         p.composer = None;
                     }
+                    crate::streamline::hudless_resized();
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
                         width,
@@ -9925,7 +10044,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes_for_frame(texture, state_u32, None, frame, token);
                 }
             }
         }
@@ -9986,7 +10105,7 @@ impl Host {
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_planes_for_frame(texture, state_u32, None, frame, token);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -10111,13 +10230,25 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Frame generation: the frame's markers, constants and tags.
+            let presenting = crate::streamline::present_begins(
+                token,
+                crate::streamline::Planes {
+                    base: (texture, state_u32),
+                    overlay: overlay.filter(|_| composed),
+                    size: [width, height],
+                },
+            );
+            let called = crate::streamline::present_called(&presenting);
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_returned(called);
+            let fg = crate::streamline::present_ends(presenting, status);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
-                p.panel.frame(p.meter.line_due());
+                p.panel.frame(p.meter.line_due(), fg);
             }
-            let presented = p.meter.record_present(p.hwnd, status);
+            let presented = p.meter.record_present(p.hwnd, status, fg);
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
@@ -10125,6 +10256,14 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Lets the swap chain and what presents with it go, once everything
+    /// sent has run (`victory upscaler-check`: before Streamline is shut
+    /// down; nothing presents afterwards).
+    pub(crate) fn drop_presenter(&self) {
+        settle_now(WHY_SYNC);
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn presenter(
@@ -10154,9 +10293,32 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let proxied = crate::streamline::swap_chain_factory(&factory).map(|(proxy, queue)| {
+                proxy
+                    .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
+                    .and_then(|s| s.cast::<IDXGISwapChain3>())
+            });
+            let swap_chain = match proxied {
+                Some(Ok(swap_chain)) => {
+                    crate::streamline::swap_chain_made(true, None);
+                    // Frame generation must be off across a change between
+                    // windowed and full screen (Streamline's guide, 12.0):
+                    // the system's own Alt+Enter is not taken for this window.
+                    if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
+                        let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                    }
+                    swap_chain
+                }
+                Some(Err(e)) => {
+                    crate::streamline::swap_chain_made(false, Some(&e));
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
+                }
+                // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
+                // generation: Streamline's proxy of it, for its present hook.)
+                None => crate::streamline::present_hooked(
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
+                ),
+            };
             // Alt+Enter is the title window's own switch to and from full
             // screen (frameless, the swap chain stretched); DXGI's would make
             // it exclusive full screen, whose buffers nothing resizes.
@@ -10164,7 +10326,7 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
-            crate::overlay::start(hwnd, self.adapter.clone());
+            if !crate::streamline::checking() { crate::overlay::start(hwnd, self.adapter.clone()); }
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
@@ -11662,12 +11824,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn textures_are_kept_while_the_card_has_room() {
         use super::vram_keep;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        // The queue's default share (90) and any above 88: as before.
+        for room in [88, 90, 97] {
+            assert_eq!(vram_keep(100 * gib, 87 * gib, room).0, 600_000);
+            // Past it: the longest idle ones, enough to come down to 85 %.
+            let (ms, bytes) = vram_keep(100 * gib, 90 * gib, room);
+            assert_eq!((ms, bytes), (5_000, 5 * gib));
+            assert_eq!(vram_keep(100 * gib, 120 * gib, room), (1_500, 35 * gib));
+            assert_eq!(vram_keep(0, 7, room).0, 5_000);
+        }
+    }
+
+    /// #449: under 88 the letting go starts at the queue's share and comes
+    /// down to 3 below it; 95 % stays the line for the short time.
+    #[test]
+    fn textures_go_from_where_the_queue_is_refused() {
+        use super::vram_keep;
+        let gib = 1 << 30;
+        assert_eq!(vram_keep(100 * gib, 84 * gib, 85).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 85 * gib, 85), (5_000, 3 * gib));
+        assert_eq!(vram_keep(100 * gib, 87 * gib, 85), (5_000, 5 * gib));
+        assert_eq!(vram_keep(100 * gib, 94 * gib, 85), (5_000, 12 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib, 85), (1_500, 13 * gib));
+        // The lowest share the queue takes (50).
+        assert_eq!(vram_keep(100 * gib, 49 * gib, 50).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 50 * gib, 50), (5_000, 3 * gib));
     }
 
     #[test]

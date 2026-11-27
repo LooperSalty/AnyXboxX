@@ -86,6 +86,16 @@ fixed: [docs/findings-rtx4090.md](docs/findings-rtx4090.md).
 | PC FSR 4.1.2 to 3840×2160 (`-Fsr4K`, Series X profile) | Belobug, from [DexNom/VIctory](https://github.com/DexNom/VIctory) `ab34a8b2` | Ported; needs AMD's signed upscaler DLL |
 | DLSS 4.5 Super Resolution (`-Dlss4K`) on the same bridge | this tree | Being written |
 
+When DLSS Super Resolution is ready, VIctory forces upscaler 7 so the title
+calls FidelityFX and DLSS can handle the upscale. If you set `VICTORY_UPSCALER=6`,
+VIctory logs the override once. An explicit `VICTORY_FFX_SCALE` still takes
+precedence over the DLSS mode's render scale.
+
+The shipping FSR4 context sizes (1920×1080 output, 1280×720 render) are
+assumed (measured by VIctory-NVIDIA on 26/11), to confirm in game. When a
+requested context falls outside the supported sizes, VIctory uses these sizes
+for the title's FSR4 context and passes the requested dimensions to DLSS.
+
 ### Test reliability
 
 Four `victory-gpu` tests failed CI now and then. Three shared global state with
