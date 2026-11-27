@@ -122,7 +122,11 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down: the keyboard's only while the title's window has
     /// focus, scripted ones (`VICTORY_KEYS_FILE`, `VICTORY_KEYS`) always.
-    fn keys(&mut self) -> Vec<KeyState>;
+    fn keys(&mut self, auto_a: bool) -> Vec<KeyState>;
+    /// Whether this poll should send an automatic A tap.
+    fn auto_a(&self) -> bool {
+        false
+    }
     /// The mouse for the stand-in pad (see `mouse.rs`); nothing unless the window has focus.
     fn mouse(&mut self) -> Mouse {
         Mouse::default()
@@ -479,8 +483,12 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let auto_a = source.auto_a();
+            if auto_a && let Some(pad) = pads.iter_mut().flatten().next() {
+                pad.buttons |= A;
+            }
+            (pads, source.keys(auto_a), source.mouse())
         };
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
@@ -658,7 +666,7 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: bool) -> Vec<KeyState> {
             Vec::new()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
@@ -1327,7 +1335,14 @@ mod host {
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn auto_a(&self) -> bool {
+            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
+                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            super::auto_a_now(*AUTO_A, super::START.elapsed())
+        }
+
+        fn keys(&mut self, auto_a: bool) -> Vec<KeyState> {
             let mut down = asked_keys();
             down.extend(scripted());
             if focused() {
@@ -1346,14 +1361,7 @@ mod host {
                 append_shift_fallback(&mut held, &down, shift_down);
                 down.extend(held);
             }
-            // (AnyXboxX) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
-            // (the stand-in pad's A) is down for a quarter of a second in every four,
-            // whether or not the window has focus: a launch gets through the title's
-            // "press A" screens without the focus being taken from what the user does.
-            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
-                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-            });
-            if super::auto_a_now(*AUTO_A, super::START.elapsed()) && !down.contains(&0x0D) {
+            if auto_a && !down.contains(&0x0D) {
                 down.push(0x0D);
             }
             down.into_iter()
@@ -1669,6 +1677,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        auto_a: bool,
         mouse: Mouse,
         rumble: Vec<(usize, u16, u16)>,
     }
@@ -1679,7 +1688,10 @@ mod tests {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn auto_a(&self) -> bool {
+            self.0.lock().unwrap().auto_a
+        }
+        fn keys(&mut self, _: bool) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
         fn mouse(&mut self) -> Mouse {
@@ -1881,6 +1893,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_a_taps_the_first_connected_pad() {
+        let (hub, host) = fake();
+        let physical = PadState {
+            buttons: B,
+            left_x: 0.5,
+            right_trigger: 0.75,
+            ..Default::default()
+        };
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(physical);
+            host.pads[3] = Some(PadState::default());
+            host.auto_a = true;
+            // The automatic tap appears as Enter in the keyboard sample.
+            host.keys = vec![key(0x0D)];
+        }
+        let sample = |device| {
+            let reading = current(hub, GAMEPAD_KIND, device).unwrap();
+            let state = pad(reading);
+            release(reading);
+            state
+        };
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            sample(1),
+            PadState {
+                buttons: A | B,
+                ..physical
+            }
+        );
+        assert_eq!(sample(3), PadState::default());
+
+        // A held Enter key is still only a keyboard input while a real pad is connected.
+        host.lock().unwrap().auto_a = false;
+        hub.poll();
+        assert_eq!(sample(1), physical);
+    }
+
+    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1940,6 +1992,23 @@ mod tests {
         // The old keys still pull the same triggers.
         let pad = fallback(&[key(b'Z'), key(b'C')], Mouse::default());
         assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
+    }
+
+    #[test]
+    fn auto_a_and_mouse_reach_the_merged_pad_together() {
+        let (hub, host) = fake_with(true);
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(PadState { buttons: B, ..Default::default() });
+            host.auto_a = true;
+            host.mouse = Mouse { x: 0.5, left: true, ..Default::default() };
+        }
+        hub.poll();
+        let reading = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let state = pad(reading);
+        assert_eq!(state.buttons, A | B);
+        assert_eq!((state.right_x, state.right_trigger), (0.5, 1.0));
+        release(reading);
     }
 
     #[test]

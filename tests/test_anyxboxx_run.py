@@ -253,6 +253,7 @@ def test_overrides_apply_to_warm_and_run_after_all_switches(tmp_path, fake_tool,
 
 def test_auto_a_and_frametime_dump_are_set_when_asked(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--auto-a", "--frametime-dump"])
+    assert calls[0] == BUILD, done.stderr
     logged = calls[1].split(" | ", 1)[1].split(";")
     assert "VICTORY_AUTO_A=150" in logged and "VICTORY_FRAMETIME_DUMP=1" in logged, done.stderr
 
