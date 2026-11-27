@@ -23,7 +23,7 @@ Mesuré par le mainteneur le 25 novembre (RTX 4070 SUPER, i7-13700KF, chemin Ser
 
 ### Sous Linux (Proton, AMD)
 
-La base Neptune ne reprend pas les 57 commits Proton/AMD de la base précédente (section suivante) : `main` a besoin de quatre choses sous Proton. `anyxboxx run` ne tourne que sous Windows : posez ces réglages à la main autour de `wine victory.exe run <dossier du jeu>\game_scarlett_master.exe --execute`, avec les mêmes variables que le lanceur.
+La base Neptune ne reprend pas les 57 commits Proton/AMD de la base précédente (section suivante). `main` a besoin de quatre réglages sous Proton. Pour utiliser le lanceur Windows en ligne de commande sous Proton, passez `run --game-dir <dossier du jeu> --victory-exe <chemin de victory.exe> --profile linux-amd` à `anyxboxx.exe`. Un exécutable compilé de manière croisée fonctionne seul, sans manifeste. Pour activer la [vérification de l'identité de l'exécutable](lanceur.md#victory-précompilé), définissez `ANYXBOXX_VICTORY_MANIFEST_SHA256`. Pour un lancement direct par `wine victory.exe run <dossier du jeu>\game_scarlett_master.exe --execute`, posez les variables à la main.
 
 | Quoi | Pourquoi |
 | --- | --- |

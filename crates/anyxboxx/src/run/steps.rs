@@ -2,9 +2,13 @@
 //! script did, the graphical launcher (`crates/anyxboxx-launcher`) drives them one by one.
 
 use std::ffi::OsString;
+use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 
+use super::identity::{BuildProfile, IdentityError, MANIFEST_PIN_ENV, VerifiedPrebuilt};
 use super::{Console, RunArgs, RunError, settings};
 
 pub const GAME_EXE: &str = "game_scarlett_master.exe";
@@ -18,12 +22,13 @@ pub type Env = Vec<(String, OsString)>;
 
 /// Where VIctory's sources and its built `victory.exe` are. `manifest` is `None` for a
 /// `victory.exe` built beforehand (`--victory-exe`): there is nothing to build.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Victory {
-    pub manifest: Option<PathBuf>,
-    pub exe: PathBuf,
+    manifest: Option<PathBuf>,
+    exe: PathBuf,
     /// Built with the diag profile and the diagnostics feature (`--diag`, `--dred`).
-    pub diag: bool,
+    diag: bool,
+    prebuilt: Option<Arc<VerifiedPrebuilt>>,
 }
 
 impl Victory {
@@ -42,12 +47,17 @@ impl Victory {
             manifest: Some(manifest),
             exe: target.join(profile).join("victory.exe"),
             diag,
+            prebuilt: None,
         })
     }
 
-    /// A `victory.exe` built beforehand, used as is: under Proton there is no cargo, so VIctory
-    /// is cross-built on the Linux side (`--target x86_64-pc-windows-msvc`) and only run here.
+    /// Use a prebuilt as supplied, with identity verification when a pin is set.
     pub fn prebuilt(exe: &Path) -> Result<Self, RunError> {
+        match std::env::var(MANIFEST_PIN_ENV) {
+            Ok(pin) => return Self::pinned_prebuilt(exe, &pin),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(IdentityError::InvalidPin.into()),
+            Err(std::env::VarError::NotPresent) => {}
+        }
         if !exe.is_file() {
             return Err(RunError::NoVictoryExe(exe.display().to_string()));
         }
@@ -55,7 +65,42 @@ impl Victory {
             manifest: None,
             exe: exe.to_path_buf(),
             diag: false,
+            prebuilt: None,
         })
+    }
+
+    /// The pin comes from a trusted build provider independently of the executable and sidecar.
+    pub fn pinned_prebuilt(exe: &Path, trusted_manifest_sha256: &str) -> Result<Self, RunError> {
+        let prebuilt = VerifiedPrebuilt::open(exe, trusted_manifest_sha256)?;
+        Ok(Victory {
+            manifest: None,
+            exe: prebuilt.path().to_path_buf(),
+            diag: prebuilt.profile() == BuildProfile::Diag,
+            prebuilt: Some(Arc::new(prebuilt)),
+        })
+    }
+
+    pub fn exe(&self) -> &Path {
+        &self.exe
+    }
+
+    /// Stable identity for cache and benchmark records of a verified prebuilt.
+    pub fn manifest_sha256(&self) -> Option<&str> {
+        self.prebuilt
+            .as_ref()
+            .map(|verified| verified.identity.manifest_sha256())
+    }
+
+    pub(super) fn check_diagnostics(&self, requested: bool) -> Result<(), RunError> {
+        if requested && self.prebuilt.is_some() && !self.diag {
+            return Err(IdentityError::Diagnostics.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_build(&mut self, command: &mut Command) -> Result<(), RunError> {
+        self.exe = build_executable(command)?;
+        Ok(())
     }
 
     /// `cargo build` of the release profile (or the diag profile with diagnostics): does nothing
@@ -77,41 +122,108 @@ impl Victory {
     /// base `warm` takes no archives: it makes the host pipelines of every pipeline earlier runs
     /// noted, so the driver's cache has them before the game asks. `archives` only enter the warm
     /// fingerprint (`warm_state`), never the command line, which Vice-Tay refuses.
-    pub fn warm_command(&self, archives: &[PathBuf], env: &Env) -> Command {
+    pub fn warm_command(&self, archives: &[PathBuf], env: &Env) -> RuntimeCommand {
         let _ = archives;
-        let mut command = Command::new(&self.exe);
+        let mut command = self.runtime_command();
         command.arg("warm");
-        apply_env(&mut command, env);
+        apply_env(&mut command.command, env);
         command
     }
 
     /// The warm before a first launch (`--precompile`): checks that shaders.rpf, the game and its
     /// two DLLs are there, then runs `victory warm` with the game's environment.
-    pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
+    pub fn precompile_command(
+        &self,
+        game_dir: &Path,
+        env: &Env,
+    ) -> Result<RuntimeCommand, RunError> {
         validate_precompile_inputs(game_dir)?;
         // Vice-Tay's `warm` reads no files: the inputs are checked so a broken game folder still
         // fails here, as before, and the command is the plain warm.
-        let mut command = Command::new(&self.exe);
-        command.arg("warm");
-        apply_env(&mut command, env);
-        Ok(command)
+        Ok(self.warm_command(&[], env))
     }
 
     /// `victory run <game> --execute` with the game's environment, as a Series X.
-    pub fn game_command(&self, game_dir: &Path, env: &Env) -> Command {
+    pub fn game_command(&self, game_dir: &Path, env: &Env) -> RuntimeCommand {
         self.game_command_as(game_dir, env, Console::SeriesX)
     }
 
     /// `victory run <game> --execute`, then the arguments of `console` (none for Series X).
-    pub fn game_command_as(&self, game_dir: &Path, env: &Env, console: Console) -> Command {
-        let mut command = Command::new(&self.exe);
+    pub fn game_command_as(&self, game_dir: &Path, env: &Env, console: Console) -> RuntimeCommand {
+        let mut command = self.runtime_command();
         command
+            .command
             .arg("run")
             .arg(game_dir.join(GAME_EXE))
             .arg("--execute")
             .args(console.victory_args());
-        apply_env(&mut command, env);
+        apply_env(&mut command.command, env);
         command
+    }
+
+    fn runtime_command(&self) -> RuntimeCommand {
+        RuntimeCommand {
+            command: Command::new(self.exe()),
+            prebuilt: self.prebuilt.clone(),
+        }
+    }
+}
+
+/// A process command keeps a verified image and its path protected until the child is spawned.
+pub struct RuntimeCommand {
+    command: Command,
+    prebuilt: Option<Arc<VerifiedPrebuilt>>,
+}
+
+impl RuntimeCommand {
+    pub fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.command.arg(arg);
+        self
+    }
+
+    pub fn stdio(&mut self, stdin: Stdio, stdout: Stdio, stderr: Stdio) {
+        self.command.stdin(stdin).stdout(stdout).stderr(stderr);
+    }
+
+    #[cfg(windows)]
+    pub fn creation_flags(&mut self, flags: u32) {
+        use std::os::windows::process::CommandExt;
+
+        self.command.creation_flags(flags);
+    }
+
+    pub fn identity_line(&self) -> Option<String> {
+        self.prebuilt
+            .as_ref()
+            .map(|verified| verified.identity.log_line())
+    }
+
+    pub fn spawn(&mut self) -> io::Result<Child> {
+        if let Some(verified) = &self.prebuilt {
+            verified.recheck()?;
+        }
+        self.command.spawn()
+    }
+
+    fn status(&mut self) -> io::Result<ExitStatus> {
+        self.spawn()?.wait()
+    }
+}
+
+impl From<Command> for RuntimeCommand {
+    fn from(command: Command) -> Self {
+        Self {
+            command,
+            prebuilt: None,
+        }
+    }
+}
+
+impl Deref for RuntimeCommand {
+    type Target = Command;
+
+    fn deref(&self) -> &Command {
+        &self.command
     }
 }
 
@@ -205,7 +317,8 @@ pub(super) fn build_executable(command: &mut Command) -> Result<PathBuf, RunErro
             let is_binary = target["kind"]
                 .as_array()
                 .is_some_and(|kind| kind.iter().any(|k| k == "bin"));
-            if message["reason"] != "compiler-artifact" || target["name"] != "victory" || !is_binary {
+            if message["reason"] != "compiler-artifact" || target["name"] != "victory" || !is_binary
+            {
                 return None;
             }
             message["executable"]
@@ -224,7 +337,10 @@ pub(super) fn build_executable(command: &mut Command) -> Result<PathBuf, RunErro
 }
 
 /// Waits for the command; a process killed without exit code counts as 1, like PowerShell.
-pub fn status(command: &mut Command, name: &str) -> Result<i32, RunError> {
+pub fn status(command: &mut RuntimeCommand, name: &str) -> Result<i32, RunError> {
+    if let Some(identity) = command.identity_line() {
+        println!("{identity}");
+    }
     let status = command
         .status()
         .map_err(|e| RunError::Spawn(name.to_string(), e))?;

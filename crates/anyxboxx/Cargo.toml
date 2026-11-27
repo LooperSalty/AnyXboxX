@@ -17,7 +17,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror.workspace = true
 anyxboxx-report.workspace = true
 victory-hle.workspace = true
@@ -25,7 +27,10 @@ victory-pe.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # GetLocalTime: the local-time stamp of the jour-j report folder, as Python's time.strftime.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

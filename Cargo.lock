@@ -262,7 +262,10 @@ version = "0.1.0"
 dependencies = [
  "anyxboxx-report",
  "clap",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "victory-hle",
  "victory-pe",

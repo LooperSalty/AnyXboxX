@@ -7,6 +7,8 @@ environment `anyxboxx run` gives VIctory are the same as the script's default, -
 the PATH and a fake victory.exe already built; the fake tool logs every call and the VICTORY_*
 variables it sees.
 """
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -165,8 +167,6 @@ def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=Tr
     (tmp_path / "tools").mkdir()
     shutil.copy(fake_tool, tmp_path / "tools" / "cargo.exe")
     (tmp_path / "xg_xs.dll").write_bytes(b"")
-    (tmp_path / "prebuilt").mkdir()
-    shutil.copy(fake_tool, tmp_path / "prebuilt" / "prebuilt.exe")
     log = tmp_path / "calls.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("VICTORY_")}
     env.update(inherited)
@@ -174,10 +174,8 @@ def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=Tr
     env["ANYXBOXX_LOGICAL_CPUS"] = str(logical_cpus)
     env.update({"PATH": f"{tmp_path / 'tools'}{os.pathsep}{os.environ['PATH']}",
                 "CARGO_TARGET_DIR": str(tmp_path / "target"), "FAKE_TOOL_LOG": str(log),
-                "FAKE_TOOL_EXIT_CARGO": str(cargo_exit), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT),
-                "FAKE_TOOL_EXIT_PREBUILT_RUN": str(VICTORY_EXIT)})
-    options = [o.replace("{xg}", str(tmp_path / "xg_xs.dll")).replace("{prebuilt}", str(tmp_path / "prebuilt"))
-               for o in options]
+                "FAKE_TOOL_EXIT_CARGO": str(cargo_exit), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT)})
+    options = [o.replace("{xg}", str(tmp_path / "xg_xs.dll")) for o in options]
     command = [str(binary), "run", "--repo", str(tmp_path / "depot"), "--game-dir", str(game), *options]
     done = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
     calls = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
@@ -370,20 +368,80 @@ def test_powershell_option_names_still_work(tmp_path, fake_tool, binary):
     assert calls == [BUILD_DIAG, GAME + ";".join(sorted(expected))], done.stderr
 
 
-# Linux (Proton): there is no cargo inside Proton, so VIctory is cross-built on the Linux side and
-# `--victory-exe` runs that build as is. The fake build is named prebuilt.exe, so its calls log as
-# `prebuilt`, apart from the repository's victory.exe; `cargo.exe` stays on the PATH, so any build
-# call would be logged too.
-PREBUILT_GAME = GAME.replace("victory run", "prebuilt run", 1)
+PIN_KEY = "ANYXBOXX_VICTORY_MANIFEST_SHA256"
 
 
-def test_a_prebuilt_victory_is_run_without_building(tmp_path, fake_tool, binary):
-    done, calls = launch(tmp_path, fake_tool, binary, ["--victory-exe", r"{prebuilt}\prebuilt.exe"])
-    assert calls == [PREBUILT_GAME + default_env()], done.stderr
-    assert done.returncode == VICTORY_EXIT
+def prebuilt_manifest(exe, contents):
+    manifest = json.dumps({
+        "schema": 1,
+        "executable_sha256": hashlib.sha256(contents).hexdigest(),
+        "executable_size": len(contents),
+        "source_commit": "a" * 40,
+        "tombox_gitlink": "b" * 40,
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "translator_version": 2,
+    }).encode()
+    exe.with_name(exe.name + ".identity.json").write_bytes(manifest)
+    return hashlib.sha256(manifest).hexdigest()
 
 
-def test_a_missing_prebuilt_victory_stops_before_anything_runs(tmp_path, fake_tool, binary):
-    done, calls = launch(tmp_path, fake_tool, binary, ["--victory-exe", r"{prebuilt}\missing.exe"])
-    assert calls == [] and done.returncode == 1
-    assert "victory.exe not found" in done.stderr
+def prebuilt_env(tmp_path):
+    env = {key: value for key, value in os.environ.items()
+           if key.upper() != PIN_KEY and not key.upper().startswith("VICTORY_")}
+    env["PATH"] = str(tmp_path / "no-cargo")
+    return env
+
+
+@pytest.mark.parametrize(("pin_kind", "error"), [
+    ("invalid", "must be a 64-digit hexadecimal SHA-256"),
+    ("wrong", "does not match the trusted SHA-256"),
+    ("missing-exe", "victory.exe not found"),
+    ("matching", "game_scarlett_master.exe not found"),
+])
+def test_cli_checks_prebuilt_identity_before_game_inputs_without_cargo(tmp_path, binary, pin_kind, error):
+    exe = tmp_path / "victory.exe"
+    contents = b"MZ\x00\x00inert fixture"
+    if pin_kind != "missing-exe":
+        exe.write_bytes(contents)
+    pin = prebuilt_manifest(exe, contents)
+    env = prebuilt_env(tmp_path)
+    env[PIN_KEY] = {"invalid": "bad", "wrong": "0" * 64}.get(pin_kind, pin)
+    done = subprocess.run(
+        [str(binary), "run", "--repo", str(tmp_path / "no-repo"),
+         "--game-dir", str(tmp_path / "no-game"), "--victory-exe", str(exe)],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert done.returncode == 1 and error in done.stderr
+    assert "Building VIctory" not in done.stdout
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["standalone", "pinned"])
+def test_cli_warms_and_launches_prebuilt_without_cargo(tmp_path, binary, fake_tool, verify):
+    artifact_dir = tmp_path / "build output"
+    artifact_dir.mkdir()
+    exe = artifact_dir / "victory.exe"
+    shutil.copyfile(fake_tool, exe)
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    (game_dir / "game_scarlett_master.exe").touch()
+    (game_dir / "fixture.rpf").touch()
+    call_log = tmp_path / "calls.log"
+    env = prebuilt_env(tmp_path)
+    env.update({"FAKE_TOOL_LOG": str(call_log), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT)})
+    console = []
+    if verify:
+        env[PIN_KEY] = prebuilt_manifest(exe, exe.read_bytes())
+        console = ["--console", "series-s"]
+    done = subprocess.run(
+        [str(binary), "run", "--repo", str(tmp_path / "no-repo"), "--warm",
+         "--game-dir", str(game_dir), "--victory-exe", str(exe), *console],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == VICTORY_EXIT, done.stderr
+    assert "Building VIctory" not in done.stdout
+    assert done.stdout.count("VICTORY_RUNTIME_IDENTITY=") == (2 if verify else 0)
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert [call.split()[:2] for call in calls] == [["victory", "warm"], ["victory", "run"]]
+    if console:
+        assert calls[1].split(" | ", 1)[0].endswith(" --console series-s")

@@ -38,7 +38,7 @@ cargo build --release --workspace --target x86_64-pc-windows-msvc \
 ```
 
 - `kernelx` et `d3d12_xs` ont besoin du `lib.exe` de MSVC pour produire le `.exp` de leur table de redirections (`anyxboxx-forwarders::link`) ; `llvm-lib /DEF` n'écrit que le `.lib`. Pas bloquant : le jeu passe par VIctory, qui ne charge pas ces DLL.
-- Il n'y a pas de cargo dans Proton : `anyxboxx.exe run` prend le VIctory compilé depuis Linux avec `--victory-exe` et saute la compilation (le dépôt n'est alors pas nécessaire). Le lancer avec le `wine` de Proton et le préfixe Wine de son choix, chemins écrits en `Z:\…` :
+- Avec Proton, `anyxboxx.exe run --victory-exe` utilise le VIctory compilé depuis Linux après vérification du manifeste et de l'exécutable. Définir `ANYXBOXX_VICTORY_MANIFEST_SHA256` avec la valeur fournie par la source de confiance avant de lancer la commande ci-dessous. [Format du manifeste](../launcher.md#prebuilt-victory)
 
 ```bash
 VKD3D_CONFIG=descriptor_heap "$PROTON/files/bin/wine" target/x86_64-pc-windows-msvc/release/anyxboxx.exe run \

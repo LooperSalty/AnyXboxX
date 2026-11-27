@@ -6,12 +6,14 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+use anyxboxx::run::RuntimeCommand;
 
 use crate::detached;
 use crate::progress::LineSplitter;
@@ -39,7 +41,7 @@ const WAIT_POLL: Duration = Duration::from_millis(100);
 /// One command of a job, with the name the window shows for it.
 pub struct Step {
     pub label: String,
-    pub command: Command,
+    pub command: RuntimeCommand,
     /// `Some(log)`: start detached, with the output written to `log` (see `detached`).
     pub detach_log: Option<PathBuf>,
     /// Runs after the command exits 0 (e.g. writes the warm marker); an error is shown as a line.
@@ -56,10 +58,10 @@ pub type RunIf = Box<dyn FnOnce() -> bool + Send>;
 
 impl Step {
     /// A step whose output is forwarded to the window.
-    pub fn new(label: impl Into<String>, command: Command) -> Self {
+    pub fn new(label: impl Into<String>, command: impl Into<RuntimeCommand>) -> Self {
         Step {
             label: label.into(),
-            command,
+            command: command.into(),
             detach_log: None,
             after: None,
             run_if: None,
@@ -67,7 +69,11 @@ impl Step {
     }
 
     /// The game: started detached, its output in `log`.
-    pub fn detached(label: impl Into<String>, command: Command, log: PathBuf) -> Self {
+    pub fn detached(
+        label: impl Into<String>,
+        command: impl Into<RuntimeCommand>,
+        log: PathBuf,
+    ) -> Self {
         Step {
             detach_log: Some(log),
             ..Step::new(label, command)
@@ -123,6 +129,9 @@ fn run_steps(steps: Vec<Step>, tx: &Sender<Event>, cancel: &AtomicBool) -> Event
             continue;
         }
         let _ = tx.send(Event::Started(step.label.clone()));
+        if let Some(identity) = step.command.identity_line() {
+            let _ = tx.send(Event::Line(identity));
+        }
         let outcome = match step.detach_log {
             Some(log) => run_detached(step.command, log, tx),
             None => match run_one(step.command, tx, cancel) {
@@ -148,7 +157,11 @@ fn run_steps(steps: Vec<Step>, tx: &Sender<Event>, cancel: &AtomicBool) -> Event
 
 /// Starts the game detached and waits for it to be up. Its output goes to `log`, which the
 /// window shows; a game that ends at once reports its exit code.
-fn run_detached(command: Command, log: PathBuf, tx: &Sender<Event>) -> Result<Event, String> {
+fn run_detached(
+    command: RuntimeCommand,
+    log: PathBuf,
+    tx: &Sender<Event>,
+) -> Result<Event, String> {
     let _ = tx.send(Event::Line(format!("Game log: {}", log.display())));
     let mut child = detached::spawn_game(command, &log).map_err(|e| e.to_string())?;
     match detached::wait_until_up(&mut child, detached::UP_WAIT).map_err(|e| e.to_string())? {
@@ -169,15 +182,14 @@ fn run_detached(command: Command, log: PathBuf, tx: &Sender<Event>) -> Result<Ev
 /// `None` when it was cancelled (killed; its readers are left to end with the pipes, since a
 /// grandchild may still hold them).
 fn run_one(
-    mut command: Command,
+    mut command: RuntimeCommand,
     tx: &Sender<Event>,
     cancel: &AtomicBool,
 ) -> std::io::Result<Option<i32>> {
-    let mut child = crate::noconsole::hide_console(&mut command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    #[cfg(windows)]
+    command.creation_flags(detached::CREATE_NO_WINDOW);
+    command.stdio(Stdio::null(), Stdio::piped(), Stdio::piped());
+    let mut child = command.spawn()?;
     let readers: Vec<JoinHandle<()>> = [
         child
             .stdout
@@ -230,6 +242,7 @@ fn forward(mut stream: Box<dyn Read + Send>, tx: Sender<Event>) -> JoinHandle<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::mpsc;
 
     fn collect(steps: Vec<Step>) -> Vec<Event> {
