@@ -110,6 +110,8 @@ TLS carrier finding: as a `no_std` cdylib, its TLS block holds exactly the carri
 
 Rust translates the f16 arithmetic and transcendental operations and the f16 integer/normalized conversions, packs and three-input min/max/median in wave32. The parity tests exercise VOP3 source and destination halves, modifiers, literals, partial EXEC and per-lane boundary values.
 
+Typed MUBUF/MTBUF loads and stores, including d16, are covered by 34 WARP/interpreter comparisons, one per encoding.
+
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.
 
 **Still Python:**

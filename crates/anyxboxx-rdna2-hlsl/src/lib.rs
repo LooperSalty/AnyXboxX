@@ -19,6 +19,7 @@ mod scalar_memory;
 mod scalar_movrel;
 mod scalar_wide;
 mod subword;
+mod typed_buffer;
 mod vector_binary;
 mod vector_compare;
 mod vector_dot;
@@ -115,6 +116,9 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "MTBUF" | "MUBUF" if anyxboxx_rdna2_ref::format_access::supports(name) => {
+            return typed_buffer::statements(name, pair);
+        }
         "MUBUF" => return buffer_memory::statements(name, pair),
         "GLOBAL" | "FLAT" => return flat_memory::statements(name, family, pair),
         "DS" => return lds::statements(name, pair),

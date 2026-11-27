@@ -110,6 +110,8 @@ Constat sur la porteuse TLS : en cdylib `no_std`, son bloc TLS contient exacteme
 
 Rust traduit en wave32 l’arithmétique et les transcendantes f16, les conversions entières et normalisées f16, le compactage et les minimum, maximum et médiane à trois entrées. Les tests de parité couvrent les demi-registres source et destination VOP3, les modificateurs, les littéraux, le masque EXEC partiel et les valeurs limites par lane.
 
+Les lectures et écritures typées MUBUF/MTBUF, y compris d16, sont couvertes par 34 comparaisons WARP/interpréteur, une par encodage.
+
 La CLI Rust affiche le HLSL des instructions portées avec `anyxboxx rdna2 FICHIER --hlsl`. Les deux CLI signalent le retrait de `--spirv` avec le code de sortie 2.
 
 **Encore en Python :**
