@@ -16,6 +16,7 @@
 pub mod atomic;
 pub mod atomic_float;
 pub mod buffer_format;
+pub mod cmpf16;
 pub mod compare;
 pub mod decode;
 pub mod div;
@@ -28,6 +29,9 @@ pub mod exec;
 pub mod export;
 pub mod ext;
 pub mod ext_compare;
+pub mod f16;
+pub mod f16_trans;
+pub mod f16conv;
 pub mod flat;
 pub mod float;
 pub mod format_access;

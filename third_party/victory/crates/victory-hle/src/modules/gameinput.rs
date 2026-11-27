@@ -56,8 +56,10 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 /// Virtual keys of the extra trigger keys (layout-independent).
+const VK_SHIFT: u8 = 0x10;
 const VK_SPACE: u8 = 0x20;
 const VK_LSHIFT: u8 = 0xA0;
+const VK_RSHIFT: u8 = 0xA1;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
@@ -371,6 +373,9 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Last logged stand-in pad trigger state (`(held_vks, left_bits, right_bits)`)
+    /// so `VICTORY_INPUT_TRACE` / debug logging prints once per change.
+    last_trigger_trace: Option<(Vec<u8>, u32, u32)>,
 }
 
 pub struct Hub {
@@ -439,6 +444,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                last_trigger_trace: None,
             }),
             returned: Condvar::new(),
         }));
@@ -515,7 +521,53 @@ impl Hub {
     }
 }
 
+/// Whether stand-in pad trigger changes are logged at `info` level
+/// (`VICTORY_INPUT_TRACE=1`; otherwise logged at `debug` level).
+fn input_trace_info() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPUT_TRACE").is_some_and(|v| v == "1"))
+}
+
 impl State {
+    /// Logs the stand-in pad's held virtual keys and trigger levels once per
+    /// change (at `info!` with `VICTORY_INPUT_TRACE=1`, `debug!` otherwise).
+    fn trace_stand_in_triggers(&mut self, keys: &[KeyState], pad: PadState, one_pad: bool) {
+        let trigger_active = pad.left_trigger != 0.0 || pad.right_trigger != 0.0;
+        let had_active = self
+            .last_trigger_trace
+            .as_ref()
+            .is_some_and(|(_, l, r)| *l != 0 || *r != 0);
+        if !trigger_active && !had_active && !input_trace_info() {
+            return;
+        }
+        let mut vks: Vec<u8> = keys.iter().map(|k| k.virtual_key).collect();
+        vks.sort_unstable();
+        vks.dedup();
+        let next = (vks, pad.left_trigger.to_bits(), pad.right_trigger.to_bits());
+        if self.last_trigger_trace.as_ref() == Some(&next) {
+            return;
+        }
+        let hex: Vec<String> = next.0.iter().map(|vk| format!("{vk:#04x}")).collect();
+        if input_trace_info() {
+            tracing::info!(
+                vks = ?hex,
+                left_trigger = pad.left_trigger,
+                right_trigger = pad.right_trigger,
+                one_pad,
+                "stand-in pad triggers"
+            );
+        } else {
+            tracing::debug!(
+                vks = ?hex,
+                left_trigger = pad.left_trigger,
+                right_trigger = pad.right_trigger,
+                one_pad,
+                "stand-in pad triggers"
+            );
+        }
+        self.last_trigger_trace = Some(next);
+    }
+
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
@@ -527,7 +579,9 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys, mouse), merged);
+            let stand_in = fallback(&keys, mouse);
+            self.trace_stand_in_triggers(&keys, stand_in, true);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -536,7 +590,11 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse)));
+        let fallback = (!any_pad).then(|| {
+            let stand_in = fallback(&keys, mouse);
+            self.trace_stand_in_triggers(&keys, stand_in, false);
+            Value::Pad(stand_in)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1257,20 +1315,14 @@ mod host {
             }
             let mut pad = self.pads[slot]?;
             // The scripted keys (`VICTORY_KEYS_FILE` and `VICTORY_KEYS`)
-            // also press the first pad's buttons, by the stand-in pad's
-            // table: with a real pad connected the stand-in is not there,
+            // also press the first pad's buttons and triggers, by the stand-in
+            // pad's table: with a real pad connected the stand-in is not there,
             // and a title that listens to the pad (the title's start screen)
             // saw nothing.
             if slot == 0 {
                 let mut asked = asked_keys();
                 asked.extend(scripted());
-                for vk in asked {
-                    if let Some(&(_, button)) =
-                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
-                    {
-                        pad.buttons |= button;
-                    }
-                }
+                pad = apply_scripted_keys(pad, &asked);
             }
             Some(pad)
         }
@@ -1281,11 +1333,17 @@ mod host {
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
+                let mut held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                // If a keyboard driver or remapper reports only generic VK_SHIFT
+                // without VK_LSHIFT/VK_RSHIFT, synthesize VK_LSHIFT so Left Shift
+                // still reaches the stand-in pad's left trigger.
+                // SAFETY: plain query.
+                let shift_down = unsafe { GetAsyncKeyState(i32::from(super::VK_SHIFT)) } < 0;
+                append_shift_fallback(&mut held, &down, shift_down);
                 down.extend(held);
             }
             // (AnyXboxX) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
@@ -1324,15 +1382,52 @@ mod host {
         }
     }
 
+    /// Applies scripted virtual keys (`VICTORY_KEYS`, `VICTORY_KEYS_FILE`) to
+    /// host pad slot 0: buttons from `FALLBACK_BUTTONS` plus trigger keys
+    /// (`Space`/`C` -> right trigger, `LeftShift`/`Z` -> left trigger).
+    fn apply_scripted_keys(mut pad: PadState, vks: &[u8]) -> PadState {
+        for &vk in vks {
+            if let Some(&(_, button)) =
+                super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+            {
+                pad.buttons |= button;
+            }
+            if vk == super::VK_SPACE || vk == b'C' {
+                pad.right_trigger = 1.0;
+            }
+            if vk == super::VK_LSHIFT || vk == b'Z' {
+                pad.left_trigger = 1.0;
+            }
+        }
+        pad
+    }
+
+    /// Synthesizes `VK_LSHIFT` when generic `VK_SHIFT` is held without either
+    /// `VK_LSHIFT` or `VK_RSHIFT` already present.
+    fn append_shift_fallback(held: &mut Vec<u8>, down: &[u8], shift_down: bool) {
+        if shift_down
+            && !held.contains(&super::VK_LSHIFT)
+            && !held.contains(&super::VK_RSHIFT)
+            && !down.contains(&super::VK_LSHIFT)
+            && !down.contains(&super::VK_RSHIFT)
+        {
+            held.push(super::VK_LSHIFT);
+        }
+    }
+
     /// A key's virtual-key code: a letter, a digit, or `Enter`, `Esc`,
-    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
-    /// table maps them to buttons).
+    /// `Tab`, `Back`, `Space`, `LeftShift` (`LShift`/`Shift`), `RightShift`
+    /// (`RShift`), `Up`, `Down`, `Left`, `Right` (the stand-in pad's table
+    /// maps them to buttons and triggers).
     fn key_code(key: &str) -> Option<u8> {
         Some(match key {
             "Enter" => 0x0D,
             "Esc" => 0x1B,
             "Tab" => 0x09,
             "Back" => 0x08,
+            "Space" => super::VK_SPACE,
+            "LeftShift" | "LShift" | "Shift" => super::VK_LSHIFT,
+            "RightShift" | "RShift" => super::VK_RSHIFT,
             "Up" => 0x26,
             "Down" => 0x28,
             "Left" => 0x25,
@@ -1446,14 +1541,37 @@ mod host {
     #[test]
     fn a_keys_file_holds_each_key_for_its_seconds() {
         let now = Instant::now();
-        let asked = asked("Enter 0.2\nJ 1.5\nnot a key 3\nW -1\nX\n", now);
+        let asked = asked("Enter 0.2\nJ 1.5\nSpace 0.5\nLeftShift 0.75\nnot a key 3\nW -1\nX\n", now);
         assert_eq!(
             asked,
             [
                 (now + Duration::from_millis(200), 0x0D),
-                (now + Duration::from_millis(1500), b'J')
+                (now + Duration::from_millis(1500), b'J'),
+                (now + Duration::from_millis(500), super::VK_SPACE),
+                (now + Duration::from_millis(750), super::VK_LSHIFT),
             ]
         );
+    }
+
+    #[test]
+    fn key_code_and_scripted_triggers_support_space_and_shift() {
+        assert_eq!(key_code("Space"), Some(super::VK_SPACE));
+        assert_eq!(key_code("LeftShift"), Some(super::VK_LSHIFT));
+        assert_eq!(key_code("LShift"), Some(super::VK_LSHIFT));
+        assert_eq!(key_code("Shift"), Some(super::VK_LSHIFT));
+        assert_eq!(key_code("RightShift"), Some(super::VK_RSHIFT));
+
+        let pad = apply_scripted_keys(PadState::default(), &[super::VK_SPACE, super::VK_LSHIFT, 0x0D]);
+        assert_eq!((pad.buttons, pad.left_trigger, pad.right_trigger), (A, 1.0, 1.0));
+
+        // Generic VK_SHIFT synthesizes VK_LSHIFT only when neither LShift nor RShift is held.
+        let mut held = Vec::new();
+        append_shift_fallback(&mut held, &[], true);
+        assert_eq!(held, vec![super::VK_LSHIFT]);
+
+        let mut held_right = vec![super::VK_RSHIFT];
+        append_shift_fallback(&mut held_right, &[], true);
+        assert_eq!(held_right, vec![super::VK_RSHIFT]);
     }
 
     #[test]

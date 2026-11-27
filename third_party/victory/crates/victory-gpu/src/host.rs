@@ -162,23 +162,37 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
+/// `room_percent` is the share up to which the texture queue makes new
+/// copies (`crate::resource::room`, `VICTORY_TEXTURE_ROOM_PERCENT`). Under
+/// 88 the letting go starts there, and comes down to 3 below it: from 85
+/// to 88 % the 8 GB preset's 85 refused every new texture while idle ones
+/// were kept for ten minutes (#449). The 95 % line stays.
+///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
-pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+pub(crate) fn vram_keep(budget: u64, used: u64, room_percent: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
+    /// Where letting go starts when the queue's share is above it.
+    const START: u64 = 88;
+    /// How far under the start the letting go comes down to.
+    const BELOW: u64 = 3;
+    /// From here idle copies go after [`SHORT_MS`].
+    const SHORT_FROM: u64 = 95;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    let start = room_percent.min(START);
+    let target = start.saturating_sub(BELOW);
+    if used < share(start) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(SHORT_FROM) {
+        (IDLE_MS, used - share(target))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(target))
     }
 }
 
@@ -6788,14 +6802,24 @@ impl HostList {
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let copy = crate::resource::host_copy(resource)?;
+        let (before, _) = self.transition_held(&copy, wanted)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
-        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        Some((unsafe { &*std::ptr::from_ref(&copy.texture) }, before))
+    }
+
+    /// [`HostList::transition`] of a host copy the caller holds: the state
+    /// it leaves and the (legal) state it takes, if that is a change.
+    pub(crate) fn transition_held(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(u32, u32)> {
         let wanted = legal_for(copy.flags(), wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 self.changed_something();
                 None
             }
@@ -6804,7 +6828,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((before, wanted))
             }
         }
     }
@@ -6859,18 +6883,28 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
-        const UNORDERED_ACCESS: u32 = 0x8;
         // Asked for every texture a draw reads: most have no twin.
-        let Some(twin) = crate::resource::twin(resource) else {
+        let Some((depth, Some(twin))) = crate::resource::host_side(resource) else {
             return false;
         };
-        let Some(depth) = crate::resource::host_copy(resource) else {
-            return false;
-        };
+        self.twin_use_held(&depth, &twin, colour, write);
+        true
+    }
+
+    /// [`HostList::twin_use`] of a depth texture's host copy `depth` and
+    /// colour twin `twin`, both held by the caller.
+    pub(crate) fn twin_use_held(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &std::sync::Arc<crate::resource::Twin>,
+        colour: bool,
+        write: bool,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
-            .entry(std::sync::Arc::as_ptr(&twin) as usize)
+            .entry(std::sync::Arc::as_ptr(twin) as usize)
             .or_insert_with(|| TwinUse {
                 depth: depth.clone(),
                 twin: twin.clone(),
@@ -6910,7 +6944,7 @@ impl HostList {
         }
         drop(twins);
         if copy {
-            self.twin_copy(&depth, &twin, colour);
+            self.twin_copy(depth, twin, colour);
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -6918,7 +6952,6 @@ impl HostList {
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
-        true
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
@@ -9655,6 +9688,12 @@ impl Meter {
                             / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
                         crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
                     );
+                    if let Some(cap) = crate::tiles::max_size() {
+                        tracing::info!(
+                            "texture size cap {cap} (VICTORY_TEXTURE_MAX_SIZE): lifted from {} textures the card copies into or out of",
+                            crate::resource::CAP_LIFTED.load(Ordering::Relaxed)
+                        );
+                    }
                 }
                 {
                     let mode = crate::watch::page_writes();
@@ -11615,12 +11654,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn textures_are_kept_while_the_card_has_room() {
         use super::vram_keep;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        // The queue's default share (90) and any above 88: as before.
+        for room in [88, 90, 97] {
+            assert_eq!(vram_keep(100 * gib, 87 * gib, room).0, 600_000);
+            // Past it: the longest idle ones, enough to come down to 85 %.
+            let (ms, bytes) = vram_keep(100 * gib, 90 * gib, room);
+            assert_eq!((ms, bytes), (5_000, 5 * gib));
+            assert_eq!(vram_keep(100 * gib, 120 * gib, room), (1_500, 35 * gib));
+            assert_eq!(vram_keep(0, 7, room).0, 5_000);
+        }
+    }
+
+    /// #449: under 88 the letting go starts at the queue's share and comes
+    /// down to 3 below it; 95 % stays the line for the short time.
+    #[test]
+    fn textures_go_from_where_the_queue_is_refused() {
+        use super::vram_keep;
+        let gib = 1 << 30;
+        assert_eq!(vram_keep(100 * gib, 84 * gib, 85).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 85 * gib, 85), (5_000, 3 * gib));
+        assert_eq!(vram_keep(100 * gib, 87 * gib, 85), (5_000, 5 * gib));
+        assert_eq!(vram_keep(100 * gib, 94 * gib, 85), (5_000, 12 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib, 85), (1_500, 13 * gib));
+        // The lowest share the queue takes (50).
+        assert_eq!(vram_keep(100 * gib, 49 * gib, 50).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 50 * gib, 50), (5_000, 3 * gib));
     }
 
     #[test]

@@ -1068,6 +1068,10 @@ fn root_signature(
 }
 
 #[cfg(test)]
+#[path = "rectangle_input_tests.rs"]
+mod rectangle_input_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;

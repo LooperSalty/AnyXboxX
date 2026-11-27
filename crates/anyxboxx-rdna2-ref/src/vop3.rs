@@ -351,6 +351,10 @@ pub fn execute(
         crate::pkf16::execute_fmac_vop3(wave, word, literal)?;
         return Ok(true);
     }
+    if crate::f16::supports(name) {
+        crate::f16::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::wide::execute(
         wave,
         name,
@@ -383,6 +387,10 @@ pub fn execute(
     if crate::vector::is_no_operation(name) {
         return Ok(true);
     }
+    if crate::cmpf16::supports(name) {
+        crate::cmpf16::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::vop3_forms::lane(wave, name, &fields, literal)?
         || crate::vop3_forms::mad64(wave, name, &fields, literal)?
     {
@@ -410,6 +418,10 @@ pub fn execute(
             "{name} avec op_sel/clamp (VOP3, résultat 16 bits)"
         )));
     }
+    if crate::f16_trans::supports(name) {
+        crate::f16_trans::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::vop3_forms::operation(wave, name, opcode, &fields, literal)? {
         return Ok(true);
     }
@@ -421,6 +433,10 @@ pub fn execute(
             )));
         }
         return crate::movrel::vector(wave, name, fields.vdst, fields.sources[0], literal);
+    }
+    if crate::f16conv::supports(name) {
+        crate::f16conv::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
     }
     if !is_native(name) {
         return Ok(false);
