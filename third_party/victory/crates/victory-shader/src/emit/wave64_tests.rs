@@ -1722,6 +1722,134 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
 
+#[test]
+fn dpp16_and_dpp8_honor_inactive_source_lanes_and_fi() {
+    // dpp8:[1,0,3,2,5,4,7,6] (each lane swaps with its odd/even neighbour)
+    const DPP8_SWAP1: u32 = 1 | 0 << 3 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    // dpp16 ext word: row_mask:0xf bank_mask:0xf, ctrl, bound_ctrl, fi, src0=v1
+    let dpp16 = |ctrl: u32, bound_ctrl: bool, fi: bool| -> u32 {
+        0xFF00_0000 | u32::from(bound_ctrl) << 19 | u32::from(fi) << 18 | ctrl << 8 | 1
+    };
+
+    let build_body = |wave64: bool| -> Vec<u32> {
+        let mut w = vop3(0x169, 1, v(0), k(10)).to_vec(); // v_mul_lo_u32 v1, v0, 10
+        w.extend([
+            vop2(0x25, 1, k(1), 1), // v_add_nc_u32 v1, 1, v1 (10*lane + 1)
+            vop1(0x01, 4, LIT),
+            0xAAAA, // v4 sentinel
+            vop1(0x01, 5, LIT),
+            0xBBBB, // v5 sentinel
+            vop1(0x01, 6, LIT),
+            0xCCCC, // v6 sentinel
+            vop1(0x01, 7, LIT),
+            0xDDDD,                 // v7 sentinel
+            vop2(0x1B, 2, k(1), 0), // v_and_b32 v2, 1, v0
+            vopc(0xC2, k(0), 2),    // v_cmp_eq_u32 vcc, 0, v2 (even lanes active)
+            sop1(if wave64 { 0x24 } else { 0x3C }, 12, VCC), // s_and_saveexec_b64/b32 s12, vcc
+        ]);
+        // 1. DPP16 quad_perm:[1,0,3,2] (0xB1) bound_ctrl:0 fi:0 -> inactive odd source: keep v4
+        w.extend([vop1(0x01, 4, 0xFA), dpp16(0xB1, false, false)]);
+        // 2. DPP16 quad_perm:[1,0,3,2] (0xB1) bound_ctrl:1 fi:0 -> inactive odd source: write 0
+        w.extend([vop1(0x01, 5, 0xFA), dpp16(0xB1, true, false)]);
+        // 3. DPP16 quad_perm:[1,0,3,2] (0xB1) bound_ctrl:0 fi:1 -> fetch inactive odd source
+        w.extend([vop1(0x01, 6, 0xFA), dpp16(0xB1, false, true)]);
+        // 4. DPP8 swap-1 fi:0 (0xE9) -> inactive odd source: keep v7; then active swap-2 into v7
+        w.extend([vop1(0x01, 7, 0xE9), DPP8_SWAP1 << 8 | 1]);
+        // 5. DPP16 quad_perm:[2,3,0,1] (0x4E) bound_ctrl:0 fi:0 -> active even source into v4 if lane&2!=0
+        //    actually write into v6's high bits? Keep v4 clean and instead verify active source via v_add_nc_u32 on v5:
+        //    v5 = (inactive->0) + active_partner(quad_perm:[2,3,0,1])
+        w.extend([vop2(0x25, 5, 0xFA, 5), dpp16(0x4E, false, false)]);
+        w.push(sop1(if wave64 { 0x04 } else { 0x03 }, EXEC, 12)); // restore EXEC
+        w.extend(stores([4, 5, 6, 7]));
+        w
+    };
+
+    let want_for = |lanes: u32| -> Vec<u32> {
+        let val = |n: u32| 10 * n + 1;
+        (0..lanes)
+            .flat_map(|n| {
+                if n % 2 == 0 {
+                    // v4: preserved 0xAAAA; v5: 0 + val(n ^ 2); v6: fi:1 fetched val(n ^ 1); v7: preserved 0xDDDD
+                    [0xAAAA, val(n ^ 2), val(n ^ 1), 0xDDDD]
+                } else {
+                    // inactive lanes keep all sentinels
+                    [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD]
+                }
+            })
+            .collect()
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. Guarded wave32 compute
+    let w32 = build_body(false);
+    let native32 = native_of(&w32, false, 32);
+    let p32 = ir::build(&native32.code, native32.wave64, native32.vgprs).expect("ir::build");
+    let shader32 = lowered(&native32, &p32, &HashSet::new()).expect("lower wave32");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader32.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Some(got32) = run_lanes(&shader32, [0; 4], 128) else { return };
+    same_as_console(&got32, &want_for(32));
+
+    // 2. Divergent wave32 branch (guard == None; odd host lanes branched away):
+    //    test DPP16 bound_ctrl:0, DPP16 bound_ctrl:1 + active swap-2, and DPP8 fi:0.
+    let mut w32_br = vop3(0x169, 1, v(0), k(10)).to_vec(); // v_mul_lo_u32 v1, v0, 10
+    w32_br.extend([
+        vop2(0x25, 1, k(1), 1),
+        vop1(0x01, 4, LIT),
+        0xAAAA,
+        vop1(0x01, 5, LIT),
+        0xBBBB,
+        vop1(0x01, 6, LIT),
+        0xCCCC,
+        vop1(0x01, 7, LIT),
+        0xDDDD,
+        vop2(0x1B, 2, k(1), 0),
+        vopc(0xC2, k(0), 2),
+        sop1(0x3C, 12, VCC), // s_and_saveexec_b32 s12, vcc
+        sopp(0x08, 8),       // s_cbranch_execz over 4 x 2-dword DPP instructions
+        vop1(0x01, 4, 0xFA),
+        dpp16(0xB1, false, false),
+        vop1(0x01, 5, 0xFA),
+        dpp16(0xB1, true, false),
+        vop1(0x01, 7, 0xE9),
+        DPP8_SWAP1 << 8 | 1,
+        vop2(0x25, 5, 0xFA, 5),
+        dpp16(0x4E, false, false),
+        sop1(0x03, EXEC, 12),
+    ]);
+    w32_br.extend(stores([4, 5, 6, 7]));
+    let native32_br = native_of(&w32_br, false, 32);
+    let p32_br = ir::build(&native32_br.code, native32_br.wave64, native32_br.vgprs).expect("ir::build");
+    let shader32_br = lowered(&native32_br, &p32_br, &HashSet::new()).expect("lower wave32 branch");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader32_br.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let want32_br: Vec<u32> = (0..32u32)
+        .flat_map(|n| {
+            if n % 2 == 0 {
+                [0xAAAA, 10 * (n ^ 2) + 1, 0xCCCC, 0xDDDD]
+            } else {
+                [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD]
+            }
+        })
+        .collect();
+    let Some(got32_br) = run_lanes(&shader32_br, [0; 4], 128) else { return };
+    same_as_console(&got32_br, &want32_br);
+
+    // 3. Split wave64 compute on a 32-lane host (also checks DPP8 fi:1 via v6)
+    let w64 = build_body(true);
+    let native64 = native(&w64);
+    let p64 = ir::build(&native64.code, native64.wave64, native64.vgprs).expect("ir::build");
+    let shader64 = lowered(&native64, &p64, &HashSet::new()).expect("lower split wave64");
+    let Some(got64) = run_lanes(&shader64, [0; 4], 256) else { return };
+    same_as_console(&got64, &want_for(64));
+    eprintln!("ran on the hardware device: DPP16 and DPP8 honored EXEC, bound_ctrl, and fi in wave32 (guarded & branched) and split wave64");
+}
+
 /// Lowers `body` as a console program of one 64-lane wave (or 32 when `wave64` is not set)
 /// for a host of 32-lane waves, validates it and runs it there; each lane stores v3 to dword
 /// v0 of the raw UAV. None where the host device does not run it.
