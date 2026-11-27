@@ -23,7 +23,7 @@ Measured by the maintainer on 25 November (RTX 4070 SUPER, i7-13700KF, Series X 
 
 ### On Linux (Proton, AMD)
 
-The Neptune base does not carry the 57 Proton/AMD commits of the previous base (next section), so `main` needs four things under Proton. `anyxboxx run` is Windows only: set these by hand around `wine victory.exe run <game folder>\game_scarlett_master.exe --execute`, with the same variables as the launcher.
+The Neptune base does not carry the 57 Proton/AMD commits of the previous base (next section), so `main` needs four things under Proton. To launch through the Windows CLI under Proton, pass `run --game-dir <game folder> --victory-exe <path to victory.exe> --profile linux-amd` to `anyxboxx.exe`. A standalone cross-built executable works without a manifest. You can opt in to [runtime identity verification](launcher.md#prebuilt-victory) with `ANYXBOXX_VICTORY_MANIFEST_SHA256`. For a direct `wine victory.exe run <game folder>\game_scarlett_master.exe --execute` launch, set the variables by hand.
 
 | What | Why |
 | --- | --- |

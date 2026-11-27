@@ -226,7 +226,7 @@ pub fn find_repo(explicit: Option<&Path>) -> Option<PathBuf> {
     })
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod identity_tests;
 #[cfg(test)]
 mod tests;

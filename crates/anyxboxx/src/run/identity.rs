@@ -10,6 +10,9 @@ use super::locked_path::LockedPath;
 
 pub const MANIFEST_PIN_ENV: &str = "ANYXBOXX_VICTORY_MANIFEST_SHA256";
 
+#[cfg(any(test, windows))]
+const MANIFEST_LIMIT: u64 = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildProfile {
@@ -41,23 +44,40 @@ pub(super) struct VerifiedIdentity {
 }
 
 impl VerifiedIdentity {
+    #[cfg(any(test, windows))]
+    pub(super) fn parse(bytes: &[u8], pin: &str) -> Result<Self, IdentityError> {
+        use sha2::{Digest, Sha256};
+
+        if bytes.len() as u64 > MANIFEST_LIMIT {
+            return Err(IdentityError::ManifestTooLarge(MANIFEST_LIMIT));
+        }
+        let manifest_sha256 = format!("{:x}", Sha256::digest(bytes));
+        if !manifest_sha256.eq_ignore_ascii_case(pin) {
+            return Err(IdentityError::ManifestDigest);
+        }
+        let manifest: Manifest = serde_json::from_slice(bytes)?;
+        manifest.validate()?;
+        Ok(Self {
+            trust: "pinned-manifest-sha256",
+            manifest_sha256,
+            manifest,
+        })
+    }
+
     pub(super) fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
     }
 
     pub(super) fn log_line(&self) -> String {
-        // This record consists only of strings and integers.
-        format!(
-            "VICTORY_RUNTIME_IDENTITY={}",
-            serde_json::to_string(self).expect("serialize runtime identity")
-        )
+        match serde_json::to_string(self) {
+            Ok(record) => format!("VICTORY_RUNTIME_IDENTITY={record}"),
+            Err(error) => format!("VICTORY_RUNTIME_IDENTITY_ERROR={error}"),
+        }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
-    #[error("set {MANIFEST_PIN_ENV} to the manifest SHA-256 from your trusted build provider")]
-    MissingPin,
     #[error("{MANIFEST_PIN_ENV} must be a 64-digit hexadecimal SHA-256")]
     InvalidPin,
     #[error("cannot open or read {path:?}: {source}")]
@@ -97,7 +117,6 @@ impl VerifiedPrebuilt {
 
         use sha2::{Digest, Sha256};
 
-        const MANIFEST_LIMIT: u64 = 4096;
         if !is_hex(pin, 64) {
             return Err(IdentityError::InvalidPin.into());
         }
@@ -109,15 +128,8 @@ impl VerifiedPrebuilt {
         LockedPath::open_file(manifest_path)
             .and_then(|file| file.take(MANIFEST_LIMIT + 1).read_to_end(&mut bytes))
             .map_err(|source| read_error(manifest_path, source))?;
-        if bytes.len() as u64 > MANIFEST_LIMIT {
-            return Err(IdentityError::ManifestTooLarge(MANIFEST_LIMIT).into());
-        }
-        let manifest_sha256 = format!("{:x}", Sha256::digest(&bytes));
-        if !manifest_sha256.eq_ignore_ascii_case(pin) {
-            return Err(IdentityError::ManifestDigest.into());
-        }
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(IdentityError::from)?;
-        manifest.validate()?;
+        let identity = VerifiedIdentity::parse(&bytes, pin)?;
+        let manifest = &identity.manifest;
         let metadata = locked
             .file()
             .metadata()
@@ -133,14 +145,7 @@ impl VerifiedPrebuilt {
         {
             return Err(IdentityError::ExecutableDigest.into());
         }
-        Ok(Self {
-            identity: VerifiedIdentity {
-                trust: "pinned-manifest-sha256",
-                manifest_sha256,
-                manifest,
-            },
-            locked,
-        })
+        Ok(Self { identity, locked })
     }
 
     #[cfg(not(windows))]
@@ -176,7 +181,7 @@ impl VerifiedPrebuilt {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 impl Manifest {
     fn validate(&self) -> Result<(), IdentityError> {
         if self.schema != 1 {
@@ -201,7 +206,7 @@ impl Manifest {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 fn is_hex(value: &str, length: usize) -> bool {
     value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

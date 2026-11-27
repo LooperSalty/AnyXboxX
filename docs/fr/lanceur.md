@@ -71,4 +71,41 @@ Les réglages sont des profils par système et par fabricant de carte (`crates/a
 - **La fenêtre s'est fermée seule** : le journal indique `window closed: suspending the title` quand c'est vous qui l'avez fermée ; un plantage est écrit dans `crashes.log` sous `%LOCALAPPDATA%\victory\data\`.
 - **Erreur Windows 1455 dans `crashes.log`** : le fichier d'échange est trop petit ; fermez d'autres applications ou agrandissez-le.
 
-Sous Proton ou Wine, le lanceur ne peut pas compiler VIctory (pas de cargo) : utilisez `anyxboxx run` comme décrit dans [lancer-gta6.md](lancer-gta6.md).
+### VIctory précompilé
+
+Sous Windows ou Proton, passez `--victory-exe <chemin>` à l'un des deux lanceurs pour éviter
+la compilation par Cargo. Vous pouvez utiliser un exécutable seul issu d'une source de confiance.
+Si `ANYXBOXX_VICTORY_MANIFEST_SHA256` est définie, le lanceur exige un fichier
+`<nom-de-l'exécutable>.identity.json` à côté de l'exécutable et vérifie les deux avant le lancement.
+Cette vérification détecte un exécutable remplacé ou modifié après la compilation de confiance,
+même si le manifeste local a aussi été remplacé. Obtenez le SHA-256 des **octets exacts du manifeste**
+indépendamment auprès du fournisseur de confiance, par exemple dans les métadonnées authentifiées
+de la version publiée.
+
+Le manifeste est un objet JSON UTF-8 de 4 096 octets au plus. Le schéma 1 exige tous ces champs.
+
+| Champ | Valeur |
+| --- | --- |
+| `schema` | `1` |
+| `executable_sha256` | 64 chiffres hexadécimaux pour les octets de l'exécutable |
+| `executable_size` | Longueur exacte de l'exécutable, en octets |
+| `source_commit` | Commit Git complet à 40 chiffres de la compilation AnyXboxX |
+| `tombox_gitlink` | Gitlink TomBox complet à 40 chiffres dans ce commit |
+| `target` | `x86_64-pc-windows-msvc` |
+| `profile` | `release` ou `diag`. Un exécutable vérifié utilisé avec `--diag` ou `--dred` exige `diag`. |
+| `translator_version` | Entier positif pour `victory_shader::TRANSLATOR_VERSION`, l'ABI du cache des shaders |
+
+Les commandes warm et run appliquent les protections de partage Windows à l'exécutable vérifié
+et à ses dossiers parents résolus jusqu'à la création du processus. Juste avant le lancement,
+elles contrôlent que le chemin désigne toujours l'exécutable vérifié. Les dossiers ne peuvent pas
+être déplacés ni renommés tant que le lanceur conserve ces descripteurs. Le lanceur en ligne de
+commande les garde ouverts pendant toute la partie. Sous Proton, la vérification dépend du
+comportement de Wine pour le partage des fichiers Windows. Réservez l'accès en écriture depuis
+Linux à l'exécutable vérifié et à ses dossiers aux processus de confiance.
+
+La ligne de journal `VICTORY_RUNTIME_IDENTITY=` contient les champs du manifeste ainsi que
+`manifest_sha256` et `trust` (`pinned-manifest-sha256`). Le lanceur en ligne de commande l'imprime
+et le lanceur graphique l'écrit dans les journaux de la tâche et du jeu détaché. Le marqueur de
+warm du lanceur graphique utilise `manifest_sha256` comme identité de la compilation. Pour une
+compilation depuis les sources en ligne de commande, l'exécutable est celui signalé par Cargo.
+[Messages d'artefacts Cargo](https://doc.rust-lang.org/cargo/reference/external-tools.html#artifact-messages)

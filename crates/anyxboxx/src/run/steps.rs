@@ -51,13 +51,22 @@ impl Victory {
         })
     }
 
-    /// Select a prebuilt using the manifest pin supplied by the launcher's caller.
+    /// Use a prebuilt as supplied, with identity verification when a pin is set.
     pub fn prebuilt(exe: &Path) -> Result<Self, RunError> {
-        let pin = std::env::var(MANIFEST_PIN_ENV).map_err(|error| match error {
-            std::env::VarError::NotPresent => IdentityError::MissingPin,
-            std::env::VarError::NotUnicode(_) => IdentityError::InvalidPin,
-        })?;
-        Self::pinned_prebuilt(exe, &pin)
+        match std::env::var(MANIFEST_PIN_ENV) {
+            Ok(pin) => return Self::pinned_prebuilt(exe, &pin),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(IdentityError::InvalidPin.into()),
+            Err(std::env::VarError::NotPresent) => {}
+        }
+        if !exe.is_file() {
+            return Err(RunError::NoVictoryExe(exe.display().to_string()));
+        }
+        Ok(Victory {
+            manifest: None,
+            exe: exe.to_path_buf(),
+            diag: false,
+            prebuilt: None,
+        })
     }
 
     /// The pin comes from a trusted build provider independently of the executable and sidecar.
@@ -83,7 +92,7 @@ impl Victory {
     }
 
     pub(super) fn check_diagnostics(&self, requested: bool) -> Result<(), RunError> {
-        if requested && !self.diag {
+        if requested && self.prebuilt.is_some() && !self.diag {
             return Err(IdentityError::Diagnostics.into());
         }
         Ok(())

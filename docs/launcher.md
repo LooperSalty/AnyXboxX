@@ -73,12 +73,13 @@ Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profile
 
 ### Prebuilt VIctory
 
-On Windows or under Proton, pass `--victory-exe <path>` to either launcher. A prebuilt uses the
-adjacent `<executable-name>.identity.json` and skips Cargo. Set `ANYXBOXX_VICTORY_MANIFEST_SHA256`
-to the SHA-256 of the **exact manifest bytes** obtained independently from your trusted build
-provider, for example from authenticated release metadata. The launcher hashes the manifest and
-the executable before selecting it. Under Proton, keep native-host write access to the runtime
-directory limited to trusted processes.
+On Windows or under Proton, pass `--victory-exe <path>` to either launcher to skip Cargo.
+You can use a standalone executable from a trusted source. When
+`ANYXBOXX_VICTORY_MANIFEST_SHA256` is set, the launcher requires an adjacent
+`<executable-name>.identity.json` and verifies it and the executable before launch. This
+detects an executable replaced or modified after the trusted build, even if its local
+manifest was also replaced. Obtain the SHA-256 of the **exact manifest bytes** independently
+from your trusted build provider, for example from authenticated release metadata.
 
 The UTF-8 manifest is a JSON object limited to 4,096 bytes. Schema 1 requires all of these fields.
 
@@ -90,13 +91,18 @@ The UTF-8 manifest is a JSON object limited to 4,096 bytes. Schema 1 requires al
 | `source_commit` | Full 40-digit Git commit of the AnyXboxX build |
 | `tombox_gitlink` | Full 40-digit TomBox gitlink from that commit |
 | `target` | `x86_64-pc-windows-msvc` |
-| `profile` | `release` or `diag`. `--diag` and `--dred` require `diag`. |
+| `profile` | `release` or `diag`. A verified prebuilt used with `--diag` or `--dred` requires `diag`. |
 | `translator_version` | Positive integer for the build's `victory_shader::TRANSLATOR_VERSION`, the shader-cache ABI |
 
 Warm and run commands retain Windows sharing protection for the verified executable and its
-resolved directory chain through process creation. They also check that the path still identifies
-that file immediately before spawning. The `VICTORY_RUNTIME_IDENTITY=` log line contains the
-manifest fields and adds `manifest_sha256` and `trust` (`pinned-manifest-sha256`). The CLI prints
-this record and the graphical launcher writes it to the job log and the detached game log. Its
-warm marker uses `manifest_sha256` as the build identity. A regular source build in the CLI uses
-the executable reported by Cargo. [Cargo artifact messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#artifact-messages)
+resolved directory chain through process creation. They check that the path still identifies the
+verified executable immediately before spawning. The directories cannot be moved or renamed while
+the launcher holds those handles. The CLI keeps them open for the duration of the game. Under
+Proton, verification depends on Wine's Windows file-sharing behavior. Restrict native Linux
+write access to the verified runtime and its directories to trusted processes.
+
+The `VICTORY_RUNTIME_IDENTITY=` log line contains the manifest fields and adds `manifest_sha256`
+and `trust` (`pinned-manifest-sha256`). The CLI prints this record and the graphical launcher
+writes it to the job log and the detached game log. Its warm marker uses `manifest_sha256` as
+the build identity. A source build in the CLI uses the executable reported by Cargo.
+[Cargo artifact messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#artifact-messages)

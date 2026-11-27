@@ -368,17 +368,10 @@ def test_powershell_option_names_still_work(tmp_path, fake_tool, binary):
     assert calls == [BUILD_DIAG, GAME + ";".join(sorted(expected))], done.stderr
 
 
-@pytest.mark.parametrize(("pin_kind", "error"), [
-    ("absent", "ANYXBOXX_VICTORY_MANIFEST_SHA256"),
-    ("wrong", "does not match the trusted SHA-256"),
-    ("missing-exe", "victory.exe not found"),
-    ("matching", "game_scarlett_master.exe not found"),
-])
-def test_cli_checks_prebuilt_identity_before_game_inputs_without_cargo(tmp_path, binary, pin_kind, error):
-    exe = tmp_path / "victory.exe"
-    contents = b"MZ\x00\x00inert fixture"
-    if pin_kind != "missing-exe":
-        exe.write_bytes(contents)
+PIN_KEY = "ANYXBOXX_VICTORY_MANIFEST_SHA256"
+
+
+def prebuilt_manifest(exe, contents):
     manifest = json.dumps({
         "schema": 1,
         "executable_sha256": hashlib.sha256(contents).hexdigest(),
@@ -390,11 +383,30 @@ def test_cli_checks_prebuilt_identity_before_game_inputs_without_cargo(tmp_path,
         "translator_version": 2,
     }).encode()
     exe.with_name(exe.name + ".identity.json").write_bytes(manifest)
-    pin_key = "ANYXBOXX_VICTORY_MANIFEST_SHA256"
-    env = {key: value for key, value in os.environ.items() if key.upper() != pin_key}
+    return hashlib.sha256(manifest).hexdigest()
+
+
+def prebuilt_env(tmp_path):
+    env = {key: value for key, value in os.environ.items()
+           if key.upper() != PIN_KEY and not key.upper().startswith("VICTORY_")}
     env["PATH"] = str(tmp_path / "no-cargo")
-    if pin_kind != "absent":
-        env[pin_key] = "0" * 64 if pin_kind == "wrong" else hashlib.sha256(manifest).hexdigest()
+    return env
+
+
+@pytest.mark.parametrize(("pin_kind", "error"), [
+    ("invalid", "must be a 64-digit hexadecimal SHA-256"),
+    ("wrong", "does not match the trusted SHA-256"),
+    ("missing-exe", "victory.exe not found"),
+    ("matching", "game_scarlett_master.exe not found"),
+])
+def test_cli_checks_prebuilt_identity_before_game_inputs_without_cargo(tmp_path, binary, pin_kind, error):
+    exe = tmp_path / "victory.exe"
+    contents = b"MZ\x00\x00inert fixture"
+    if pin_kind != "missing-exe":
+        exe.write_bytes(contents)
+    pin = prebuilt_manifest(exe, contents)
+    env = prebuilt_env(tmp_path)
+    env[PIN_KEY] = {"invalid": "bad", "wrong": "0" * 64}.get(pin_kind, pin)
     done = subprocess.run(
         [str(binary), "run", "--repo", str(tmp_path / "no-repo"),
          "--game-dir", str(tmp_path / "no-game"), "--victory-exe", str(exe)],
@@ -402,3 +414,30 @@ def test_cli_checks_prebuilt_identity_before_game_inputs_without_cargo(tmp_path,
     )
     assert done.returncode == 1 and error in done.stderr
     assert "Building VIctory" not in done.stdout
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["standalone", "pinned"])
+def test_cli_warms_and_launches_prebuilt_without_cargo(tmp_path, binary, fake_tool, verify):
+    artifact_dir = tmp_path / "build output"
+    artifact_dir.mkdir()
+    exe = artifact_dir / "victory.exe"
+    shutil.copyfile(fake_tool, exe)
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    (game_dir / "game_scarlett_master.exe").touch()
+    (game_dir / "fixture.rpf").touch()
+    call_log = tmp_path / "calls.log"
+    env = prebuilt_env(tmp_path)
+    env.update({"FAKE_TOOL_LOG": str(call_log), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT)})
+    if verify:
+        env[PIN_KEY] = prebuilt_manifest(exe, exe.read_bytes())
+    done = subprocess.run(
+        [str(binary), "run", "--repo", str(tmp_path / "no-repo"), "--warm",
+         "--game-dir", str(game_dir), "--victory-exe", str(exe)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == VICTORY_EXIT, done.stderr
+    assert "Building VIctory" not in done.stdout
+    assert done.stdout.count("VICTORY_RUNTIME_IDENTITY=") == (2 if verify else 0)
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert [call.split()[:2] for call in calls] == [["victory", "warm"], ["victory", "run"]]

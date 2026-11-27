@@ -1,13 +1,31 @@
+#[cfg(windows)]
 use std::fs;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{IdentityError, RunError, Victory};
+use super::{IdentityError, identity::VerifiedIdentity};
+#[cfg(windows)]
+use super::{RunError, Victory};
 
 const IMAGE: &[u8] = b"MZ\0\0inert verification fixture";
 
+fn manifest() -> Value {
+    json!({
+        "schema": 1,
+        "executable_sha256": digest(IMAGE),
+        "executable_size": IMAGE.len(),
+        "source_commit": "a".repeat(40),
+        "tombox_gitlink": "b".repeat(40),
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "translator_version": 2,
+    })
+}
+
+#[cfg(windows)]
 struct Fixture {
     dir: tempfile::TempDir,
     exe: PathBuf,
@@ -15,6 +33,7 @@ struct Fixture {
     manifest: Value,
 }
 
+#[cfg(windows)]
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -26,16 +45,7 @@ impl Fixture {
             dir,
             exe,
             sidecar: artifact_dir.join("victory.exe.identity.json"),
-            manifest: json!({
-                "schema": 1,
-                "executable_sha256": digest(IMAGE),
-                "executable_size": IMAGE.len(),
-                "source_commit": "a".repeat(40),
-                "tombox_gitlink": "b".repeat(40),
-                "target": "x86_64-pc-windows-msvc",
-                "profile": "release",
-                "translator_version": 2,
-            }),
+            manifest: manifest(),
         }
     }
 
@@ -54,6 +64,7 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 #[test]
+#[cfg(windows)]
 fn verified_prebuilt_plans_warm_and_run_without_cargo() {
     let fixture = Fixture::new();
     let pin = fixture.pin();
@@ -81,6 +92,7 @@ fn verified_prebuilt_plans_warm_and_run_without_cargo() {
 }
 
 #[test]
+#[cfg(windows)]
 fn valid_replacement_manifest_also_needs_the_trusted_pin() {
     let mut fixture = Fixture::new();
     let old_pin = fixture.pin();
@@ -96,6 +108,7 @@ fn valid_replacement_manifest_also_needs_the_trusted_pin() {
 }
 
 #[test]
+#[cfg(windows)]
 fn rejects_executable_changes_even_when_the_size_matches() {
     let fixture = Fixture::new();
     let pin = fixture.pin();
@@ -115,43 +128,58 @@ fn validates_manifest_fields_and_schema_even_with_a_valid_pin() {
         ("executable_sha256", json!("z".repeat(64))),
         ("executable_size", json!(0)),
     ] {
-        let mut fixture = Fixture::new();
-        fixture.manifest[key] = invalid;
+        let mut record = manifest();
+        record[key] = invalid;
+        let bytes = serde_json::to_vec(&record).unwrap();
         assert!(
-            matches!(Victory::pinned_prebuilt(&fixture.exe, &fixture.pin()), Err(RunError::PrebuiltIdentity(IdentityError::Field(field))) if field == key)
+            matches!(VerifiedIdentity::parse(&bytes, &digest(&bytes)), Err(IdentityError::Field(field)) if field == key)
         );
     }
 
-    let mut fixture = Fixture::new();
-    fixture.manifest["schema"] = json!(2);
+    let mut record = manifest();
+    record["schema"] = json!(2);
+    let bytes = serde_json::to_vec(&record).unwrap();
     assert!(matches!(
-        Victory::pinned_prebuilt(&fixture.exe, &fixture.pin()),
-        Err(RunError::PrebuiltIdentity(IdentityError::Schema(2)))
+        VerifiedIdentity::parse(&bytes, &digest(&bytes)),
+        Err(IdentityError::Schema(2))
     ));
 }
 
 #[test]
 fn rejects_duplicate_unknown_and_oversized_manifest_metadata() {
-    let fixture = Fixture::new();
-    let manifest = serde_json::to_string(&fixture.manifest).unwrap();
+    let record = serde_json::to_string(&manifest()).unwrap();
     for mutation in ["\"schema\":1,", "\"unrecognized\":0,"] {
-        let bytes = format!("{{{mutation}{}", &manifest[1..]);
-        let pin = fixture.pin_bytes(bytes.as_bytes());
+        let bytes = format!("{{{mutation}{}", &record[1..]).into_bytes();
         assert!(matches!(
-            Victory::pinned_prebuilt(&fixture.exe, &pin),
-            Err(RunError::PrebuiltIdentity(IdentityError::ManifestJson(_)))
+            VerifiedIdentity::parse(&bytes, &digest(&bytes)),
+            Err(IdentityError::ManifestJson(_))
         ));
     }
-    let pin = fixture.pin_bytes(&vec![b' '; 4097]);
+    let bytes = vec![b' '; 4097];
     assert!(matches!(
-        Victory::pinned_prebuilt(&fixture.exe, &pin),
-        Err(RunError::PrebuiltIdentity(IdentityError::ManifestTooLarge(
-            _
-        )))
+        VerifiedIdentity::parse(&bytes, &digest(&bytes)),
+        Err(IdentityError::ManifestTooLarge(4096))
     ));
 }
 
 #[test]
+fn parses_and_logs_the_pinned_manifest() {
+    let manifest = manifest();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let pin = digest(&bytes);
+    let identity = VerifiedIdentity::parse(&bytes, &pin).unwrap();
+    let line = identity.log_line();
+    let record: Value =
+        serde_json::from_str(line.strip_prefix("VICTORY_RUNTIME_IDENTITY=").unwrap()).unwrap();
+    assert_eq!(record["manifest_sha256"], pin);
+    assert_eq!(record["trust"], "pinned-manifest-sha256");
+    for (key, value) in manifest.as_object().unwrap() {
+        assert_eq!(record[key], *value);
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn command_keeps_the_executable_and_parent_protected_after_planning() {
     let fixture = Fixture::new();
     let victory = Victory::pinned_prebuilt(&fixture.exe, &fixture.pin()).unwrap();
