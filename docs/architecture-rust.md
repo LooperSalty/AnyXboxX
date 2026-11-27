@@ -129,6 +129,29 @@ it (decision D3).
 - **`rust/` merges into `crates/`** in phase 1; `rust/Cargo.toml` is then deleted.
 - **One target directory**, `target/` at the root (ignored by git).
 
+## Recording a VIctory release build
+
+From a Visual Studio x64 developer shell with the Windows SDK, use a clean checkout and an
+initialized TomBox submodule. Use a new target directory for each build.
+
+```powershell
+python tools/build_victory_identity.py --target-dir target/victory-release-a --offline
+python tools/build_victory_identity.py --target-dir target/victory-release-b --offline
+```
+
+Omit `--offline` when Cargo needs to fetch the dependencies described by the lockfile. Use
+`--profile diag` for a diagnostics build. Cargo uses the pinned VIctory lockfile and reports the
+exact executable. The tool checks the checkout again before writing the records next to it.
+[Cargo build options](https://doc.rust-lang.org/cargo/commands/cargo-build.html)
+
+`victory.exe.identity.json` supplies schema 1 for OPT-SEC-001. The separate
+`victory.exe.build.json` records the manifest digest, source commit, TomBox gitlink,
+VIctory tree, both lockfile SHA-256 values, Rust and Cargo versions, Windows SDK, compiler,
+linker and DXC versions and hashes, target, and profile. Compare the executable SHA-256
+values across builds and use the evidence files to attribute any difference. The launcher pin
+is the tool's printed manifest SHA-256. Distribute that value through the authenticated build
+channel used by the launcher operator.
+
 ## Parity method
 
 - Each port ships a small command line (`anyxboxx-pe <image> [--base] [--pages]`, later the
