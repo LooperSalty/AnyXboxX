@@ -294,6 +294,7 @@ mod tests {
             ("VICTORY_UPSCALER", "7"),
             ("VICTORY_DLSS", "1"),
             ("VICTORY_DLSS_MODE", "quality"),
+            ("VICTORY_FRAMEGEN", "1"),
             (
                 "VICTORY_STREAMLINE_DIR",
                 r"C:\Users\ANAKIN\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\outils\voisins\victory-nvidia\nvidia-sdk\Streamline\bin\x64",
