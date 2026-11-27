@@ -1078,6 +1078,9 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // Streamline is given the device (DLSS, `VICTORY_DLSS`); for frame
+        // generation (`VICTORY_FRAMEGEN`) the direct queue is made through
+        // its device proxy.
         let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
             Some(queue) => queue,
             None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
@@ -1351,8 +1354,12 @@ pub(crate) struct HostList {
     /// A fresh replacement held by a logically closed title list. Only its
     /// next reset may reuse this open recording without resetting D3D12.
     left_open: std::sync::atomic::AtomicBool,
-    upscale: std::sync::atomic::AtomicU64,
-    hudless: std::sync::atomic::AtomicU64,
+    /// The upscaling (`crate::streamline`) recorded in the list, noted for
+    /// the present after its submission.
+    upscale: OnceLock<Mutex<Option<crate::streamline::Noted>>>,
+    /// The copy of the colour without the interface (`crate::streamline`)
+    /// recorded in the list, noted likewise.
+    hudless: OnceLock<Mutex<Option<crate::streamline::Copied>>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4479,8 +4486,8 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 left_open: false.into(),
-                upscale: Default::default(),
-                hudless: Default::default(),
+                upscale: OnceLock::new(),
+                hudless: OnceLock::new(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5897,18 +5904,11 @@ impl Host {
                 list.close();
             }
         }
+        // Upscalings these lists recorded, in submission order: the next
+        // present tags the latest (frame generation).
         if crate::streamline::tracking_frames() {
-            // Upscalings these lists recorded, in submission order: the next
-            // present tags the latest (frame generation).
             for run in runs {
-                let id = run.take_upscale();
-                if id != 0 {
-                    crate::streamline::submitted(id);
-                }
-                let id = run.take_hudless();
-                if id != 0 {
-                    crate::streamline::hudless_submitted(id);
-                }
+                run.submit_frame_inputs();
             }
         }
         let was_working = working(true);
@@ -6803,8 +6803,8 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
-        self.upscale.store(0, Ordering::Relaxed);
-        self.hudless.store(0, Ordering::Relaxed);
+        self.take_upscale();
+        self.take_hudless();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7742,30 +7742,40 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
-    /// The list recorded upscaling `id` (`crate::streamline`).
-    pub(crate) fn mark_upscale(&self, id: u64) {
-        self.upscale.store(id, Ordering::Relaxed);
+    pub(crate) fn submit_frame_inputs(&self) {
+        // Executing a closed list twice submits two upscales or copies. The
+        // recording keeps its inputs until reset; the present gets a reference.
+        if let Some(slot) = self.upscale.get()
+            && let Some(noted) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        {
+            crate::streamline::submitted(noted);
+        }
+        if let Some(slot) = self.hudless.get()
+            && let Some(copied) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        {
+            crate::streamline::hudless_submitted(copied);
+        }
     }
 
-    /// The upscaling the list recorded, taken (0 for none).
-    pub(crate) fn take_upscale(&self) -> u64 {
-        self.upscale.swap(0, Ordering::Relaxed)
+    /// Keep the resources with their recording until it is submitted or reset.
+    pub(crate) fn mark_upscale(&self, noted: crate::streamline::Noted) {
+        *self.upscale.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()) = Some(noted);
     }
 
-    /// The list recorded copy `id` of the colour without the interface
-    /// (`crate::streamline`, frame generation).
-    pub(crate) fn mark_hudless(&self, id: u64) {
-        self.hudless.store(id, Ordering::Relaxed);
+    pub(crate) fn take_upscale(&self) -> Option<crate::streamline::Noted> {
+        self.upscale.get()?.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
-    /// The copy the list recorded (0 for none).
+    pub(crate) fn mark_hudless(&self, copied: crate::streamline::Copied) {
+        *self.hudless.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()) = Some(copied);
+    }
+
     pub(crate) fn hudless(&self) -> u64 {
-        self.hudless.load(Ordering::Relaxed)
+        self.hudless.get().and_then(|copy| copy.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.id)).unwrap_or(0)
     }
 
-    /// As [`HostList::hudless`], taken.
-    pub(crate) fn take_hudless(&self) -> u64 {
-        self.hudless.swap(0, Ordering::Relaxed)
+    pub(crate) fn take_hudless(&self) -> Option<crate::streamline::Copied> {
+        self.hudless.get()?.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -9455,7 +9465,7 @@ pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+pub(crate) const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -9664,7 +9674,7 @@ impl Meter {
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
-        crate::streamline::line(frames);
+            crate::streamline::line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
@@ -10050,7 +10060,7 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
-            crate::streamline::resizing();
+            if !crate::streamline::resizing() { return None; }
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -10061,6 +10071,7 @@ impl Host {
                     if p.format != format {
                         p.composer = None;
                     }
+                    crate::streamline::hudless_resized();
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
                         width,
@@ -10269,6 +10280,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Frame generation: the frame's markers, constants and tags.
             let presenting = crate::streamline::present_begins(
                 frame,
                 crate::streamline::Planes {
@@ -10280,7 +10292,7 @@ impl Host {
             let called = crate::streamline::present_called(&presenting);
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             crate::streamline::present_returned(called);
-            crate::streamline::present_ends(presenting);
+            crate::streamline::present_ends(presenting, status);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -10301,11 +10313,7 @@ impl Host {
     /// down; nothing presents afterwards).
     pub(crate) fn drop_presenter(&self) {
         settle_now(WHY_SYNC);
-        let presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(Presenter { copy, ahead, composer, swap_chain, .. }) = presenter {
-            drop((copy, ahead, composer));
-            drop(swap_chain);
-        }
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn presenter(
@@ -10314,7 +10322,7 @@ impl Host {
         height: u32,
         format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
-        let hwnd = match (!crate::streamline::checking()).then(title_window).flatten() {
+        let hwnd = match title_window() {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
