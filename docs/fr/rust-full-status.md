@@ -124,6 +124,8 @@ En wave32, SDWA et DPP réutilisent les expressions Rust VOP1/VOP2. WARP vérifi
 
 Le générateur Rust traduit les 14 opérations du module HLSL Python sur paires de mots et les quatre instructions de division prises en charge. Les tests WARP couvrent les calculs et conversions f64, les décalages sur deux mots, les charges utiles NaN lors de l’élargissement des f32, les corrections de division et VCC.
 
+VOP3 reprend toutes les comparaisons entières et flottantes VOPC traduites. Des programmes WARP vérifient chaque masque de comparaison VOP3 et un vote wave64 qui franchit la ligne 31.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 La CLI Rust affiche le HLSL des instructions portées avec `anyxboxx rdna2 FICHIER --hlsl`. Les deux CLI signalent le retrait de `--spirv` avec le code de sortie 2.

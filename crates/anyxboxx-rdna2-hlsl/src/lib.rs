@@ -154,6 +154,7 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "VOP3" if name.starts_with("v_cmp") => vector_compare::vop3(name, pair, literal, 32)?,
         "VOP3" if division::supports(name) => division::statement(name, pair, literal)?,
         "VOP1" | "VOP3" if wide_templates::template(name).is_some() => {
             wide::statement(name, family, pair)?

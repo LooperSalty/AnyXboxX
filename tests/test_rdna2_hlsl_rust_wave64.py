@@ -10,6 +10,8 @@ from test_rdna2_hlsl_wave64 import store_lane, with_lane_offset
 
 
 @pytest.mark.parametrize("ops", [
+    [*vop3("v_cmp_gt_u32", 12, V, const(41)), vop1("v_mov_b32", 8, 12), vop1("v_mov_b32", 9, 13),
+     *vop3("v_cmp_lt_f16", 12, V, 242, abs_=1, neg=1), vop1("v_mov_b32", 10, 13)],
     [vopc("v_cmp_lt_u32", const(30), 0), vop2("v_cndmask_b32", 8, const(1), 0),
      vop2("v_add_co_ci_u32", 9, LITERAL, 8), 0xFFFFFFFF, vop1("v_mov_b32", 10, 107)],
     [sop1("s_mov_b32", 126, const(0)), sopp("s_cbranch_execz", 1), vop1("v_mov_b32", 8, V),

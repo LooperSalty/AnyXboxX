@@ -34,13 +34,7 @@ pub fn condition(name: &str, code: u32, a: &str, b: &str) -> Result<String, Stri
     if suffix == "f16" {
         let ah = half_operand(code, a);
         let bh = format!("({b} & 0xFFFFu)");
-        let condition = if op == "class" {
-            format!("((({bh}) >> ClassF16({ah})) & 1u) != 0u")
-        } else {
-            float_condition(op, &format!("F16ToF32({ah})"), &format!("F16ToF32({bh})"))
-                .ok_or_else(|| format!("untranslated instruction: {name}"))?
-        };
-        return Ok(condition);
+        return half_condition(name, op, &ah, &bh);
     }
     if suffix == "f32" {
         let condition =
@@ -74,6 +68,87 @@ pub fn condition(name: &str, code: u32, a: &str, b: &str) -> Result<String, Stri
         }
     };
     Ok(condition)
+}
+
+fn half_condition(name: &str, op: &str, a: &str, b: &str) -> Result<String, String> {
+    if op == "class" {
+        return Ok(format!("((({b}) >> ClassF16({a})) & 1u) != 0u"));
+    }
+    float_condition(op, &format!("F16ToF32({a})"), &format!("F16ToF32({b})"))
+        .ok_or_else(|| format!("untranslated instruction: {name}"))
+}
+
+pub fn vop3(name: &str, word: u64, literal: Option<u32>, lanes: usize) -> Result<String, String> {
+    let f = anyxboxx_rdna2_ref::vop3::Fields::new(word);
+    let half = name.ends_with("_f16");
+    if (name.ends_with("16") && word >> 11 & 15 != 0)
+        || (half
+            && (f.clamp || f.omod != 0 || (name.contains("_class_") && (f.abs | f.neg) & 2 != 0)))
+    {
+        return Err(format!("{name}: invalid compare source or output modifier"));
+    }
+    let read = |i: usize| -> Result<String, String> {
+        let code = f.sources[i];
+        let mut expr = if code >= 256 {
+            format!("v[{}]", code - 256)
+        } else {
+            source(code, literal).map_err(|e| format!("{name}: {e}"))?
+        };
+        if half {
+            expr = half_operand(code, &expr);
+        }
+        if half || name.ends_with("_f32") {
+            if f.abs & (1 << i) != 0 {
+                expr = format!(
+                    "({expr} & {})",
+                    if half { "0x7FFFu" } else { "0x7FFFFFFFu" }
+                );
+            }
+            if f.neg & (1 << i) != 0 {
+                expr = format!(
+                    "({expr} ^ {})",
+                    if half { "0x8000u" } else { "0x80000000u" }
+                );
+            }
+        }
+        Ok(expr)
+    };
+    let (a, b) = (read(0)?, read(1)?);
+    let condition = if half {
+        let op = name
+            .trim_start_matches("v_cmpx_")
+            .trim_start_matches("v_cmp_")
+            .trim_end_matches("_f16");
+        half_condition(name, op, &a, &b)?
+    } else {
+        condition(name, f.sources[0], &a, &b)?
+    };
+    let d = if name.starts_with("v_cmpx_") {
+        126
+    } else {
+        f.vdst
+    };
+    let target = |code| {
+        if code == 125 || d == 125 {
+            "s_null".into()
+        } else {
+            format!("s[{code}]")
+        }
+    };
+    if d >= 128 || (lanes == 64 && d == 127) {
+        return Err(format!("{name}: invalid destination mask"));
+    }
+    let lo = target(d);
+    Ok(if lanes == 64 {
+        format!(
+            "{{ bool t = (LANE_ON) && ({condition}); uint2 m = Ballot64(lane, t); {lo} = m.x; {} = m.y; }}",
+            target(d + 1)
+        )
+    } else {
+        format!(
+            "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {lo} = Ballot(lane, t); }}"
+        )
+    })
 }
 
 fn float_condition(op: &str, a: &str, b: &str) -> Option<String> {
