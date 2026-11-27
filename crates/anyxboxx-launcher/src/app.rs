@@ -64,6 +64,8 @@ pub struct App {
     pub host: Host,
     pub gpu: GpuVendor,
     pub adapter_name: Option<String>,
+    pub framegen_unavailable: Option<&'static str>,
+    pub streamline_check: Option<(String, Result<(), String>)>,
     adapters: Option<Vec<Adapter>>,
     pub setup: Vec<Item>,
     pub settings: Settings,
@@ -148,6 +150,11 @@ impl App {
             profiles,
             host,
             gpu,
+            framegen_unavailable: crate::framegen::unavailable(
+                gpu, adapter_name.as_deref().unwrap_or_default(),
+                host == Host::Windows && crate::framegen::detect_hags(),
+            ),
+            streamline_check: None,
             adapter_name,
             setup: read_setup(adapters.as_deref()),
             adapters,
@@ -211,11 +218,12 @@ impl App {
         self.open_dialog(Pick::XgLibrary);
     }
 
-    fn open_dialog(&mut self, kind: Pick) {
+    pub(crate) fn open_dialog(&mut self, kind: Pick) {
         if self.pick_rx.is_some() {
             return;
         }
         let start = match kind {
+            Pick::Streamline => Some(PathBuf::from(&self.settings.options.dlss.streamline_dir)),
             Pick::GameFolder => self.settings.game_path(),
             Pick::XgLibrary => PathBuf::from(self.settings.xg_dll.trim())
                 .parent()
@@ -250,6 +258,7 @@ impl App {
             return;
         };
         match kind {
+            Pick::Streamline => self.settings.options.dlss.streamline_dir = path.display().to_string(),
             Pick::GameFolder => self.set_game_folder(&path),
             Pick::XgLibrary => self.settings.xg_dll = path.display().to_string(),
         }
@@ -335,6 +344,7 @@ impl App {
             &repo,
             self.victory_exe.as_deref(),
             &profile,
+            self.framegen_unavailable.is_none(),
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -342,6 +352,10 @@ impl App {
                 return;
             }
         };
+        if let Err(reason) = crate::streamline::check_launch(&plan.env) {
+            self.notice = Some(reason);
+            return;
+        }
         if !precompile_only {
             // NVIDIA Smooth Motion lives in the driver's profile, not in VIctory's environment:
             // written now, so the game starts with the switch as the Play page shows it. A failure

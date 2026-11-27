@@ -105,6 +105,14 @@ mod tests {
             keep_open_after_launch: true,
             always_rewarm: true,
             options: LaunchOptions {
+                dlss: crate::dlss::DlssOptions {
+                    super_resolution: true,
+                    framegen: true,
+                    mode: "balanced".into(),
+                    preset: "k".into(),
+                    hudless: false,
+                    streamline_dir: r"D:\Streamline SDK\bin\x64".into(),
+                },
                 preset: Preset::Quality,
                 resolution: Resolution::P1080,
                 window: WindowMode::Borderless,
@@ -152,6 +160,7 @@ mod tests {
         let settings = load(&path).expect("load").into_settings();
         assert_eq!(settings.game_dir, "E:\\G");
         assert_eq!(settings.options.keyboard, Keyboard::Qwertz);
+        assert_eq!(settings.options.dlss, crate::dlss::DlssOptions::default());
         assert_eq!(settings.options.preset, Preset::Fast);
         assert_eq!(settings.xg_mode, XgMode::Real);
     }
