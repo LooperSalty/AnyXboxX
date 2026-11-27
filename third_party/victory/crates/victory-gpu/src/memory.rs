@@ -82,6 +82,10 @@ const COPIES: u32 = (1 << 12) - 1;
 const PAGE: u64 = 1 << 16;
 /// An arena's bytes.
 const ARENA: u64 = 64 << 20;
+/// Pages in one arena (`64 MiB / 64 KiB = 1024`).
+const ARENA_PAGES: usize = (ARENA / PAGE) as usize;
+/// `u64` bitmap words covering [`ARENA_PAGES`].
+const ARENA_WORDS: usize = ARENA_PAGES / 64;
 /// What is compared at a time.
 const PIECE: usize = 4096;
 /// Pages held, at most (3 GiB).
@@ -154,6 +158,123 @@ struct Packed {
     header: u64,
 }
 
+/// One 64 MiB arena and its per-page free bitmap.
+/// Bit `k` of `free_bits[k / 64]` is 1 when slot `k` (`base + k * PAGE`) is free.
+struct Arena {
+    copy: usize,
+    base: usize,
+    free_bits: [u64; ARENA_WORDS],
+    free_count: usize,
+}
+
+impl Arena {
+    fn new(copy: usize, base: usize) -> Self {
+        Self {
+            copy,
+            base,
+            free_bits: [u64::MAX; ARENA_WORDS],
+            free_count: ARENA_PAGES,
+        }
+    }
+
+    fn take_one(&mut self) -> Option<usize> {
+        if self.free_count == 0 {
+            return None;
+        }
+        for (wi, w) in self.free_bits.iter_mut().enumerate() {
+            if *w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                *w &= !(1u64 << bit);
+                self.free_count -= 1;
+                return Some(self.base + (wi * 64 + bit) * PAGE as usize);
+            }
+        }
+        None
+    }
+
+    fn clear_run(&mut self, start: usize, len: usize) {
+        let end = start + len;
+        let mut slot = start;
+        while slot < end {
+            let wi = slot >> 6;
+            let bit = slot & 63;
+            let take = (64 - bit).min(end - slot);
+            let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
+            debug_assert_eq!(self.free_bits[wi] & mask, mask);
+            self.free_bits[wi] &= !mask;
+            slot += take;
+        }
+        self.free_count -= len;
+    }
+
+    /// Allocates the lowest contiguous run of `need` free pages in this arena.
+    fn take_run(&mut self, need: usize) -> Option<usize> {
+        if need == 0 || need > self.free_count {
+            return None;
+        }
+        if need == 1 {
+            return self.take_one();
+        }
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        for (wi, &word) in self.free_bits.iter().enumerate() {
+            if word == 0 {
+                run_len = 0;
+                continue;
+            }
+            if word == u64::MAX {
+                if run_len == 0 {
+                    run_start = wi * 64;
+                }
+                run_len += 64;
+                if run_len >= need {
+                    self.clear_run(run_start, need);
+                    return Some(self.base + run_start * PAGE as usize);
+                }
+                continue;
+            }
+            let mut bit = 0usize;
+            while bit < 64 {
+                let shifted = word >> bit;
+                if shifted == 0 {
+                    run_len = 0;
+                    break;
+                }
+                if shifted & 1 == 0 {
+                    run_len = 0;
+                    bit += shifted.trailing_zeros() as usize;
+                    continue;
+                }
+                let ones = shifted.trailing_ones() as usize;
+                if run_len == 0 {
+                    run_start = wi * 64 + bit;
+                }
+                run_len += ones;
+                if run_len >= need {
+                    self.clear_run(run_start, need);
+                    return Some(self.base + run_start * PAGE as usize);
+                }
+                bit += ones;
+            }
+        }
+        None
+    }
+
+    /// Returns `at` (which belongs to this arena) back to the free bitmap.
+    fn give_back(&mut self, at: usize) -> bool {
+        let slot = (at - self.base) / PAGE as usize;
+        debug_assert!(slot < ARENA_PAGES);
+        let mask = 1u64 << (slot & 63);
+        if self.free_bits[slot >> 6] & mask == 0 {
+            self.free_bits[slot >> 6] |= mask;
+            self.free_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
@@ -162,8 +283,11 @@ struct Memory {
     copies: Vec<Arc<Shadow>>,
     /// Places of title buffers' copies among `copies`.
     numbers: HashMap<usize, usize>,
-    /// Arenas: place in `copies`, address.
-    arenas: Vec<(usize, usize)>,
+    /// Arenas in creation order; allocations prefer lower arenas first so the
+    /// active working set packs densely into the fewest physical arenas.
+    arenas: Vec<Arena>,
+    /// Total free pages across `arenas`.
+    free_pages: usize,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
@@ -176,8 +300,6 @@ struct Memory {
     /// Their addresses in the order they came, and where the sweep is.
     packed_order: Vec<u64>,
     packed_sweep: usize,
-    /// Places of pages that are free: the copy, the address in the arena.
-    free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
@@ -255,6 +377,7 @@ impl Memory {
             copies: Vec::new(),
             numbers: HashMap::new(),
             arenas: Vec::new(),
+            free_pages: 0,
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
@@ -262,7 +385,6 @@ impl Memory {
             packed: HashMap::new(),
             packed_order: Vec::new(),
             packed_sweep: 0,
-            free: Vec::new(),
             open: Default::default(),
             faulted: 0,
             heaps: HashMap::new(),
@@ -389,18 +511,142 @@ impl Memory {
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
-        if let Some((copy, at)) = self.free.pop() {
-            self.hold(page, at, copy);
-            return true;
-        }
-        if !self.another() {
-            return false;
-        }
-        let Some((copy, at)) = self.free.pop() else {
+        let Some((copy, at)) = self.alloc_one(true) else {
             return false;
         };
         self.hold(page, at, copy);
         true
+    }
+
+    /// Allocates the lowest free page from the lowest-numbered arena with space,
+    /// optionally creating a new arena when all existing arenas are full.
+    fn alloc_one(&mut self, allow_new: bool) -> Option<(usize, usize)> {
+        for arena in &mut self.arenas {
+            if let Some(at) = arena.take_one() {
+                self.free_pages -= 1;
+                return Some((arena.copy, at));
+            }
+        }
+        if allow_new && self.another() {
+            let arena = self.arenas.last_mut()?;
+            if let Some(at) = arena.take_one() {
+                self.free_pages -= 1;
+                return Some((arena.copy, at));
+            }
+        }
+        None
+    }
+
+    /// Allocates a contiguous run of `need` pages in the lowest-numbered arena
+    /// that fits; falls back to a new arena only if `allow_new` and total free
+    /// pages across existing arenas are fewer than `need`.
+    fn alloc_run(&mut self, need: usize, allow_new: bool) -> Option<(usize, usize)> {
+        if need == 0 || need > ARENA_PAGES {
+            return None;
+        }
+        for arena in &mut self.arenas {
+            if let Some(at) = arena.take_run(need) {
+                self.free_pages -= need;
+                return Some((arena.copy, at));
+            }
+        }
+        if allow_new && self.free_pages < need && self.pages.len() + self.free_pages < MOST && self.another() {
+            let arena = self.arenas.last_mut()?;
+            if let Some(at) = arena.take_run(need) {
+                self.free_pages -= need;
+                return Some((arena.copy, at));
+            }
+        }
+        None
+    }
+
+    /// Allocates `need` pages from the lowest single arena that holds at least
+    /// `need` free slots (even if non-contiguous), keeping all pages under one
+    /// descriptor.
+    fn alloc_single_arena(&mut self, need: usize) -> Option<(usize, Vec<usize>)> {
+        if need == 0 || need > ARENA_PAGES {
+            return None;
+        }
+        for arena in &mut self.arenas {
+            if arena.free_count >= need {
+                let mut addrs = Vec::with_capacity(need);
+                for _ in 0..need {
+                    addrs.push(arena.take_one()?);
+                }
+                self.free_pages -= need;
+                return Some((arena.copy, addrs));
+            }
+        }
+        None
+    }
+
+    /// Returns a freed page back to its owning arena's free bitmap.
+    fn give_back(&mut self, copy: usize, at: usize) {
+        if let Some(arena) = self.arenas.iter_mut().find(|a| a.copy == copy)
+            && arena.give_back(at)
+        {
+            self.free_pages += 1;
+        }
+    }
+
+    /// Maps pages `first..=last` (stopping at the first page not belonging to
+    /// the title), preferring a contiguous run in the lowest arena when
+    /// multiple unmapped pure-arena pages are requested together.
+    fn map_contiguous(&mut self, first: u64, last: u64, mark_theirs: bool) -> u64 {
+        let count = (last.saturating_sub(first) + 1) as usize;
+        if count > 1 && count <= ARENA_PAGES && self.pages.len() + count <= MOST {
+            let mut unmapped: Vec<u64> = Vec::with_capacity(count);
+            let mut all_arena = true;
+            for page in first..=last {
+                if self.copy_of(page).is_some() {
+                    continue;
+                }
+                if !self.possible(page) {
+                    all_arena = false;
+                    break;
+                }
+                let start = page * PAGE;
+                if crate::shadow::in_buffer(start, PAGE).is_some()
+                    || (self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK))
+                {
+                    all_arena = false;
+                    break;
+                }
+                unmapped.push(page);
+            }
+            if all_arena && unmapped.len() > 1 {
+                if let Some((copy, base)) = self.alloc_run(unmapped.len(), true) {
+                    for (k, page) in unmapped.into_iter().enumerate() {
+                        self.hold(page, base + k * PAGE as usize, copy);
+                        if mark_theirs && let Some(held) = self.pages.get_mut(&page) {
+                            held.theirs = true;
+                        }
+                    }
+                    return last + 1;
+                }
+                if let Some((copy, addrs)) = self.alloc_single_arena(unmapped.len()) {
+                    for (page, at) in unmapped.into_iter().zip(addrs) {
+                        self.hold(page, at, copy);
+                        if mark_theirs && let Some(held) = self.pages.get_mut(&page) {
+                            held.theirs = true;
+                        }
+                    }
+                    return last + 1;
+                }
+            }
+        }
+        let mut end = first;
+        while end <= last {
+            let new = self.copy_of(end).is_none();
+            if !self.map(end) {
+                break;
+            }
+            if mark_theirs && new && let Some(held) = self.pages.get_mut(&end) {
+                held.theirs = true;
+            }
+            end += 1;
+        }
+        end
     }
 
     /// Another arena's pages.
@@ -411,9 +657,8 @@ impl Memory {
         let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
             return false;
         };
-        self.arenas.push((n, at));
-        // The lowest first.
-        self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
+        self.arenas.push(Arena::new(n, at));
+        self.free_pages += ARENA_PAGES;
         true
     }
 
@@ -432,8 +677,9 @@ impl Memory {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
             if held.owners == 0 && held.theirs {
-                self.free.push((held.copy, held.at));
+                let (copy, at) = (held.copy, held.at);
                 self.pages.remove(&page);
+                self.give_back(copy, at);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
             }
@@ -507,10 +753,8 @@ impl Memory {
     /// they were taken goes into the arenas.
     fn ready(&mut self, address: u64, len: u64) {
         let first = address / PAGE;
-        let mut end = first;
-        while end * PAGE < address + len && self.map(end) {
-            end += 1;
-        }
+        let last = (address + len.saturating_sub(1)) / PAGE;
+        let end = self.map_contiguous(first, last, false);
         self.bring(first, end);
     }
 
@@ -605,16 +849,7 @@ impl Memory {
         if !self.packed.contains_key(&address) {
             self.packed.insert(address, Packed { frame: self.frame, len, header });
             self.packed_order.push(address);
-            for page in page..=last {
-                let new = self.copy_of(page).is_none();
-                if new && !self.place(page) {
-                    continue;
-                }
-                if let Some(held) = self.pages.get_mut(&page) {
-                    held.owners += 1;
-                    held.theirs |= new;
-                }
-            }
+            self.place_packed_pages(page, last);
             self.stats.packed_bytes += len;
         }
         for page in page..=last {
@@ -623,6 +858,68 @@ impl Memory {
             self.take(page, from as usize, to as usize, true);
         }
         self.stats.packed += 1;
+    }
+
+    /// Places unmapped pages of a packed structure (`first..=last`) at
+    /// submission time, preferring a contiguous run in the lowest arena so
+    /// late-streamed multi-page BVHs also stay contiguous inside one arena.
+    fn place_packed_pages(&mut self, first: u64, last: u64) {
+        let count = (last.saturating_sub(first) + 1) as usize;
+        if count > 1 && count <= ARENA_PAGES {
+            let mut unmapped: Vec<u64> = Vec::with_capacity(count);
+            for p in first..=last {
+                if self.copy_of(p).is_none()
+                    && p >= 0x1_0000
+                    && p < u64::from(MEMORY_PAGES) - 1
+                    && crate::texture::committed((p * PAGE) as *const u8, PAGE as usize)
+                    && crate::shadow::in_buffer(p * PAGE, PAGE).is_none()
+                {
+                    unmapped.push(p);
+                }
+            }
+            if unmapped.len() > 1 {
+                if let Some((copy, base)) = self.alloc_run(unmapped.len(), false) {
+                    for (k, p) in unmapped.iter().copied().enumerate() {
+                        self.hold(p, base + k * PAGE as usize, copy);
+                        crate::watch::wrote(self.entry(p) as usize, 8);
+                        self.take(p, 0, PAGE as usize, true);
+                    }
+                    for p in first..=last {
+                        let new = unmapped.binary_search(&p).is_ok();
+                        if let Some(held) = self.pages.get_mut(&p) {
+                            held.owners += 1;
+                            held.theirs |= new;
+                        }
+                    }
+                    return;
+                }
+                if let Some((copy, addrs)) = self.alloc_single_arena(unmapped.len()) {
+                    for (&p, at) in unmapped.iter().zip(addrs) {
+                        self.hold(p, at, copy);
+                        crate::watch::wrote(self.entry(p) as usize, 8);
+                        self.take(p, 0, PAGE as usize, true);
+                    }
+                    for p in first..=last {
+                        let new = unmapped.binary_search(&p).is_ok();
+                        if let Some(held) = self.pages.get_mut(&p) {
+                            held.owners += 1;
+                            held.theirs |= new;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        for page in first..=last {
+            let new = self.copy_of(page).is_none();
+            if new && !self.place(page) {
+                continue;
+            }
+            if let Some(held) = self.pages.get_mut(&page) {
+                held.owners += 1;
+                held.theirs |= new;
+            }
+        }
     }
 
     /// A place in an arena for a page of committed title memory, at a
@@ -636,7 +933,7 @@ impl Memory {
         {
             return false;
         }
-        let Some((copy, at)) = self.free.pop() else {
+        let Some((copy, at)) = self.alloc_one(false) else {
             return false;
         };
         self.hold(page, at, copy);
@@ -969,7 +1266,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free_pages < SPARE && m.pages.len() + m.free_pages < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1011,16 +1308,10 @@ pub(crate) fn ready(
             // list is submitted ([`Memory::land`]).
             if let Some((len, _)) = m.packed_at(at) {
                 packed = true;
-                for page in at / PAGE..=(at + len - 1) / PAGE {
-                    let new = m.copy_of(page).is_none();
-                    if m.map(page)
-                        && new
-                        && let Some(held) = m.pages.get_mut(&page)
-                    {
-                        held.theirs = true;
-                    }
-                }
-                m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
+                let first_page = at / PAGE;
+                let last_page = (at + len - 1) / PAGE;
+                let end = m.map_contiguous(first_page, last_page, true);
+                m.bring(first_page, end);
             }
             list.defer_host(move || {
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -1278,8 +1569,8 @@ mod dump {
                 }
                 text += &format!("frame {}\n", self.frame);
                 for (page, held) in &self.pages {
-                    let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
-                    let at = held.at - self.arenas[arena].1;
+                    let arena = self.arenas.iter().position(|a| a.copy == held.copy).unwrap_or(usize::MAX);
+                    let at = held.at - self.arenas[arena].base;
                     text += &format!("{:#x} {arena} {at:#x}\n", page * PAGE);
                 }
                 let _ = std::fs::write(folder.join("pages.txt"), text);
@@ -1298,8 +1589,8 @@ mod dump {
             self.dump.done = true;
             let Some(host) = host() else { return };
             let mut copies = Vec::new();
-            for &(n, _) in &self.arenas {
-                let buffer = &self.copies[n].buffer;
+            for arena in &self.arenas {
+                let buffer = &self.copies[arena.copy].buffer;
                 let Some((to, data)) = host.shared_buffer(ARENA) else { break };
                 // SAFETY: an open list; live buffers of those sizes. The list
                 // has not used the arena yet.
@@ -1315,6 +1606,10 @@ mod dump {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "memory_locality_tests.rs"]
+mod locality_tests;
 
 #[cfg(test)]
 mod tests {
