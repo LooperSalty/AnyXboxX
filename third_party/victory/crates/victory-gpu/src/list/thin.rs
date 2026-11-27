@@ -162,13 +162,14 @@ impl Front {
         }
     }
 
-    fn close(&mut self) {
+    fn close(&mut self) -> bool {
         if self.closed {
-            return;
+            return false;
         }
         self.put(CLOSE, &[]);
         self.closed = true;
         self.hand_over();
+        true
     }
 }
 
@@ -327,7 +328,7 @@ impl Drop for Recording {
             if !inner.closed {
                 // Left in the middle.
                 STATS[3].fetch_add(1, Relaxed);
-                super::close(inner.back as This);
+                super::close_recording(inner.back as This);
             }
             held(&BACKS).push(inner.back);
         }
@@ -352,7 +353,7 @@ fn back_list(kind: u32) -> This {
         return back as This;
     }
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
+    super::close_recording(list);
     list
 }
 
@@ -567,7 +568,9 @@ fn record(handle: u64) -> [u64; RECORD] {
 const RECORD: usize = size_of::<RtvRecord>().div_ceil(8);
 
 extern "system" fn list_close(this: This) -> HRESULT {
-    front(this).close();
+    if front(this).close() {
+        crate::descriptor::list_closed();
+    }
     S_OK
 }
 extern "system" fn list_reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -793,7 +796,7 @@ fn translate<const SPLIT: bool>(
                 super::reset(list, allocator, w[0] as This);
             }
             CLOSE => {
-                super::close(list);
+                super::close_recording(list);
                 closed = true;
             }
             BARRIER => {
