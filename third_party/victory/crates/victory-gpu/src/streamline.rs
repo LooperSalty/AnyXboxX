@@ -29,14 +29,15 @@ mod check;
 mod device;
 mod frames;
 mod hudless;
+mod options;
 mod present;
 mod stats;
 pub use check::check;
 use device::{COPY_DEST, texture};
-pub(crate) use frames::submitted;
+pub(crate) use frames::{Noted, submitted};
 use frames::*;
 use hudless::*;
-pub(crate) use hudless::{before_target_draw, hudless_submitted, hudless_wanted};
+pub(crate) use hudless::{Copied, before_target_draw, hudless_resized, hudless_submitted, hudless_wanted};
 pub(crate) use present::{Planes, present_begins, present_ends, resizing};
 use stats::*;
 pub(crate) use stats::{line, present_called, present_returned};
@@ -272,10 +273,11 @@ struct Calls {
     last: Option<(u32, [u32; 2], [u32; 2])>,
     /// Frame generation: on, and the frame whose simulation began.
     framegen_on: bool,
+    framegen_times: u32,
     simulating: Option<u32>,
 }
 
-static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, simulating: None });
+static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, framegen_times: 0, simulating: None });
 
 fn calls() -> std::sync::MutexGuard<'static, Calls> {
     CALLS.lock().unwrap_or_else(|e| e.into_inner())
@@ -287,7 +289,11 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
     let mut token = std::ptr::null_mut();
     // SAFETY: an out pointer and an index.
     let code = unsafe { (sl.get_new_frame_token)(&mut token, &index) };
-    (code == 0 && !token.is_null()).then_some(token)
+    if code != 0 || token.is_null() {
+        once!(warn, index, code, result = abi::result_name(code), "Streamline did not supply a frame token");
+        return None;
+    }
+    Some(token)
 }
 
 /// Select the title's FidelityFX path only after the host device is ready.

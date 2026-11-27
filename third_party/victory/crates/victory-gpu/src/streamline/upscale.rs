@@ -69,6 +69,9 @@ pub fn upscale(up: &Upscale) -> Taken {
     if up.camera.render.contains(&0) || up.camera.output.contains(&0) {
         return Taken::No("an empty render or output size");
     }
+    if framegen && !dlss && ![DEPTH, MOTION].iter().all(|&i| crate::resource::is_resource(up.resources[i].0)) {
+        return Taken::No("invalid depth or motion vectors for frame generation");
+    }
     if dlss && let Err(why) = validate(up) {
         return Taken::No(why);
     }
@@ -81,13 +84,13 @@ pub fn upscale(up: &Upscale) -> Taken {
                 return false;
             }
             if framegen {
-                note(host, &up, id);
+                return note(host, &up, id) || dlss;
             }
             true
         }),
     );
     if !asked {
-        return Taken::No("DLSS could not record into the command list");
+        return Taken::No("the upscale could not be recorded on the command list");
     }
     if dlss { Taken::Dlss } else { Taken::Noted }
 }
