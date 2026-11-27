@@ -1,6 +1,6 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
-//! `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`, `VICTORY_UPSCALER`; each off
-//! without it): places in the title's code changed at load, each compared
+//! `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`, `VICTORY_UPSCALER`):
+//! places in the title's code changed at load, each compared
 //! byte for byte first and left alone, said so, if it differs (another
 //! build of the title).
 //!
@@ -21,7 +21,9 @@
 //!   safe: at 0.5 on Series S (run res-6) the title divided by zero 49 s in.
 //! - **Upscaler.** [`PICKER`] (+0x7e93f0): `VICTORY_UPSCALER=<kind>` makes
 //!   the picker return `kind` (pull request #53): 6 the title's own, 7
-//!   FidelityFX.
+//!   FidelityFX. When DLSS Super Resolution is ready, it forces selector 7
+//!   to reach the FidelityFX dispatch, overriding an explicit `VICTORY_UPSCALER=6`.
+//!   An explicit `VICTORY_FFX_SCALE` still takes precedence over the DLSS scale.
 
 use crate::frame_rate::Patched;
 
@@ -81,6 +83,23 @@ pub fn asked_upscaler() -> Option<u32> {
         eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected 6 (the title's own) or 7 (FidelityFX)");
     }
     kind
+}
+
+#[cfg(any(windows, test))]
+fn select_upscaler(
+    dlss_ready: bool,
+    requested: Option<u32>,
+    on_override: impl FnOnce(u32),
+) -> Option<u32> {
+    const FIDELITYFX: u32 = 7;
+    if dlss_ready {
+        if let Some(kind) = requested.filter(|&kind| kind != FIDELITYFX) {
+            on_override(kind);
+        }
+        Some(FIDELITYFX)
+    } else {
+        requested
+    }
 }
 
 /// A place to change: its offset in the image and the bytes there
@@ -300,7 +319,13 @@ pub unsafe fn apply_with_fidelityfx(base: usize, size: usize, scale: Option<f32>
     if let Some(s) = asked_ffx_scale().or(scale) {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
-    if let Some(kind) = scale.map(|_| 7).or_else(asked_upscaler) {
+    let selector = select_upscaler(scale.is_some(), asked_upscaler(), |kind| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("DLSS overrides VICTORY_UPSCALER={kind} with 7 (FidelityFX)")
+        });
+    });
+    if let Some(kind) = selector {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
     }
     for (site, code, value) in asked {
@@ -319,6 +344,20 @@ pub unsafe fn apply_with_fidelityfx(base: usize, size: usize, scale: Option<f32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dlss_reports_only_a_conflicting_selector() {
+        for requested in [None, Some(6), Some(7)] {
+            assert_eq!(
+                select_upscaler(false, requested, |_| panic!("unexpected override")),
+                requested
+            );
+            let mut overridden = None;
+            let selected = select_upscaler(true, requested, |kind| overridden = Some(kind));
+            assert_eq!(selected, Some(7));
+            assert_eq!(overridden, requested.filter(|&kind| kind == 6));
+        }
+    }
 
     #[test]
     fn switches_parse() {

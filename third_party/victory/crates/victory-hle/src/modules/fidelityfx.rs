@@ -182,9 +182,7 @@ fn contexts<T>(f: impl FnOnce(&mut HashMap<usize, Created>) -> T) -> T {
     f(contexts.get_or_insert_with(HashMap::new))
 }
 
-/// The largest output the title's shipping FSR4 accepts: it carries only the
-/// fixed-resolution contexts reported by VIctory-NVIDIA's November 26 run.
-/// Creating a context at other dimensions failed on that build.
+// Shipping FSR4 context sizes: assumed (measured by VIctory-NVIDIA on 26/11), to confirm in game.
 const SHIPPING_MAX_OUTPUT: [u32; 2] = [1920, 1080];
 const SHIPPING_MAX_RENDER: [u32; 2] = [1280, 720];
 

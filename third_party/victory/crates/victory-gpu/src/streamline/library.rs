@@ -1,3 +1,7 @@
+//! VIctory verifies the NVIDIA Authenticode signature of `sl.interposer.dll` only.
+//! Streamline loads and verifies the other NVIDIA DLLs from the same directory.
+//! Other users must not have write access to that directory.
+
 use super::*;
 
 struct Library(windows_sys::Win32::Foundation::HMODULE);
