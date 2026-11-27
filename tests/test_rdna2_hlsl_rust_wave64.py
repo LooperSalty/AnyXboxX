@@ -4,12 +4,14 @@ import pytest
 from emu import rdna2_exec, rdna2_gpu, rdna2_hlsl
 from test_rdna2_exec import LITERAL, V, const, sop1, sopp, vop1, vop2, vop3, vopc
 from test_rdna2_exec_memory import OUTPUT, ds
+from test_rdna2_exec_ds_addtid import addtid_program
 from test_rdna2_hlsl import MEMORY_SIZE
 from test_rdna2_hlsl_rust_parity import rust
 from test_rdna2_hlsl_wave64 import store_lane, with_lane_offset
 
 
 @pytest.mark.parametrize("ops", [
+    [*addtid_program(64), vop1("v_mov_b32", 8, V + 2)],
     [*vop3("v_cmp_gt_u32", 12, V, const(41)), vop1("v_mov_b32", 8, 12), vop1("v_mov_b32", 9, 13),
      *vop3("v_cmp_lt_f16", 12, V, 242, abs_=1, neg=1), vop1("v_mov_b32", 10, 13)],
     [vopc("v_cmp_lt_u32", const(30), 0), vop2("v_cndmask_b32", 8, const(1), 0),

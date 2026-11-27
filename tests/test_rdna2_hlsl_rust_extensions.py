@@ -1,8 +1,13 @@
 """SDWA and DPP read a different subword or lane for each result."""
 from test_rdna2_exec import LITERAL, sop1, vop1, vop2, vopc
 from test_rdna2_hlsl import store_lane, with_lane_offset
+from test_rdna2_exec_ds_addtid import addtid_program
 from test_rdna2_hlsl_rust_half import verify
 from test_rdna2_sdwa_dpp_exec import SDWA, DPP16, DPP8, DPP8_FI, dpp16_word, dpp8_word, sdwa_word
+
+
+def test_lds_addtid_uses_m0_and_active_lane():
+    verify(with_lane_offset(*addtid_program(32), *store_lane(2, 0)), b"")
 
 
 def test_subword_and_lane_controls_match_reference_memory():

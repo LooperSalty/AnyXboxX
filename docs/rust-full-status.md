@@ -128,6 +128,8 @@ VOP3 now shares all translated VOPC integer and floating comparisons. Batched WA
 
 VOP3 also uses the existing expression emitters for VOP1/VOP2 aliases. WARP checks the aliases, cube faces and coordinates, byte interpolation and the native SAD instructions.
 
+LDS ADDTID reads and writes use M0, the immediate offset and the lane ID in wave32 and wave64. Partial-EXEC tests exchange values through LDS and compare WARP memory to the interpreter.
+
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.

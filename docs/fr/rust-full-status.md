@@ -128,6 +128,8 @@ VOP3 reprend toutes les comparaisons entières et flottantes VOPC traduites. Des
 
 VOP3 utilise aussi les expressions VOP1/VOP2 pour leurs encodages longs. WARP vérifie ces variantes, les faces et coordonnées de cube, l’interpolation d’octets et les instructions SAD natives.
 
+Les lectures et écritures LDS ADDTID utilisent M0, le déplacement immédiat et le numéro de ligne en wave32 et wave64. Les tests sous EXEC partiel échangent des données via la LDS et comparent la mémoire sous WARP à l’interpréteur.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 La CLI Rust affiche le HLSL des instructions portées avec `anyxboxx rdna2 FICHIER --hlsl`. Les deux CLI signalent le retrait de `--spirv` avec le code de sortie 2.

@@ -1,6 +1,28 @@
 //! LDS full-word reads and writes for straight-line wave32 programs.
 
 pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
+    if matches!(name, "ds_read_addtid_b32" | "ds_write_addtid_b32") {
+        let index = format!(
+            "(((s[124] & 0xFFFFu) + {}u + lane * 4u) >> 2) % 8128u",
+            word & 65535
+        );
+        let barrier = "GroupMemoryBarrierWithGroupSync();".to_owned();
+        let active = "((s[126] >> lane) & 1u) != 0";
+        return Ok(if name == "ds_read_addtid_b32" {
+            vec![
+                barrier,
+                format!("if ({active}) {{ v[{}] = g_lds[{index}]; }}", word >> 56),
+            ]
+        } else {
+            vec![
+                format!(
+                    "if ({active}) {{ g_lds[{index}] = v[{}]; }}",
+                    (word >> 40) & 255
+                ),
+                barrier,
+            ]
+        });
+    }
     if matches!(
         name,
         "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32"
