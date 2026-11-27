@@ -64,10 +64,29 @@ const BIG_POOLS: &[(&str, &str)] = &[
     ("VICTORY_LAND_THREADS", "6"),
 ];
 
+/// From this many logical CPUs, the landing pool gets 8 threads ([`HUGE_POOLS`]).
+pub const HUGE_CPU_THRESHOLD: usize = 24;
+
+/// [`BIG_POOLS`] with 8 landing threads, for CPUs with at least [`HUGE_CPU_THRESHOLD`] logical CPUs.
+///
+/// Measured 2026-11-27, RTX 4070 SUPER + i7-13700KF (24 logical CPUs), Series X, 1080p, warm cache, same build,
+/// one long run each, by draws a frame: 5,000-7,000 draws 17.1 -> 22.0 fps, over 7,000 draws 14.6 -> 17.8 fps,
+/// 10th percentile 10.4 -> 16.1 fps, lighter scenes unchanged (23-25 fps). With 6 threads the landing pool sat at
+/// x5.2-5.4 in heavy scenes; with 8 it reaches x6.1-6.6.
+const HUGE_POOLS: &[(&str, &str)] = &[
+    ("VICTORY_THIN_THREADS", "12"),
+    ("VICTORY_UNDER_THREADS", "8"),
+    ("VICTORY_LAND_THREADS", "8"),
+];
+
 /// The worker-pool sizes to apply over `TUNED` for a CPU with `logical_cpus` logical CPUs, or `None` to keep the
 /// 8-core sizes.
 pub fn pool_sizes(logical_cpus: usize) -> Option<&'static [(&'static str, &'static str)]> {
-    (logical_cpus >= BIG_CPU_THRESHOLD).then_some(BIG_POOLS)
+    if logical_cpus >= HUGE_CPU_THRESHOLD {
+        Some(HUGE_POOLS)
+    } else {
+        (logical_cpus >= BIG_CPU_THRESHOLD).then_some(BIG_POOLS)
+    }
 }
 
 /// Overrides the detected logical CPU count (a positive integer): lets tests and benchmarks pin the pool sizes.
@@ -126,7 +145,7 @@ fn pairs(
         .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
 }
 
-/// Variables set before the XG library is checked, in the script's order.
+/// Profile settings and switches. Explicit overrides are applied after XG validation.
 pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
     base_with_cpus(args, logical_cpus())
 }
@@ -147,9 +166,6 @@ pub fn base_with_cpus(args: &RunArgs, logical_cpus: usize) -> Vec<(String, OsStr
     }
     if args.quality {
         env.extend(pairs(QUALITY));
-    }
-    for (name, value) in &args.overrides {
-        env.push((name.clone(), OsString::from(value)));
     }
     if args.auto_a {
         env.push((AUTO_A.to_string(), OsString::from("150")));

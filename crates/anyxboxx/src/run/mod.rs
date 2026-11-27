@@ -1,7 +1,7 @@
 //! `anyxboxx run`: builds VIctory (cargo does nothing when it is current) and launches it on the
 //! user's own game folder. Rust replacement of main's `tools/lancer_victory.ps1`: same checks,
 //! same build, same environment (`tests/fixtures/lancer_victory_neptune.ps1` is the golden copy),
-//! same warm and precompile steps, same exit code.
+//! same exit code. On Vice-Tay, warm and precompile share a pipeline-cache warm.
 
 mod settings;
 mod steps;
@@ -73,7 +73,7 @@ pub struct RunArgs {
     /// Picture first: windows and buffers read fresh each frame (about half the frame rate).
     #[arg(long, alias = "Quality")]
     pub quality: bool,
-    /// KEY=VALUE VICTORY_* variables set after the tuned set and --quality, for A/B runs. Repeatable.
+    /// Override any VICTORY_* launch setting with KEY=VALUE. Repeatable. Use KEY= to unset it.
     #[arg(long = "override", alias = "Override", value_parser = parse_override)]
     pub overrides: Vec<(String, String)>,
     /// Taps A through the start screens for 150 s (VICTORY_AUTO_A=150).
@@ -88,10 +88,10 @@ pub struct RunArgs {
     /// Turn on device-removed data (VICTORY_D3D12_DRED); needs the diagnostics build, so implies --diag.
     #[arg(long, alias = "Dred")]
     pub dred: bool,
-    /// Run `victory warm` on the game folder's own .rpf archives before the game (about 7 min the first time).
+    /// Check for .rpf archives and warm the recorded host pipelines before the game.
     #[arg(long, alias = "Warm")]
     pub warm: bool,
-    /// Warm shaders.rpf, the game executable and its two DLLs before the game.
+    /// Check the shader archive and required DLLs, then warm the recorded host pipelines.
     #[arg(long, alias = "Precompile")]
     pub precompile: bool,
     /// Your own copy of the GDK's offline PC xg_xs.dll (never in this repository).
@@ -133,6 +133,8 @@ pub enum RunError {
     NoGame(String),
     #[error("cargo build failed (exit code {0}).")]
     BuildFailed(i32),
+    #[error("cargo build reported {0} VIctory executables, expected one.")]
+    BuildArtifactCount(usize),
     #[error("xg_xs.dll not found: {0:?}.")]
     NoXgDll(String),
     #[error("--precompile needs {0:?}.")]
@@ -148,12 +150,19 @@ pub enum RunError {
 /// Runs the launch like the script, step for step; returns VIctory's exit code. With
 /// `--victory-exe` the build is skipped and the repository is not needed.
 pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
-    let victory = match (&args.victory_exe, repo) {
+    let mut victory = match (&args.victory_exe, repo) {
         (Some(exe), _) => Victory::prebuilt(exe)?,
         (None, Some(repo)) => Victory::locate(repo, args.uses_diag())?,
         (None, None) => return Err(RunError::NoRepo),
     };
+    let env = environment(args)?;
     game_exe(&args.game_dir)?;
+    if args.warm {
+        warm_archives(&args.game_dir)?;
+    }
+    if args.precompile {
+        steps::validate_precompile_inputs(&args.game_dir)?;
+    }
     if let Some(mut build) = victory.build_command() {
         let profile = if args.uses_diag() {
             "diag profile, diagnostics feature"
@@ -161,24 +170,14 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
             "release"
         };
         println!("Building VIctory ({profile})...");
-        let code = status(&mut build, "cargo")?;
-        if code != 0 {
-            return Err(RunError::BuildFailed(code));
-        }
+        victory.exe = steps::build_executable(&mut build)?;
     }
-    let env = environment(args)?;
     if args.warm {
-        let archives = warm_archives(&args.game_dir)?;
-        println!(
-            "Warming the shader cache from the game's archives (about 7 minutes the first time)..."
-        );
-        warm_or_fail(&mut victory.warm_command(&archives, &env))?;
-    }
-    if args.precompile {
-        println!(
-            "Precompiling the shaders of shaders.rpf, the game and its DLLs into the cache..."
-        );
-        warm_or_fail(&mut victory.precompile_command(&args.game_dir, &env)?)?;
+        println!("Warming the host pipeline cache...");
+        warm_or_fail(&mut victory.warm_command(&[], &env))?;
+    } else if args.precompile {
+        println!("Preparing the recorded host pipelines before launch...");
+        warm_or_fail(&mut victory.warm_command(&[], &env))?;
     }
     status(&mut victory.game_command(&args.game_dir, &env), "victory")
 }

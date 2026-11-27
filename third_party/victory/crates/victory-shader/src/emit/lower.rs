@@ -1870,6 +1870,29 @@ impl<'a> Lower<'a> {
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            let mut first_lane_crosses = false;
+            if wave == 64 && group > 32 && host_max_wave() == 32 {
+                let sources: Vec<_> = insts()
+                    .filter(|i| {
+                        i.name() == "v_readfirstlane_b32"
+                            && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+                    })
+                    .filter_map(|i| match &i.fields {
+                        Fields::Valu(v) => match v.src.first() {
+                            Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !sources.is_empty() {
+                    let uniform = all_lane_blocks(x.st).map_or_else(HashSet::new, |all| {
+                        lane_uniform(p, x.st, &all, wave_tid(p, x), false)
+                    });
+                    first_lane_crosses = sources.into_iter().any(|v| !uniform.contains(&v));
+                    console_lanes |= first_lane_crosses;
+                }
+            }
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, `ds_bpermute`, which the ISA
@@ -1879,7 +1902,7 @@ impl<'a> Lower<'a> {
             // lane-constant masks), nor when LDS may be shared within the console wave without
             // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+                let crosses = first_lane_crosses || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -8750,7 +8773,15 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            // Row masks refer to console lanes even on a 32-lane host.
+            let row_lane = if self.halves.is_some() {
+                let thread = self.console_thread();
+                let mask = k(self, 63);
+                self.s.m.bin(c, Bin::And, thread, mask)
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -9625,6 +9656,8 @@ impl<'a> Lower<'a> {
                     }
                     if self.exchange.as_ref().is_some_and(|e| e.1) {
                         // a group of 32 or fewer: the lane is in this host wave
+                        let mask = self.s.m.i32(self.wave() - 1);
+                        let lane = self.s.m.bin(self.cur, Bin::And, lane, mask);
                         let r = self.read_lane(a, lane);
                         return int(self, r);
                     }
@@ -9633,6 +9666,8 @@ impl<'a> Lower<'a> {
                         need(self.cur_ir);
                         return Err("a lane read where not every lane runs");
                     }
+                    let k63 = self.s.m.i32(63);
+                    let lane = self.s.m.bin(self.cur, Bin::And, lane, k63);
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
@@ -9648,11 +9683,19 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     return int(self, r);
                 }
+                let lane = if self.mask_data == MaskData::Host {
+                    lane
+                } else {
+                    let mask = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, mask)
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
+                // On RDNA 2, v_writelane_b32 ignores EXEC and masks the lane index
+                // to the wave size (low 5 bits in wave32, low 6 bits in wave64).
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -9666,9 +9709,11 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
+                let mask = self.s.m.i32(if self.x.native.wave64 { 63 } else { 31 });
+                let lane = self.s.m.bin(c, Bin::And, lane, mask);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -9807,7 +9852,11 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))?
             }
-            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(code @ 128..=208) => {
+                let lo = crate::resource::inline(code).ok_or("an inline integer operand")?;
+                let hi = (lo as i32 >> 31) as u32;
+                (self.s.m.i32(lo), self.s.m.i32(hi))
+            },
             Operand::Const(c @ 240..=248) => {
                 const INLINE_F64: [f64; 9] = [
                     0.5,
@@ -11070,45 +11119,50 @@ impl<'a> Lower<'a> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" | "f16" if op == "class" => {
+            "f16" | "f32" | "f64" if op == "class" => {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
-                let f16 = ty == "f16";
-                let x = if f16 {
-                    let Fields::Valu(v) = &inst.fields else {
-                        unreachable!()
-                    };
-                    let mut h = self.half_src(inst, 0)?;
-                    if v.abs & 1 != 0 {
-                        let m = self.s.m.i32(0x7FFF);
-                        h = self.s.m.bin(c, Bin::And, h, m);
+                let (x, lo, exp_sh, sign_sh, exp_mask) = match ty {
+                    "f16" => {
+                        let Fields::Valu(v) = &inst.fields else {
+                            unreachable!()
+                        };
+                        let mut h = self.half_src(inst, 0)?;
+                        if v.abs & 1 != 0 {
+                            let m = self.s.m.i32(0x7FFF);
+                            h = self.s.m.bin(c, Bin::And, h, m);
+                        }
+                        if v.neg & 1 != 0 {
+                            let s = self.s.m.i32(0x8000);
+                            h = self.s.m.bin(c, Bin::Xor, h, s);
+                        }
+                        (h, None, 10, 15, 0x1F)
                     }
-                    if v.neg & 1 != 0 {
-                        let s = self.s.m.i32(0x8000);
-                        h = self.s.m.bin(c, Bin::Xor, h, s);
+                    "f64" => {
+                        let (lo, hi) = self.f64_pair(inst, 0)?;
+                        (hi, Some(lo), 20, 31, 0x7FF)
                     }
-                    h
-                } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    _ => {
+                        let x = self.fsrc(inst, 0)?;
+                        (self.as_int(x), None, 23, 31, 0xFF)
+                    }
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
-                    (10, 15, 0x1F, 0x03FF, 0x0200)
-                } else {
-                    (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000)
-                };
                 let (k_exp, k_sign, k_emax, mant, quiet) = (
                     k(self, exp_sh),
                     k(self, sign_sh),
                     k(self, exp_mask),
-                    k(self, mant_mask),
-                    k(self, quiet_bit),
+                    k(self, (1 << exp_sh) - 1),
+                    k(self, 1 << (exp_sh - 1)),
                 );
                 let e = self.s.m.bin(c, Bin::LShr, x, k_exp);
                 let e = self.s.m.bin(c, Bin::And, e, k_emax);
-                let m = self.s.m.bin(c, Bin::And, x, mant);
+                let mut m = self.s.m.bin(c, Bin::And, x, mant);
+                if let Some(lo) = lo {
+                    // Test the full binary64 fraction for zero using two i32 words.
+                    m = self.s.m.bin(c, Bin::Or, m, lo);
+                }
                 let neg = self.s.m.bin(c, Bin::LShr, x, k_sign);
                 let zero = k(self, 0);
                 let (e0, emax) = (

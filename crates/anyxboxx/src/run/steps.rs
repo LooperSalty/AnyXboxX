@@ -1,9 +1,9 @@
 //! The steps of a launch as reusable pieces: the CLI (`anyxboxx run`) chains them like main's
 //! script did, the graphical launcher (`crates/anyxboxx-launcher`) drives them one by one.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::{RunArgs, RunError, settings};
 
@@ -12,7 +12,8 @@ pub const GAME_EXE: &str = "game_scarlett_master.exe";
 pub const PRECOMPILED_DLLS: [&str; 2] = ["XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll"];
 pub const SHADERS: &str = "shaders.rpf";
 
-/// Environment variables given to VIctory, in the order they are set.
+/// Environment variables applied to the VIctory child process in order.
+/// An empty value removes a VICTORY_* variable from that child.
 pub type Env = Vec<(String, OsString)>;
 
 /// Where VIctory's sources and its built `victory.exe` are. `manifest` is `None` for a
@@ -80,25 +81,19 @@ impl Victory {
         let _ = archives;
         let mut command = Command::new(&self.exe);
         command.arg("warm");
-        command.envs(pairs(env));
+        apply_env(&mut command, env);
         command
     }
 
     /// The warm before a first launch (`--precompile`): checks that shaders.rpf, the game and its
     /// two DLLs are there, then runs `victory warm` with the game's environment.
     pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
-        let shaders = game_dir.join(SHADERS);
-        let dlls: Vec<PathBuf> = PRECOMPILED_DLLS.iter().map(|d| game_dir.join(d)).collect();
-        for needed in std::iter::once(&shaders).chain(&dlls) {
-            if !needed.is_file() {
-                return Err(RunError::PrecompileInput(needed.display().to_string()));
-            }
-        }
+        validate_precompile_inputs(game_dir)?;
         // Vice-Tay's `warm` reads no files: the inputs are checked so a broken game folder still
         // fails here, as before, and the command is the plain warm.
         let mut command = Command::new(&self.exe);
         command.arg("warm");
-        command.envs(pairs(env));
+        apply_env(&mut command, env);
         Ok(command)
     }
 
@@ -109,9 +104,20 @@ impl Victory {
             .arg("run")
             .arg(game_dir.join(GAME_EXE))
             .arg("--execute");
-        command.envs(pairs(env));
+        apply_env(&mut command, env);
         command
     }
+}
+
+/// Check the extra inputs required for a first launch.
+pub(super) fn validate_precompile_inputs(game_dir: &Path) -> Result<(), RunError> {
+    for name in std::iter::once(SHADERS).chain(PRECOMPILED_DLLS) {
+        let needed = game_dir.join(name);
+        if !needed.is_file() {
+            return Err(RunError::PrecompileInput(needed.display().to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// The `.rpf` archives directly in `game_dir`, sorted by name (never the folder's other trees).
@@ -138,14 +144,14 @@ pub fn warm_archives(game_dir: &Path) -> Result<Vec<PathBuf>, RunError> {
 /// The game executable of `game_dir`, which must exist.
 pub fn game_exe(game_dir: &Path) -> Result<PathBuf, RunError> {
     let exe = game_dir.join(GAME_EXE);
-    if exe.exists() {
+    if exe.is_file() {
         Ok(exe)
     } else {
         Err(RunError::NoGame(game_dir.display().to_string()))
     }
 }
 
-/// The game's environment, checked like the script (the XG library must exist).
+/// Validate XG and apply explicit overrides after profile values and dedicated switches.
 pub fn environment(args: &RunArgs) -> Result<Env, RunError> {
     let mut env = settings::base(args);
     if let Some(dll) = args.xg_dll.as_deref().filter(|p| !p.as_os_str().is_empty()) {
@@ -156,12 +162,59 @@ pub fn environment(args: &RunArgs) -> Result<Env, RunError> {
             std::path::absolute(dll).map_err(|e| RunError::Spawn(dll.display().to_string(), e))?;
         env.extend(settings::xg(&absolute, args.xg_mode.as_str()));
     }
+    env.extend(
+        args.overrides
+            .iter()
+            .map(|(name, value)| (name.clone(), OsString::from(value))),
+    );
     Ok(env)
 }
 
-fn pairs(env: &Env) -> impl Iterator<Item = (&OsStr, &OsStr)> {
-    env.iter()
-        .map(|(k, v)| (OsStr::new(k.as_str()), v.as_os_str()))
+fn apply_env(command: &mut Command, env: &Env) {
+    for (key, value) in env {
+        if key.starts_with("VICTORY_") && value.is_empty() {
+            command.env_remove(key);
+        } else {
+            command.env(key, value);
+        }
+    }
+}
+
+/// Ask Cargo for the executable path so custom targets and target directories work.
+pub(super) fn build_executable(command: &mut Command) -> Result<PathBuf, RunError> {
+    let output = command
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| RunError::Spawn("cargo".into(), e))?;
+    if !output.status.success() {
+        return Err(RunError::BuildFailed(output.status.code().unwrap_or(1)));
+    }
+    let executables: Vec<_> = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter_map(|message| {
+            let target = &message["target"];
+            let is_binary = target["kind"]
+                .as_array()
+                .is_some_and(|kind| kind.iter().any(|k| k == "bin"));
+            if message["reason"] != "compiler-artifact" || target["name"] != "victory" || !is_binary {
+                return None;
+            }
+            message["executable"]
+                .as_str()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
+        .collect();
+    let [executable] = executables.as_slice() else {
+        return Err(RunError::BuildArtifactCount(executables.len()));
+    };
+    if !executable.is_file() {
+        return Err(RunError::NoVictoryExe(executable.display().to_string()));
+    }
+    Ok(executable.clone())
 }
 
 /// Waits for the command; a process killed without exit code counts as 1, like PowerShell.

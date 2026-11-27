@@ -44,6 +44,10 @@ fn execute_vector(
     if vector::is_no_operation(name) {
         return Ok(true);
     }
+    if crate::f16::supports(name) {
+        crate::f16::execute(wave, name, family, word, literal)?;
+        return Ok(true);
+    }
     let fields = vector::fields(family, word);
     let carry = family == "VOP2" && vector::is_carry(name);
     if EXTENSION_CODES.contains(&(word & 0x1FF)) {
@@ -94,6 +98,10 @@ fn execute_compare(
     literal: Option<u32>,
 ) -> Result<bool, Error> {
     let (src0, vsrc1) = (word & 0x1FF, (word >> 9) & 0xFF);
+    if crate::cmpf16::supports(name) {
+        crate::cmpf16::execute(wave, name, src0, vsrc1, literal)?;
+        return Ok(true);
+    }
     if EXTENSION_CODES.contains(&src0) && ext_compare::supports(name) {
         if src0 != ext::SDWA {
             return Err(ext_compare::refuse_dpp(name, src0 == ext::DPP16));

@@ -20,7 +20,7 @@ This repository contains no game files, keys or executables, and does not explai
 ## Requirements
 
 - Windows 10 or 11, 64-bit, with an AVX2 processor.
-- A Direct3D 12 graphics card with shader model 6.6 and mesh shaders: NVIDIA RTX 20 series or newer, or AMD RDNA 2 or newer. A 12 GB card runs short of texture memory; the launcher has a preset for 8 and 12 GB cards.
+- A Direct3D 12 graphics card with shader model 6.6 and mesh shaders: NVIDIA RTX 20 series or newer, or AMD RDNA 2 or newer. **The project is focused on NVIDIA**: every measurement and the launcher's tuned settings are for NVIDIA cards (RTX 4070 SUPER). AMD cards work too, but less well (fewer fps, more graphics issues), and get less attention. A 12 GB card runs short of texture memory; the launcher has a preset for 8 and 12 GB cards.
 - 32 GB of RAM recommended, and more than 30 GB free on the system drive (the shader cache grows as you play).
 - Your own copy of the Xbox Series 1.0.2.1 build: a folder that contains `game_scarlett_master.exe`. It is not provided.
 - [Rust](https://rustup.rs/) and Visual Studio 2022 or 2026 Build Tools with the "Desktop development with C++" workload. VIctory is built from source the first time you play.
@@ -53,7 +53,7 @@ Regenerate: `scarlett.py --carte <package folder> docs/images/carte-avancee.svg`
 ![Xbox Series X translation progress](docs/images/traduction.svg)
 
 - **CPU instructions: 100%.** The Series X uses an AMD Zen 2 in x86-64, the same instruction set as a PC: the game's code runs as is.
-- **GPU instructions: 89%.** 1,330 of the 1,490 RDNA 2 encodings run in the reference interpreter, and the RDNA 2 → DXIL recompiler already draws a first vertex and pixel shader with D3D12.
+- **GPU instructions: 91%.** 1,364 of the 1,490 RDNA 2 encodings run in the reference interpreter, and the RDNA 2 → DXIL recompiler already draws a first vertex and pixel shader with D3D12.
 - **System functions: 66%** of the 1,337 functions imported by the DLLs of the test package are resolved.
 - **GDK runtime: 210 of the 396 functions** are written in AnyXboxX, in Rust and C++: the task queue, the offline user, the Xbox Series X identity, saves, the package, the offline Store and invitations. The other interfaces are served by the Windows GDK runtime when it is installed.
 
