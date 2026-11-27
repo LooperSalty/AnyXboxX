@@ -96,6 +96,9 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// A copy created for title memory by address whose GPU buffer lives in
+    /// local VRAM ([`by_address`], [`by_address_owned`]).
+    by_address_card: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -261,9 +264,11 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Bytes of title-memory-by-address (RT BVH) arenas placed in local VRAM.
 static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Running total used against `VICTORY_MEMORY_CARD_MB`.
+static BY_ADDRESS_CARD_USED: AtomicU64 = AtomicU64::new(0);
 
 /// Local-VRAM buffer breakdown for the HUD: `[card_buffers_and_windows, bvh_arenas]`.
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn vram_breakdown() -> [u64; 2] {
     let bvh = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
     let win = WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_sub(bvh);
@@ -2488,6 +2493,12 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
     runs
 }
 
+/// Dword-aligned `(offset, len)` ranges where `title` differs from `held`
+/// (AVX2-accelerated when aligned and supported).
+pub(crate) fn word_diff_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    word_runs(at, title, held)
+}
+
 /// [`dword_runs`] with no gap, the fast way where it can be: a frame compares
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
@@ -2986,6 +2997,10 @@ impl Drop for Shadow {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+            }
+            if self.by_address_card {
+                BY_ADDRESS_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                BY_ADDRESS_CARD_USED.fetch_sub(card.size, Ordering::Relaxed);
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
@@ -3599,6 +3614,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            by_address_card: false,
             place: None,
         }
     }
@@ -4761,9 +4777,21 @@ impl Shadow {
         self.changes_only.store(true, Ordering::Relaxed);
     }
 
-    /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
-    pub(crate) fn resend(&self, from: usize, to: usize) {
+    /// Mutable pointer to the CPU-cached staging/backing memory (`L0 WRITE_BACK`).
+    pub(crate) fn data_mut(&self) -> *mut u8 {
+        self.data
+    }
+
+    /// Marks byte offsets `[from, to)` dirty on the card's side directly (for
+    /// owned by-address buffers written straight into `data_mut()`).
+    pub(crate) fn mark_card_dirty(&self, from: usize, to: usize) {
         self.card_changed(from, to);
+    }
+
+    /// Marks a sequence of byte offset ranges `(from, to)` dirty on the card's
+    /// side directly.
+    pub(crate) fn mark_card_dirty_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        self.card_changed_runs(runs);
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -5862,45 +5890,86 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room && BY_ADDRESS_CARD_USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+        match host.uav_buffer(len) {
+            Some(buffer) => Some(buffer),
+            None => {
+                BY_ADDRESS_CARD_USED.fetch_sub(len, Ordering::Relaxed);
+                None
+            }
+        }
     } else {
+        if room {
+            BY_ADDRESS_CARD_USED.fetch_sub(len, Ordering::Relaxed);
+        }
         None
     };
-    let buffer = match on_card {
+    let (buffer, card, in_vram) = match on_card {
         Some(buffer) => {
             BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
-            buffer
+            WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
+            (
+                buffer,
+                Some(Card {
+                    staging,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    touched: Default::default(),
+                    size: len,
+                }),
+                true,
+            )
         }
-        None => host.shared_buffer(len)?.0,
+        None => {
+            // Keep the shader's copy separate from staging even in shared
+            // memory. The CPU can change a directory entry or update a BVH
+            // while a previous submission still needs its old contents.
+            let buffer = host.shared_buffer(len)?.0;
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address (shared)"));
+            WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+            (
+                buffer,
+                Some(Card {
+                    staging,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    touched: Default::default(),
+                    size: len,
+                }),
+                false,
+            )
+        }
     };
-    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
-    // (Counted down with the windows' on the card when it goes.)
-    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address_card = in_vram;
     shadow.changes_only.store(true, Ordering::Relaxed);
-    shadow.card = Some(Card {
-        staging,
-        before: Mutex::default(),
-        dirty: Mutex::default(),
-        sent: Mutex::default(),
-        touched: Default::default(),
-        size: len,
-    });
+    shadow.card = card;
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    if shadow.card.is_some() {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    }
     Some(shadow)
+}
+
+/// An owned buffer for [`crate::memory`]'s directory and arenas. The caller
+/// writes to the staging mapping directly and marks the changed ranges for
+/// upload in submission order.
+pub(crate) fn by_address_owned(len: u64) -> Option<Arc<Shadow>> {
+    by_address(0, len)
 }
 
 /// Copies of title memory outside buffers, by (start, length).
