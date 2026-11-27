@@ -4,6 +4,7 @@ use anyxboxx_rdna2_ref::decode::{Instruction, decode};
 
 mod buffer_memory;
 mod control_flow;
+mod extensions;
 mod flat_atomic;
 mod flat_memory;
 pub mod graphics;
@@ -150,6 +151,14 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "VOP1" | "VOP2" | "VOPC" if matches!(word & 511, 0xe9 | 0xea | 0xf9 | 0xfa) => {
+            extensions::statement(
+                name,
+                family,
+                word,
+                second.ok_or_else(|| format!("{name}: missing extension word"))?,
+            )?
+        }
         "VOP2" | "VOP3" | "VOP3P" if packed_half::supports(name) => packed_half::statement(
             name,
             family,

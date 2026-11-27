@@ -50,9 +50,10 @@ def test_vop2_literal_and_lane_source(name, monkeypatch):
 
 
 @pytest.mark.parametrize("src", [0xe9, 0xea, 0xf9, 0xfa])
-def test_vop2_extensions_are_named(src):
-    result = rust(program(vop2("v_add_nc_u32", 1, src, 0), 0))
-    assert result.returncode != 0 and b"v_add_nc_u32" in result.stderr
+def test_add_extensions_match_python(src):
+    data = program(vop2("v_add_nc_u32", 1, src, 0), 0)
+    result = rust(data)
+    assert result.returncode == 0 and result.stdout.decode() == rdna2_hlsl.translate(data)
 
 
 def test_vop2_destination_can_alias_source(monkeypatch):

@@ -29,7 +29,7 @@ def test_vopc_integer_text_and_warp(name, value, mask, monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(8)) == struct.pack("<II", wave.s[106], wave.s[126])
 
 
-@pytest.mark.parametrize("src", [0xe9, 0xea, 0xf9, 0xfa])
+@pytest.mark.parametrize("src", [0xe9, 0xea, 0xfa])
 def test_unimplemented_vopc_extensions_are_named(src):
     result = rust(program(vopc("v_cmp_eq_u32", src, 0), 0))
     assert result.returncode != 0 and b"v_cmp_eq_u32" in result.stderr

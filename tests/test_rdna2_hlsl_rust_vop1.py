@@ -69,6 +69,7 @@ def test_readfirstlane_uses_first_active_lane(mask, monkeypatch):
 
 
 @pytest.mark.parametrize("src", [0xe9, 0xea, 0xf9, 0xfa])
-def test_untranslated_extension_is_named(src):
-    result = rust(program(vop1("v_mov_b32", 1, src), 0))
-    assert result.returncode != 0 and b"v_mov_b32" in result.stderr
+def test_move_extensions_match_python(src):
+    data = program(vop1("v_mov_b32", 1, src), 0)
+    result = rust(data)
+    assert result.returncode == 0 and result.stdout.decode() == rdna2_hlsl.translate(data)

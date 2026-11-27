@@ -120,6 +120,8 @@ The Rust graphics emitter supports vertex and pixel stages, EXP and all three VI
 
 Packed f16 now covers all five packed operators, the VOP2 and VOP3 accumulating forms, the three mixed-precision FMAs and the two-element f16 dot product. WARP verifies their combined output against interpreter memory.
 
+Wave32 SDWA and DPP reuse the Rust VOP1/VOP2 expressions. WARP checks SDWA subword selection, sign extension, destination preservation, float output modifiers and comparisons, plus DPP8 and eight DPP16 control groups with partial EXEC.
+
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.

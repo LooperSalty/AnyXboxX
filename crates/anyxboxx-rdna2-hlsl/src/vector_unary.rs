@@ -26,8 +26,13 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
     if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
         return Ok(None);
     }
-    let expr = match name {
-        "v_mov_b32" => a.clone(),
+    let expr = expression(name, &a)?;
+    Ok(Some(format!("if ({ACTIVE}) v[{d}] = {expr};")))
+}
+
+pub fn expression(name: &str, a: &str) -> Result<String, String> {
+    Ok(match name {
+        "v_mov_b32" => a.to_owned(),
         "v_not_b32" => format!("(~{a})"),
         "v_bfrev_b32" => format!("reversebits({a})"),
         "v_ffbl_b32" => format!("firstbitlow({a})"),
@@ -50,6 +55,5 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
         "v_frexp_exp_i32_f32" => format!("FrexpExpF32({a})"),
         "v_frexp_mant_f32" => format!("FrexpMantF32({a})"),
         _ => return Err(format!("untranslated instruction: {name}")),
-    };
-    Ok(Some(format!("if ({ACTIVE}) v[{d}] = {expr};")))
+    })
 }

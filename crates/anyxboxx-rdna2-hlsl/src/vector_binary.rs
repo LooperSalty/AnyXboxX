@@ -23,7 +23,14 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
             "{{ uint x = {a}, y = {b}, k = (s[106] >> lane) & 1u, r = 0u; bool o = false; if (((s[126] >> lane) & 1u) != 0) {{ r = {result}; o = {carry}; v[{d}] = r; }} s[106] = Ballot(lane, o); }}"
         ));
     }
-    let expression = match name {
+    let expression = expression(name, &a, &b, d)?;
+    Ok(format!(
+        "if (((s[126] >> lane) & 1u) != 0) v[{d}] = {expression};"
+    ))
+}
+
+pub fn expression(name: &str, a: &str, b: &str, d: u32) -> Result<String, String> {
+    Ok(match name {
         "v_add_f32" => format!("F32Add({a}, {b})"),
         "v_sub_f32" => format!("F32Sub({a}, {b})"),
         "v_subrev_f32" => format!("F32Sub({b}, {a})"),
@@ -56,8 +63,5 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
             format!("MulHiI32(asuint((asint({a}) << 8) >> 8), asuint((asint({b}) << 8) >> 8))")
         }
         _ => return Err(format!("untranslated instruction: {name}")),
-    };
-    Ok(format!(
-        "if (((s[126] >> lane) & 1u) != 0) v[{d}] = {expression};"
-    ))
+    })
 }

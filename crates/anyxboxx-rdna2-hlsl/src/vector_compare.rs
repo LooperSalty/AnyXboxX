@@ -12,18 +12,27 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
         source(code, literal).map_err(|e| format!("{name}: {e}"))?
     };
     let b = format!("v[{}]", (word >> 9) & 0xff);
+    let target = if name.starts_with("v_cmpx_") {
+        "s[126]"
+    } else {
+        "s[106]"
+    };
+    let condition = condition(name, code, &a, &b)?;
+    Ok(format!(
+        "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {target} = Ballot(lane, t); }}"
+    ))
+}
+
+pub fn condition(name: &str, code: u32, a: &str, b: &str) -> Result<String, String> {
     let (prefix, suffix) = name
         .rsplit_once('_')
         .ok_or_else(|| format!("untranslated instruction: {name}"))?;
-    let (op, target) = if let Some(op) = prefix.strip_prefix("v_cmpx_") {
-        (op, "s[126]")
-    } else if let Some(op) = prefix.strip_prefix("v_cmp_") {
-        (op, "s[106]")
-    } else {
-        return Err(format!("untranslated instruction: {name}"));
-    };
+    let op = prefix
+        .strip_prefix("v_cmpx_")
+        .or_else(|| prefix.strip_prefix("v_cmp_"))
+        .ok_or_else(|| format!("untranslated instruction: {name}"))?;
     if suffix == "f16" {
-        let ah = half_operand(code, &a);
+        let ah = half_operand(code, a);
         let bh = format!("({b} & 0xFFFFu)");
         let condition = if op == "class" {
             format!("((({bh}) >> ClassF16({ah})) & 1u) != 0u")
@@ -31,16 +40,12 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
             float_condition(op, &format!("F16ToF32({ah})"), &format!("F16ToF32({bh})"))
                 .ok_or_else(|| format!("untranslated instruction: {name}"))?
         };
-        return Ok(format!(
-            "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {target} = Ballot(lane, t); }}"
-        ));
+        return Ok(condition);
     }
     if suffix == "f32" {
-        let condition = float_condition(op, &a, &b)
-            .ok_or_else(|| format!("untranslated instruction: {name}"))?;
-        return Ok(format!(
-            "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {target} = Ballot(lane, t); }}"
-        ));
+        let condition =
+            float_condition(op, a, b).ok_or_else(|| format!("untranslated instruction: {name}"))?;
+        return Ok(condition);
     }
     if !matches!(suffix, "u32" | "i32" | "u16" | "i16") {
         return Err(format!("untranslated instruction: {name}"));
@@ -68,9 +73,7 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
             }
         }
     };
-    Ok(format!(
-        "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {target} = Ballot(lane, t); }}"
-    ))
+    Ok(condition)
 }
 
 fn float_condition(op: &str, a: &str, b: &str) -> Option<String> {

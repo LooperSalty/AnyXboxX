@@ -86,6 +86,11 @@ pub fn statements(name: &str, inst: &Instruction, bytes: &[u8]) -> Result<Vec<St
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let pair = first as u64 | ((next.unwrap_or(0) as u64) << 32);
     let family = inst.family;
+    if family == "VOPC" && matches!(first & 511, 0xe9 | 0xea | 0xf9 | 0xfa) {
+        return Err(format!(
+            "{name}: wave64 lane exchange in an extended comparison"
+        ));
+    }
     if matches!(family, "VOP3" | "VOP1" | "VOP2") {
         let literal = if family == "VOP3" {
             bytes

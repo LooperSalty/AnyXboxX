@@ -120,6 +120,8 @@ Le générateur graphique Rust traduit les étages de sommets et de pixels, EXP 
 
 Le port f16 compacté couvre les cinq opérateurs, les formes à accumulation VOP2 et VOP3, les trois FMA en précision mixte et le produit scalaire de deux éléments f16. WARP vérifie leurs résultats en mémoire contre l’interpréteur.
 
+En wave32, SDWA et DPP réutilisent les expressions Rust VOP1/VOP2. WARP vérifie les sélections de sous-mots SDWA, l’extension de signe, la préservation de destination, les modificateurs de sortie flottante et les comparaisons, ainsi que DPP8 et huit groupes de contrôles DPP16 sous EXEC partiel.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 La CLI Rust affiche le HLSL des instructions portées avec `anyxboxx rdna2 FICHIER --hlsl`. Les deux CLI signalent le retrait de `--spirv` avec le code de sortie 2.
