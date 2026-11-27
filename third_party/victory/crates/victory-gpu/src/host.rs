@@ -5607,12 +5607,6 @@ impl Host {
         land();
     }
 
-    /// Sends `list`, a closed list of ours (the present's copy), as a
-    /// flight ([`late_free_present`]): not waited for, settled with the
-    /// others. The caller keeps the list and does not reset it before the
-    /// submission whose number comes back has finished ([`FINISHED`]); 0 if
-    /// it ran and was waited for after all. The second value is the queue
-    /// fence covering the list in either case.
     #[cfg(test)]
     pub(crate) fn run_test_list_sync(&self, list: &HostList) {
         let _ = self.submit(&[list], &[], false);
@@ -5637,6 +5631,12 @@ impl Host {
         }
     }
 
+    /// Sends `list`, a closed list of ours (the present's copy), as a
+    /// flight ([`late_free_present`]): not waited for, settled with the
+    /// others. The caller keeps the list and does not reset it before the
+    /// submission whose number comes back has finished ([`FINISHED`]); 0 if
+    /// it ran and was waited for after all. The second value is the queue
+    /// fence covering the list in either case.
     fn execute_own(&self, list: &HostList) -> (u64, u64) {
         late_threads();
         let Submission { fence, ahead: flight } = self.submit(&[list], &[], true);

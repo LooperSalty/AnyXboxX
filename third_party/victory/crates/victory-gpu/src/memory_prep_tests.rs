@@ -607,6 +607,68 @@ fn synthetic_bvh_prep_fast_path_tlas_replace_and_sweep_on_gpu() {
     assert_eq!(out[0], [bvh::NONE; 4], "swept-removed packed box must miss on GPU");
     assert_eq!(out[1], bvh::MISS.map(f32::to_bits), "swept-removed packed tri must miss on GPU");
 
+    // 4b. Decommit-without-write test: `VirtualFree(..., MEM_DECOMMIT)` on a
+    //     write-watched `VirtualAlloc2` region keeps the reservation intact
+    //     without dirtying the page in `GetWriteWatch`. Verify `look_again()`
+    //     still calls `there()` (`committed()`) and reclaims the decommitted
+    //     packed BVH so GPU tracing misses cleanly.
+    let decommit_addr = region_a.base + (512 << 10);
+    write_packed_bvh(decommit_addr, 1023, &box_p1, &tri_p1);
+    write_ray_record(rec_ptr, 0, (decommit_addr + 64) as u64, 5, &ray);
+    crate::frame::test_advance();
+    {
+        let list = host.new_list().expect("list decommit prime");
+        let r = ready(&list, &heap, &[decommit_addr as u64], &[], &[], Use::Builds { back: false }, None).unwrap();
+        pipe.dispatch(&list, &heap, &r, 0);
+        list.close();
+        host.run_test_list_sync(&list);
+        assert_eq!(read_results(res_ptr, 1)[0], bvh::intersect(&box_p1, 5, &ray, true), "decommit prime hit mismatch");
+    }
+    // Advance one clean frame so `Packed::checked` is populated, then decommit
+    // the page WITHOUT writing to it!
+    crate::frame::test_advance();
+    {
+        let list = host.new_list().expect("list decommit steady");
+        let _ = ready(&list, &heap, &[decommit_addr as u64], &[], &[], Use::Builds { back: false }, None).unwrap();
+        list.close();
+        host.run_test_list_sync(&list);
+    }
+    {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        // SAFETY: `decommit_addr` is page-aligned inside `region_a` (`VirtualAlloc2`).
+        let ok = unsafe { VirtualFree(decommit_addr as *mut _, PAGE as usize, MEM_DECOMMIT) };
+        assert_ne!(ok, 0, "VirtualFree(MEM_DECOMMIT) must succeed");
+    }
+    let mut decommitted_reclaimed = false;
+    for _ in 0..=SWEEP {
+        crate::frame::test_advance();
+        let list = host.new_list().expect("list decommit sweep");
+        let _ = ready(&list, &heap, &[], &[], &[], Use::Reads, None).unwrap();
+        list.close();
+        let still_tracked = MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|m| m.packed.contains_key(&(decommit_addr as u64)));
+        if !still_tracked {
+            decommitted_reclaimed = true;
+            break;
+        }
+    }
+    assert!(
+        decommitted_reclaimed,
+        "look_again() must detect a packed BVH page decommitted without a CPU write"
+    );
+    crate::frame::test_advance();
+    {
+        let list = host.new_list().expect("list after decommit");
+        let r = ready(&list, &heap, &[], &[], &[], Use::Reads, None).unwrap();
+        pipe.dispatch(&list, &heap, &r, 0);
+        list.close();
+        host.run_test_list_sync(&list);
+        assert_eq!(read_results(res_ptr, 1)[0], [bvh::NONE; 4], "decommitted packed BVH must miss on GPU");
+    }
+
     // 5. Regression checks for batched `defer_host` and coalesced write-watch:
     //    a multi-address builder dispatch must emit ONE batched `Step::Host`
     //    instead of one per address, and a sustained frame must coalesce

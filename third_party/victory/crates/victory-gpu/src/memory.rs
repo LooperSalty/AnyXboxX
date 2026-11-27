@@ -198,7 +198,6 @@ struct Memory {
     /// Reusable scratch buffers for coalesced write-watch queries.
     scratch_pages: Vec<u64>,
     scratch_watch: Vec<(u64, Option<(u64, u64)>)>,
-    scratch_packed: Vec<u64>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -280,7 +279,6 @@ impl Memory {
             refused: Default::default(),
             scratch_pages: Vec::new(),
             scratch_watch: Vec::new(),
-            scratch_packed: Vec::new(),
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -314,6 +312,12 @@ impl Memory {
         if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
             return false;
         }
+        // Pages already mapped in the directory (matching `map()`'s early
+        // return) skip redundant `VirtualQuery` + `GetWriteWatch` revalidation
+        // during dispatch recording: `bring_pages()` reads via SEH-safe
+        // `copy_mapped`, `land()` validates `committed()` on any dirty/unknown
+        // header, and `look_again()` still calls `there()` (which checks
+        // `committed()`) so pages decommitted without a write are reclaimed.
         if self.copy_of(page).is_some() {
             return true;
         }
@@ -484,8 +488,11 @@ impl Memory {
         }
         self.scratch_pages = self.bring_pages(pages);
 
-        let mut packed_addrs = std::mem::take(&mut self.scratch_packed);
-        packed_addrs.clear();
+        // Keep `there()` (`VirtualQuery` + header check) on the slow `SWEEP`
+        // cadence (~1/128 packed entries per frame) so a packed page
+        // decommitted with `VirtualFree(..., MEM_DECOMMIT)` without any CPU
+        // write (which `GetWriteWatch` does not report as dirty on a still-
+        // reserved `MEM_WRITE_WATCH` VAD) is still detected and reclaimed.
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
@@ -494,45 +501,10 @@ impl Memory {
                 if self.packed_order.is_empty() {
                     break;
                 }
-            } else {
-                packed_addrs.push(address);
+            } else if !self.there(address) {
+                self.gone(address);
             }
         }
-        if !packed_addrs.is_empty() {
-            let mut header_pages = std::mem::take(&mut self.scratch_pages);
-            header_pages.clear();
-            header_pages.extend(packed_addrs.iter().map(|&a| a / PAGE));
-            header_pages.sort_unstable();
-            header_pages.dedup();
-            let mut watch = std::mem::take(&mut self.scratch_watch);
-            query_page_writes(&header_pages, &mut watch);
-            header_pages.clear();
-            self.scratch_pages = header_pages;
-
-            for &address in &packed_addrs {
-                let page = address / PAGE;
-                let answer = lookup_watch(&watch, page);
-                if let Some((now, wrote)) = answer
-                    && let Some(known) = self.packed.get_mut(&address)
-                    && known.checked != 0
-                    && wrote <= known.checked
-                {
-                    known.checked = now;
-                    continue;
-                }
-                if !self.there(address) {
-                    self.gone(address);
-                } else if let Some((now, _)) = answer
-                    && let Some(known) = self.packed.get_mut(&address)
-                {
-                    known.checked = now;
-                }
-            }
-            watch.clear();
-            self.scratch_watch = watch;
-        }
-        packed_addrs.clear();
-        self.scratch_packed = packed_addrs;
     }
 
     /// A dispatch of the builder was given `address` to write: if it is in a
@@ -1294,6 +1266,15 @@ pub(crate) fn ready(
         }
     }
     m.scratch_pages = m.bring_pages(pending);
+    // Ordering invariant: all `addresses` in this `ready()` call belong to the
+    // same dispatch, so no GPU command runs between them. `land_batch` runs
+    // `land()` in recorded `addresses` order for all non-buffer addresses and
+    // is followed immediately by `bring_up(list)` so `directory` + all `copies`
+    // are refreshed before the dispatch. `m.small()` inside the loop only
+    // touches non-arena title-buffer copies (`!pages.contains_key`), disjoint
+    // from the arena pages written by `land_batch`. Across separate dispatches
+    // or copies on the same list, each `ready()` queues its own `defer_host` +
+    // `bring_up` in exact recorded order.
     if !land_addrs.is_empty() {
         list.defer_host(move || {
             if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -1301,6 +1282,12 @@ pub(crate) fn ready(
             }
         });
         m.bring_up(list);
+        // `m.copies` is held behind `MEMORY` and cannot grow between here and
+        // the `first_use` check below (all `map`/`another`/`opens`/`small`
+        // calls finished in the loop above). Recording the same key avoids a
+        // duplicate `bring_up(list)` for the same `m.copies.len()` on this
+        // dispatch while still firing `bring_up` if a later `ready()` on this
+        // list allocates another copy.
         let _ = list.first_use(usize::MAX - (6 << 33) - m.copies.len());
     }
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
