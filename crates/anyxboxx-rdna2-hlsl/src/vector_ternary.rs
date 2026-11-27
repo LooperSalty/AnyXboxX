@@ -2,7 +2,12 @@
 use crate::scalar::source;
 use anyxboxx_rdna2_ref::vop3::Fields;
 
-pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, String> {
+pub fn statement(
+    name: &str,
+    word: u64,
+    literal: Option<u32>,
+    m0: Option<u32>,
+) -> Result<String, String> {
     let f = Fields::new(word);
     if crate::vector_movrel::supports(name) {
         if f.abs | f.neg | f.omod != 0 || f.clamp {
@@ -14,7 +19,7 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         } else {
             source(code, literal).map_err(|e| format!("{name}: {e}"))?
         };
-        return crate::vector_movrel::statement(name, f.vdst, code, &operand);
+        return crate::vector_movrel::statement(name, f.vdst, code, &operand, m0);
     }
     if matches!(
         name,
@@ -49,6 +54,12 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
             }
             _ => format!("if (lane == ({b} & 31u)) v[{}] = {a};", f.vdst),
         });
+    }
+    if let Some(value) = crate::unary_constant::fold(name, f.sources[0], literal, Some(&f))? {
+        return Ok(format!(
+            "if (((s[126] >> lane) & 1u) != 0) v[{}] = {value};",
+            f.vdst
+        ));
     }
     let integer_result = matches!(
         name,
@@ -150,6 +161,13 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         },
     };
     if is_float && (f.clamp || f.omod != 0) {
+        if let Some(value) = crate::vector_unary::scaled(name, &expression, f.omod, f.clamp, false)
+        {
+            return Ok(format!(
+                "if (((s[126] >> lane) & 1u) != 0) v[{}] = {value};",
+                f.vdst
+            ));
+        }
         let scale = match f.omod {
             1 => "2.0f",
             2 => "4.0f",

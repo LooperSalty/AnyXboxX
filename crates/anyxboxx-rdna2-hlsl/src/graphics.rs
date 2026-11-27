@@ -201,15 +201,16 @@ pub fn translate(
         data,
         &instructions,
         32,
+        sgprs.get(&124).copied().unwrap_or(0),
         finish,
         &mut out,
-        |name, inst, bytes| match inst.family {
+        |name, inst, bytes, m0| match inst.family {
             "EXP" => export_value(stage, pair(bytes)),
             "VINTRP" if matches!(stage, Stage::Pixel { .. }) => {
                 interpolate(name, u32::from_le_bytes(bytes[..4].try_into().unwrap()))
             }
             "DS" | "VINTRP" => Err(format!("{name}: not supported in this shader stage")),
-            _ => super::statements(name, inst, bytes),
+            _ => super::statements(name, inst, bytes, m0),
         },
     )?;
     writeln!(out, "  {finish}\n}}").unwrap();

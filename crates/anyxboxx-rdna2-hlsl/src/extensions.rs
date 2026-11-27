@@ -156,7 +156,11 @@ pub fn statement(name: &str, family: &str, word: u32, ext: u32) -> Result<String
         let mut value = expr(&a, &b)?;
         let omod = (ext >> 14) & 3;
         let clamp = ext & (1 << 13) != 0;
-        if clamp || omod != 0 {
+        if let Some(scaled) =
+            vector_unary::scaled(name, &value, omod, clamp, true).filter(|_| clamp || omod != 0)
+        {
+            value = scaled;
+        } else if clamp || omod != 0 {
             if !dst_float {
                 return Err(format!("{name}: integer SDWA clamp or omod"));
             }

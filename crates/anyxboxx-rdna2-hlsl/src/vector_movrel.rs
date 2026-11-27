@@ -1,55 +1,37 @@
-//! VOP1 moves and swaps indexed by M0, as emitted by the Python reference.
+//! Resolve indexed vector moves before emitting register accesses.
+pub use anyxboxx_rdna2_ref::movrel::is_vector as supports;
+use anyxboxx_rdna2_ref::movrel::{check, offsets};
 
 const ACTIVE: &str = "((s[126] >> lane) & 1u) != 0";
 
-pub fn supports(name: &str) -> bool {
-    matches!(
-        name,
-        "v_movrels_b32"
-            | "v_movreld_b32"
-            | "v_movrelsd_b32"
-            | "v_movrelsd_2_b32"
-            | "v_swap_b32"
-            | "v_swaprel_b32"
-    )
-}
-
-pub fn statement(name: &str, dest: u32, src: u32, operand: &str) -> Result<String, String> {
-    let dest_offset = match name {
-        "v_movreld_b32" | "v_movrelsd_b32" => Some("s[124]"),
-        "v_movrelsd_2_b32" | "v_swaprel_b32" => Some("((s[124] >> 16) & 0x3FFu)"),
-        _ => None,
-    };
-    let j = index(dest, dest_offset);
-    if name == "v_movreld_b32" {
-        return Ok(format!(
-            "if ({ACTIVE}) {{ uint x = {operand}, j = {j}; if (j < 256u) v[j] = x; }}"
-        ));
-    }
-    if src < 256 {
-        return Err(format!(
-            "untranslated instruction: {name}: indexed source must be a VGPR"
-        ));
-    }
-    let src_offset = match name {
-        "v_movrels_b32" | "v_movrelsd_b32" => Some("s[124]"),
-        "v_movrelsd_2_b32" | "v_swaprel_b32" => Some("(s[124] & 0x3FFu)"),
-        _ => None,
-    };
-    let i = index(src - 256, src_offset);
-    let writes = if matches!(name, "v_swap_b32" | "v_swaprel_b32") {
-        "if (i < 256u && j < 256u) { v[i] = v[j]; v[j] = x; }"
+pub fn statement(
+    name: &str,
+    dest: u32,
+    src: u32,
+    operand: &str,
+    m0: Option<u32>,
+) -> Result<String, String> {
+    let m0 = if name == "v_swap_b32" {
+        0
     } else {
-        "if (j < 256u) v[j] = x;"
+        crate::m0::known(name, m0)?
     };
-    Ok(format!(
-        "if ({ACTIVE}) {{ uint i = {i}, j = {j}; uint x = i < 256u ? v[i] : 0u; {writes} }}"
-    ))
-}
-
-fn index(register: u32, offset: Option<&str>) -> String {
-    offset.map_or_else(
-        || format!("{register}u"),
-        |offset| format!("({register}u + {offset})"),
-    )
+    let (src_offset, dst_offset) = offsets(name, m0);
+    let dest = check(name, dest, dst_offset, 255, 1)
+        .map_err(|e| format!("untranslated instruction: {e}"))?;
+    if name == "v_movreld_b32" {
+        return Ok(format!("if ({ACTIVE}) v[{dest}] = {operand};"));
+    }
+    let src = src
+        .checked_sub(256)
+        .ok_or_else(|| format!("{name}: indexed source must be a VGPR"))?;
+    let src = check(name, src, src_offset, 255, 1)
+        .map_err(|e| format!("untranslated instruction: {e}"))?;
+    if matches!(name, "v_swap_b32" | "v_swaprel_b32") {
+        Ok(format!(
+            "if ({ACTIVE}) {{ uint x = v[{src}]; v[{src}] = v[{dest}]; v[{dest}] = x; }}"
+        ))
+    } else {
+        Ok(format!("if ({ACTIVE}) v[{dest}] = v[{src}];"))
+    }
 }

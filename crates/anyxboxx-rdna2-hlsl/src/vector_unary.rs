@@ -4,7 +4,12 @@ use crate::vector_movrel;
 
 const ACTIVE: &str = "((s[126] >> lane) & 1u) != 0";
 
-pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<String>, String> {
+pub fn statement(
+    name: &str,
+    word: u32,
+    literal: Option<u32>,
+    m0: Option<u32>,
+) -> Result<Option<String>, String> {
     let code = word & 0x1ff;
     if matches!(code, 0xe9 | 0xea | 0xf9 | 0xfa) {
         return Err(format!("untranslated instruction: {name} with SDWA or DPP"));
@@ -16,7 +21,7 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
     };
     let d = (word >> 17) & 0xff;
     if vector_movrel::supports(name) {
-        return vector_movrel::statement(name, d, code, &a).map(Some);
+        return vector_movrel::statement(name, d, code, &a, m0).map(Some);
     }
     if name == "v_readfirstlane_b32" {
         return Ok(Some(format!(
@@ -26,12 +31,29 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
     if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
         return Ok(None);
     }
-    let expr = expression(name, &a)?;
+    let expr = match crate::unary_constant::fold(name, code, literal, None)? {
+        Some(value) => value,
+        None => expression(name, &a)?,
+    };
     Ok(Some(format!("if ({ACTIVE}) v[{d}] = {expr};")))
+}
+
+pub fn scaled(name: &str, value: &str, omod: u32, clamp: bool, sdwa: bool) -> Option<String> {
+    if !matches!(
+        name,
+        "v_rcp_f32" | "v_rcp_iflag_f32" | "v_rsq_f32" | "v_sqrt_f32"
+    ) {
+        return None;
+    }
+    let scale = ["1.0", "2.0", "4.0", "0.5"][omod as usize];
+    Some(format!("UnaryOutputF32({value}, {scale}, {clamp}, {sdwa})"))
 }
 
 pub fn expression(name: &str, a: &str) -> Result<String, String> {
     Ok(match name {
+        "v_rcp_f32" | "v_rcp_iflag_f32" => format!("ReciprocalF32({a})"),
+        "v_rsq_f32" => format!("RsqrtF32({a})"),
+        "v_sqrt_f32" => format!("SqrtF32({a})"),
         "v_rndne_f32" => format!("RndneF32({a})"),
         "v_mov_b32" => a.to_owned(),
         "v_not_b32" => format!("(~{a})"),

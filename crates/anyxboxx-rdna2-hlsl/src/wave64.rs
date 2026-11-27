@@ -79,7 +79,12 @@ fn lane_statement(
     }))
 }
 
-pub fn statements(name: &str, inst: &Instruction, bytes: &[u8]) -> Result<Vec<String>, String> {
+pub fn statements(
+    name: &str,
+    inst: &Instruction,
+    bytes: &[u8],
+    m0: Option<u32>,
+) -> Result<Vec<String>, String> {
     let first = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let next = bytes
         .get(4..8)
@@ -130,7 +135,7 @@ pub fn statements(name: &str, inst: &Instruction, bytes: &[u8]) -> Result<Vec<St
             "{{ uint value = ReadLane64(lane, v[{data}], (lane & 32u) | (((v[{addr}] + {offset}u) >> 2) & 31u)); if (LANE_ON) v[{d}] = value; }}"
         )]);
     }
-    let mut lines = super::statements(name, inst, bytes)?;
+    let mut lines = super::statements(name, inst, bytes, m0)?;
     for line in &mut lines {
         *line = line.replace("((s[126] >> lane) & 1u) != 0", "LANE_ON");
         if family == "VOPC" {

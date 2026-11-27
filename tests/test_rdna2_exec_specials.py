@@ -59,7 +59,9 @@ def specials_program():
              ("v_cvt_i32_f32", float_bits(2.0 ** 31)), ("v_cvt_u32_f32", float_bits(5e9)),
              ("v_cvt_u32_f32", float_bits(-1.5)), ("v_cvt_i32_f32", float_bits(-1.5))]
     for slot, (name, value) in enumerate(cases):
-        words += [vop1("v_mov_b32", 1, LITERAL), value, vop1(name, 2, V + 1), *store_lane(2, slot)]
+        op = ([vop1(name, 2, LITERAL), value] if name == "v_exp_f32" else
+              [vop1("v_mov_b32", 1, LITERAL), value, vop1(name, 2, V + 1)])
+        words += [*op, *store_lane(2, slot)]
     words += [vop1("v_mov_b32", 1, LITERAL), MAX, *vop3("v_ldexp_f32", 2, V + 1, 128 + 10), *store_lane(2, len(cases))]
     return with_lane_offset(*words)
 

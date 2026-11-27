@@ -3,7 +3,7 @@ forms for VOP1, VOP2, and VOPC instructions (#21).
 """
 from emu.rdna2_exec_ext import operand_float_flags
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS
-from emu.rdna2_hlsl_ops import VECTOR, Untranslatable, compare_condition, is_compare, scalar_target, source
+from emu.rdna2_hlsl_ops import EXACT_UNARY, VECTOR, unary_output, Untranslatable, compare_condition, is_compare, scalar_target, source
 from emu.rdna2_operands_ext import BOUND_CTRL_BIT, CLAMP_BIT, DPP8, DPP8_FI, DPP16, FI_BIT, OMOD_SHIFT, SDWA
 
 EXT_CODES = frozenset({SDWA, DPP16, DPP8, DPP8_FI})
@@ -91,7 +91,9 @@ def _hlsl_sdwa(family, name, fields, ext, active):
     omod, clamp = (ext >> OMOD_SHIFT) & 3, (ext >> CLAMP_BIT) & 1
     if not dst_is_float and (clamp or omod):
         raise Untranslatable(f"SDWA clamp/omod not supported on an integer result: {name}")
-    if dst_is_float and (omod or clamp):
+    if name in EXACT_UNARY and (omod or clamp):
+        expr = unary_output(expr, omod, clamp, sdwa=True)
+    elif dst_is_float and (omod or clamp):
         scaled = f"asfloat({expr}) * {_OUTPUT_SCALE.get(omod, '1.0f')}"
         expr = f"asuint({'saturate(' + scaled + ')' if clamp else scaled})"
     dst_sel, dst_unused = (ext >> 8) & 7, (ext >> 11) & 3

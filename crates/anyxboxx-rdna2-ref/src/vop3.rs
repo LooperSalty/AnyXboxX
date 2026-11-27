@@ -323,7 +323,7 @@ fn compute(name: &str, a: u32, b: u32, c: u32) -> Option<u64> {
 }
 
 /// The output of one lane: clamp and omod on the float results, a 32-bit mask otherwise.
-fn output(fields: &Fields, value: u64, is_float: bool) -> u32 {
+pub fn output(fields: &Fields, value: u64, is_float: bool) -> u32 {
     if !is_float || !(fields.clamp || fields.omod != 0) {
         return (value & MASK32) as u32;
     }

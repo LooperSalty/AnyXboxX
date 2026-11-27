@@ -21,13 +21,21 @@ fn condition(name: &str, lanes: usize) -> Option<&'static str> {
     })
 }
 
+pub(crate) type Operation<'a> = (
+    &'a Instruction,
+    &'a [u8],
+    &'static str,
+    Option<(&'static str, i64)>,
+);
+
 pub fn emit(
     data: &[u8],
     instructions: &[Instruction],
     lanes: usize,
+    initial_m0: u32,
     finish: &str,
     output: &mut String,
-    statements: impl Fn(&str, &Instruction, &[u8]) -> Result<Vec<String>, String>,
+    statements: impl Fn(&str, &Instruction, &[u8], Option<u32>) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     let mut leaders = BTreeSet::from([0]);
     let mut blocks = Vec::with_capacity(instructions.len());
@@ -67,6 +75,7 @@ pub fn emit(
     if has_flow {
         output.push_str("  uint pc = 0;\n  [loop] while (pc != END_PC) {\n");
     }
+    let indices = crate::m0::incoming(&blocks, initial_m0);
     for (inst, bytes, name, branch) in blocks {
         if has_flow && leaders.contains(&inst.offset) {
             if inst.offset > 0 {
@@ -84,7 +93,12 @@ pub fn emit(
             let lines = if name == "s_endpgm" {
                 vec![finish.to_owned()]
             } else {
-                statements(name, inst, bytes)?
+                statements(
+                    name,
+                    inst,
+                    bytes,
+                    indices.get(&inst.offset).copied().flatten(),
+                )?
             };
             for line in lines {
                 writeln!(output, "{indent}{line}").unwrap();

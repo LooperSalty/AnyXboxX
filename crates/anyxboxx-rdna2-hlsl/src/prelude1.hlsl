@@ -16,6 +16,94 @@
   if (e > 127) return s | 0x7F800000u;
   return s | (uint(e + 127) << 23) | (kept & 0x7FFFFFu);
 }
+// Normalize a finite nonzero magnitude to a 24-bit significand and unbiased exponent.
+uint NormalizedF32(uint magnitude, out int exponent) {
+  uint fraction = magnitude & 0x7FFFFFu;
+  exponent = int(magnitude >> 23) - 127;
+  if (exponent != -127) return fraction | 0x800000u;
+  uint shift = 23u - firstbithigh(fraction);
+  exponent = -126 - int(shift);
+  return fraction << shift;
+}
+uint ReciprocalF32(uint a) {
+  uint sign = a & 0x80000000u, mag = a & 0x7FFFFFFFu;
+  if (mag > 0x7F800000u) return a | 0x400000u;
+  if (mag == 0u) return sign | 0x7F800000u;
+  if (mag == 0x7F800000u) return sign;
+  int e;
+  uint m = NormalizedF32(mag, e);
+  int power = -e - 1;
+  if (power > 127) return sign | 0x7F800000u;
+  // Long division at the final precision (including subnormal results).
+  uint q = 0x800000u / m, rem = 0x800000u % m;
+  for (int i = 0; i < 24 + min(power + 126, 0); ++i) {
+    rem <<= 1;
+    q = (q << 1) + (rem >= m ? 1u : 0u);
+    if (rem >= m) rem -= m;
+  }
+  if (2u * rem > m || (2u * rem == m && (q & 1u) != 0u)) ++q;
+  return sign | ((uint(max(power + 126, 0)) << 23) + q);
+}
+uint SqrtF32(uint a) {
+  uint mag = a & 0x7FFFFFFFu;
+  if (mag > 0x7F800000u) return a | 0x400000u;
+  if (mag == 0u || a == 0x7F800000u) return a;
+  if (a != mag) return 0x7FC00000u;
+  int e;
+  uint m = NormalizedF32(mag, e);
+  // Consume 24 pairs of bits of m << (23 + (e & 1)), most significant first.
+  uint pairs = m << (7 + (e & 1)), root = 0u, rem = 0u;
+  for (int i = 0; i < 24; ++i) {
+    rem = (rem << 2) | (pairs >> 30);
+    pairs <<= 2;
+    uint trial = (root << 2) + 1u;
+    root <<= 1;
+    if (rem >= trial) { rem -= trial; ++root; }
+  }
+  if (rem > root) ++root;
+  return (uint((e >> 1) + 126) << 23) + root;
+}
+uint RsqrtF32(uint a) {
+  uint mag = a & 0x7FFFFFFFu;
+  if (mag > 0x7F800000u) return a | 0x400000u;
+  if (mag == 0u) return a | 0x7F800000u;
+  if (a != mag) return 0x7FC00000u;
+  if (mag == 0x7F800000u) return 0u;
+  int e;
+  uint m = NormalizedF32(mag, e);
+  // The interpreter rounds sqrt and then its reciprocal in binary64 before packing f32.
+  uint pairs = m << (7 + (e & 1));
+  uint64_t root = 0, rem = 0;
+  for (int i = 0; i < 53; ++i) {
+    rem = (rem << 2) | (pairs >> 30);
+    pairs <<= 2;
+    uint64_t trial = (root << 2) + 1;
+    root <<= 1;
+    if (rem >= trial) { rem -= trial; ++root; }
+  }
+  if (rem > root) ++root;
+  uint64_t one = uint64_t(1) << 52;
+  uint64_t q = root == one ? 1 : 0;
+  rem = root == one ? 0 : one;
+  for (int bit = 0; bit < 53; ++bit) {
+    rem <<= 1;
+    q = (q << 1) + (rem >= root ? 1 : 0);
+    if (rem >= root) rem -= root;
+  }
+  if (2 * rem > root || (2 * rem == root && (q & 1) != 0)) ++q;
+  uint kept = uint(q >> 29), tail = uint(q) & 0x1FFFFFFFu;
+  if (tail > 0x10000000u || (tail == 0x10000000u && (kept & 1u) != 0u)) ++kept;
+  return (uint(125 - (e >> 1)) << 23) + kept;
+}
+uint UnaryOutputF32(uint a, double scale, bool clampResult, bool sdwa) {
+  uint mag = a & 0x7FFFFFFFu;
+  if (mag > 0x7F800000u) return sdwa && clampResult ? 0u : a;
+  if (clampResult && (a >> 31) != 0u && (mag != 0u || sdwa)) return 0u;
+  if (mag == 0u) return a;
+  if (mag == 0x7F800000u) return clampResult ? 0x3F800000u : a;
+  double value = F32ToF64(a) * scale;
+  return clampResult && value >= 1.0 ? 0x3F800000u : F64ToF32(value);
+}
 bool EqF32(uint a, uint b) {
   return !IsNanF32(a) && !IsNanF32(b) && (a == b || ((a | b) & 0x7FFFFFFFu) == 0u);
 }

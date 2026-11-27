@@ -104,9 +104,9 @@ def movrel_program():
     return with_lane_offset(*ops, *stores)
 
 
-def test_hlsl_indexes_register_arrays():
+def test_hlsl_resolves_indexed_registers():
     hlsl = rdna2_hlsl.translate(movrel_program())
-    assert "v[i]" in hlsl and "s[j] = x;" in hlsl and "(s[124] & 0x3FFu)" in hlsl
+    assert "v[45] = v[12];" in hlsl and "s[74] = s[13];" in hlsl
 
 
 @gpu

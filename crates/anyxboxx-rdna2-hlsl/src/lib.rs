@@ -17,6 +17,7 @@ mod int16;
 mod int16_templates;
 mod lds;
 mod lds_lanes;
+mod m0;
 mod memory_load;
 mod packed_half;
 mod sad;
@@ -29,6 +30,7 @@ mod scalar_memory;
 mod scalar_movrel;
 mod scalar_wide;
 mod typed_buffer;
+mod unary_constant;
 mod vector_binary;
 mod vector_compare;
 mod vector_dot;
@@ -73,6 +75,7 @@ pub fn translate_wave(data: &[u8], lanes: usize) -> Result<String, String> {
         data,
         &decode(data),
         lanes,
+        0,
         "return;",
         &mut output,
         if lanes == 64 {
@@ -85,7 +88,12 @@ pub fn translate_wave(data: &[u8], lanes: usize) -> Result<String, String> {
     Ok(output)
 }
 
-fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec<String>, String> {
+fn statements(
+    name: &str,
+    instruction: &Instruction,
+    bytes: &[u8],
+    m0: Option<u32>,
+) -> Result<Vec<String>, String> {
     let word = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let second = bytes
         .get(4..8)
@@ -191,11 +199,11 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         "DS" => return lds::statements(name, pair),
         "SMEM" => return scalar_memory::statements(name, pair),
         "VOP3P" => vector_dot::statement(name, pair, literal)?,
-        "VOP3" => vector_ternary::statement(name, pair, literal)?,
+        "VOP3" => vector_ternary::statement(name, pair, literal, m0)?,
         "VOPC" => vector_compare::statement(name, word, second)?,
         "VOP2" => vector_binary::statement(name, word, second)?,
         "VOP1" => {
-            return Ok(vector_unary::statement(name, word, second)?
+            return Ok(vector_unary::statement(name, word, second, m0)?
                 .into_iter()
                 .collect());
         }
@@ -205,7 +213,7 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
                 .collect());
         }
         "SOP1" if scalar_movrel::supports(name) => {
-            return Ok(scalar_movrel::statement(name, word, second)?
+            return Ok(scalar_movrel::statement(name, word, second, m0)?
                 .into_iter()
                 .collect());
         }

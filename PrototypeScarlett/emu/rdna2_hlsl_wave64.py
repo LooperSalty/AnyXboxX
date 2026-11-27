@@ -220,13 +220,13 @@ def _specific(data, instruction, name):
     return None
 
 
-def statements(data, instruction, finish="return;", special=None):
+def statements(data, instruction, finish="return;", special=None, m0=None):
     """Instructions HLSL d'une instruction RDNA 2 d'un programme wave64 (hors branchements)."""
     name = rdna2.mnemonic(instruction.family, instruction.opcode) or f"{instruction.family}#{instruction.opcode}"
     lines = _specific(data, instruction, name)
     if lines is not None:
         return lines
-    lines = rdna2_hlsl.statements(data, instruction, finish, special, active=ACTIVE)
+    lines = rdna2_hlsl.statements(data, instruction, finish, special, active=ACTIVE, m0=m0)
     if instruction.family not in SCALAR_FAMILIES and any(WAVE32_ONLY.search(line) for line in lines):
         raise Untranslatable(f"non traduite en HLSL (wave64) : {name} ({instruction.family})")
     return lines
