@@ -1464,6 +1464,240 @@ void raise(uint3 at : SV_DispatchThreadID) {
         );
     }
 
+    /// Compares the parallel 64-thread `mean` reduction (`groupshared float3 mean_acc[64]`)
+    /// directly against `LEGACY_MEAN_RAISE_HLSL`'s single-thread sequential loop on
+    /// non-uniform high-dynamic-range cells across cold-start, multi-frame temporal
+    /// follow, and room-jump transitions within a stated tolerance (`1e-5` relative/abs).
+    #[test]
+    fn parallel_mean_matches_legacy_within_tolerance() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+            IDXGIAdapter1, IDXGIFactory4,
+        };
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::{Interface, PCSTR};
+
+        const TOLERANCE: f32 = 1e-5;
+        let force_warp = std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|v| v == "1");
+        let Some(device) = (|| -> Option<ID3D12Device> {
+            unsafe {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                if !force_warp {
+                    for i in 0.. {
+                        let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+                        let Ok(desc) = adapter.GetDesc1() else { continue };
+                        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                            continue;
+                        }
+                        let mut dev: Option<ID3D12Device> = None;
+                        if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok()
+                            && let Some(d) = dev
+                        {
+                            return Some(d);
+                        }
+                    }
+                }
+                let warp: IDXGIAdapter1 = factory.EnumWarpAdapter().ok()?;
+                let mut dev: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut dev).ok()?;
+                dev
+            }
+        })() else {
+            return;
+        };
+
+        let make_buf = |bytes: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+            let mut res: Option<ID3D12Resource> = None;
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes.max(256),
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_UNKNOWN,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut res,
+                    )
+                    .unwrap();
+            }
+            res.unwrap()
+        };
+        let make_mean = |src: &str, def: &str, entry: PCSTR| -> (ID3D12RootSignature, ID3D12PipelineState) {
+            let code = crate::host::compile(&format!("#define {def}\n{src}"), entry, s!("cs_5_1")).unwrap();
+            unsafe {
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).unwrap();
+                let pso = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+
+        let (root, new_mean) = make_mean(SOURCE, "KEEP", s!("mean"));
+        let (_, legacy_mean) = make_mean(LEGACY_MEAN_RAISE_HLSL, "MEAN", s!("mean"));
+        let cells_new = make_buf(CELL_BYTES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        let cells_legacy = make_buf(CELL_BYTES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        let dummy = make_buf(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        let upload = make_buf(CELL_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let rb_new = make_buf(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let rb_legacy = make_buf(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            list.Close().unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let gpu0 = heap.GetGPUDescriptorHandleForHeapStart();
+
+            let mut fence_val = 0u64;
+            let mut wait = || {
+                fence_val += 1;
+                queue.Signal(&fence, fence_val).unwrap();
+                fence.SetEventOnCompletion(fence_val, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+            };
+
+            let mut words = [0u32; 16];
+            words[8] = 0.04f32.to_bits();  // follow
+            words[12] = 4.0f32.to_bits();  // jump
+            words[14] = 0.033f32.to_bits(); // dt
+
+            let mean_offset = CELLS * 16;
+            let mut max_rel_err = 0.0f32;
+            let mut max_abs_err = 0.0f32;
+
+            // Step 0: cold start (was = 0); steps 1..=16: temporal follow with varying HDR cells;
+            // step 17: sudden 12x brightness jump (new room).
+            for step in 0..18u32 {
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut ptr)).unwrap();
+                let dst = std::slice::from_raw_parts_mut(ptr.cast::<[f32; 4]>(), CELLS as usize + 1);
+                let scale = if step == 17 { 12.0 } else { 1.0 + 0.07 * step as f32 };
+                for (i, cell) in dst[..CELLS as usize].iter_mut().enumerate() {
+                    let h = ((i as u32).wrapping_mul(2654435761) ^ step.wrapping_mul(374761393)) as f32
+                        / u32::MAX as f32;
+                    let sky = if i % 29 == 0 { 18.5 } else { 0.003 };
+                    *cell = [
+                        (sky + h * 1.73) * scale,
+                        (sky * 0.8 + (1.0 - h) * 0.91 + 0.01) * scale,
+                        (0.001 + (h * h) * 3.17) * scale,
+                        1.0,
+                    ];
+                }
+                if step == 0 {
+                    dst[CELLS as usize] = [0.0; 4];
+                }
+                upload.Unmap(0, None);
+
+                let copy_bytes = if step == 0 { (CELLS + 1) * 16 } else { CELLS * 16 };
+                allocator.Reset().unwrap();
+                list.Reset(&allocator, None).unwrap();
+                let heaps = [Some(heap.clone())];
+                list.SetDescriptorHeaps(&heaps);
+
+                list.CopyBufferRegion(&cells_new, 0, &upload, 0, copy_bytes);
+                list.CopyBufferRegion(&cells_legacy, 0, &upload, 0, copy_bytes);
+                list.ResourceBarrier(&[
+                    crate::host::transition(&cells_new, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    crate::host::transition(&cells_legacy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                ]);
+
+                list.SetComputeRootSignature(&root);
+                list.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+                list.SetComputeRootDescriptorTable(1, gpu0);
+                list.SetComputeRootDescriptorTable(2, gpu0);
+                list.SetComputeRootUnorderedAccessView(4, dummy.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(5, dummy.GetGPUVirtualAddress());
+
+                list.SetComputeRootUnorderedAccessView(3, cells_new.GetGPUVirtualAddress());
+                list.SetPipelineState(&new_mean);
+                list.Dispatch(1, 1, 1);
+
+                list.SetComputeRootUnorderedAccessView(3, cells_legacy.GetGPUVirtualAddress());
+                list.SetPipelineState(&legacy_mean);
+                list.Dispatch(1, 1, 1);
+
+                list.ResourceBarrier(&[
+                    crate::host::transition(&cells_new, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    crate::host::transition(&cells_legacy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ]);
+                list.CopyBufferRegion(&rb_new, 0, &cells_new, mean_offset, 16);
+                list.CopyBufferRegion(&rb_legacy, 0, &cells_legacy, mean_offset, 16);
+                list.ResourceBarrier(&[
+                    crate::host::transition(&cells_new, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                    crate::host::transition(&cells_legacy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                ]);
+                list.Close().unwrap();
+                let cmd: ID3D12CommandList = list.cast().unwrap();
+                queue.ExecuteCommandLists(&[Some(cmd)]);
+                wait();
+
+                let mut got_new = [0.0f32; 4];
+                let mut got_legacy = [0.0f32; 4];
+                rb_new.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), got_new.as_mut_ptr(), 4);
+                rb_new.Unmap(0, None);
+                rb_legacy.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), got_legacy.as_mut_ptr(), 4);
+                rb_legacy.Unmap(0, None);
+
+                for ch in 0..3 {
+                    let abs_err = (got_new[ch] - got_legacy[ch]).abs();
+                    let rel_err = abs_err / got_legacy[ch].abs().max(1.0);
+                    max_abs_err = max_abs_err.max(abs_err);
+                    max_rel_err = max_rel_err.max(rel_err);
+                    assert!(
+                        rel_err <= TOLERANCE,
+                        "step {step} channel {ch}: parallel mean {} vs legacy {} (abs_err={abs_err:e}, rel_err={rel_err:e}, tol={TOLERANCE:e})",
+                        got_new[ch],
+                        got_legacy[ch]
+                    );
+                }
+                assert_eq!(
+                    got_new[3].to_bits(),
+                    got_legacy[3].to_bits(),
+                    "step {step}: temporal follow age must match legacy ({} vs {})",
+                    got_new[3],
+                    got_legacy[3]
+                );
+            }
+            println!(
+                "parallel_mean vs legacy over 18 steps: max_abs_err={max_abs_err:e} max_rel_err={max_rel_err:e} (tol={TOLERANCE:e})"
+            );
+        }
+    }
+
     /// Full-frame 1080p and 4K RT OFF vs RT ON + per-pass benchmark (`rt`, `mean`,
     /// `raise`, full-frame GPU and wall-clock p50/p95 against 33.333 ms = 30 FPS).
     /// Run with:
