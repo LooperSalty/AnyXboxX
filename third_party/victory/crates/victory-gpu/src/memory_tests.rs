@@ -429,7 +429,10 @@ fn run_trace(
 fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
     let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(host) = host() else { return };
-    if !crate::shadow::cards() || !host.card_ready() {
+    let card_memory = crate::shadow::cards() && host.card_ready();
+    let adapter = victory_shader::emit::host::Host { device: host.device.clone() }.adapter_name();
+    println!("adapter={},card_memory={card_memory}", adapter.as_deref().unwrap_or("unknown"));
+    if !card_memory {
         return;
     }
     let heap = HostHeap::new(false, 64).expect("HostHeap");
@@ -642,6 +645,21 @@ fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
     }
 }
 
+fn stats_summary(mut samples: Vec<u64>) -> (u64, u64, f64) {
+    samples.sort_unstable();
+    let len = samples.len();
+    let median = samples[(len - 1) / 2].midpoint(samples[len / 2]);
+    let p95 = samples[(len * 95).div_ceil(100) - 1];
+    let mean = samples.iter().sum::<u64>() as f64 / len as f64;
+    (median, p95, mean)
+}
+
+#[test]
+fn bvh_benchmark_summary_uses_median_and_nearest_rank_p95() {
+    assert_eq!(stats_summary((1..=120).rev().collect()), (60, 114, 60.5));
+    assert_eq!(stats_summary(vec![23]), (23, 23, 23.0));
+}
+
 /// Sustained-load GPU benchmark comparing static and dynamic BVH scenes
 /// (build/update time, bytes copied, Step::Refresh count, peak memory) with
 /// bit-for-bit ray intersection verification on every sampled frame.
@@ -653,6 +671,9 @@ fn bench_bvh_static_and_dynamic_sustained() {
         panic!("no host GPU available");
     };
     assert!(crate::shadow::cards() && host.card_ready(), "card memory required");
+    let adapter = victory_shader::emit::host::Host { device: host.device.clone() }
+        .adapter_name().expect("DXGI adapter");
+    println!("adapter={adapter},card_memory=true,p95=nearest_rank");
     let heap = HostHeap::new(false, 64).expect("HostHeap");
     let pipe = TracePipeline::new(host);
 
@@ -693,10 +714,14 @@ fn bench_bvh_static_and_dynamic_sustained() {
     }
 
     let ray_center = Ray::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 100.0);
+    let mut static_hits = Vec::with_capacity(32);
     for lane in 0..16 {
-        let addr = static_addrs[lane * 8];
+        let idx = lane * 8;
+        let addr = static_addrs[idx];
         write_ray_record(rec_ptr, lane * 2, addr + 64, 5, &ray_center);
         write_ray_record(rec_ptr, lane * 2 + 1, addr + 192, 0, &ray_center);
+        static_hits.push(bvh::intersect(&static_boxes[idx], 5, &ray_center, true));
+        static_hits.push(bvh::intersect(&static_tris[idx], 0, &ray_center, true));
     }
 
     // --- Initial Static Stream / Build ---
@@ -717,11 +742,7 @@ fn bench_bvh_static_and_dynamic_sustained() {
     let stream_us = t_stream.elapsed().as_micros() as u64;
     let stream_card_bytes = crate::shadow::CARD_STATS[0].load(Ordering::Relaxed) - card_bytes_0;
     let stream_card_runs = crate::shadow::CARD_STATS[1].load(Ordering::Relaxed) - card_runs_0;
-    for lane in 0..16 {
-        let idx = lane * 8;
-        assert_eq!(init_out[lane * 2], bvh::intersect(&static_boxes[idx], 5, &ray_center, true));
-        assert_eq!(init_out[lane * 2 + 1], bvh::intersect(&static_tris[idx], 0, &ray_center, true));
-    }
+    assert_eq!(init_out, static_hits, "initial static stream");
 
     // --- Scene A: Static Sustained Load (120 frames, 4 RT lists + 1 builder list per frame) ---
     let mut static_prep_us = Vec::with_capacity(FRAMES);
@@ -765,14 +786,7 @@ fn bench_bvh_static_and_dynamic_sustained() {
             static_refreshes_total += frame_ref;
             static_card_bytes += crate::shadow::CARD_STATS[0].load(Ordering::Relaxed) - cb0;
             static_card_runs += crate::shadow::CARD_STATS[1].load(Ordering::Relaxed) - cr0;
-            if f == WARMUP + FRAMES - 1 {
-                let out = read_results(res_ptr, 32);
-                for lane in 0..16 {
-                    let idx = lane * 8;
-                    assert_eq!(out[lane * 2], bvh::intersect(&static_boxes[idx], 5, &ray_center, true));
-                    assert_eq!(out[lane * 2 + 1], bvh::intersect(&static_tris[idx], 0, &ray_center, true));
-                }
-            }
+            assert_eq!(read_results(res_ptr, 32), static_hits, "static frame {f}");
         }
     }
 
@@ -794,6 +808,8 @@ fn bench_bvh_static_and_dynamic_sustained() {
 
     let mut dyn_prep_us = Vec::with_capacity(FRAMES);
     let mut dyn_frame_us = Vec::with_capacity(FRAMES);
+    let mut move_frame_us = Vec::new();
+    let mut stream_frame_us = Vec::new();
     let mut dyn_refreshes_total = 0usize;
     let mut dyn_card_bytes = 0u64;
     let mut dyn_card_runs = 0u64;
@@ -830,7 +846,8 @@ fn bench_bvh_static_and_dynamic_sustained() {
 
         // Every 8 frames, retire old churn packed BVH and stream a new 256 KiB packed BVH.
         let mut build_addrs = dyn_addrs.clone();
-        if f % 8 == 0 {
+        let stream = f % 8 == 0;
+        if stream {
             if let Some(old) = active_churn.take() {
                 unsafe { std::ptr::write_unaligned(old as *mut u64, 0) };
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -862,20 +879,31 @@ fn bench_bvh_static_and_dynamic_sustained() {
         if f >= WARMUP {
             dyn_prep_us.push(prep);
             dyn_frame_us.push(frame_us);
+            if stream {
+                stream_frame_us.push(frame_us);
+            } else {
+                move_frame_us.push(frame_us);
+            }
             dyn_refreshes_total += refs;
             dyn_card_bytes += crate::shadow::CARD_STATS[0].load(Ordering::Relaxed) - cb0;
             dyn_card_runs += crate::shadow::CARD_STATS[1].load(Ordering::Relaxed) - cr0;
-            if f % 20 == 0 || f == WARMUP + FRAMES - 1 {
-                let out = read_results(res_ptr, 32);
-                for i in 0..DYNAMIC_MESHES {
-                    assert_eq!(out[i * 2], bvh::intersect(&expected_boxes[i], 5, &ray_center, true));
-                    assert_eq!(out[i * 2 + 1], bvh::intersect(&expected_tris[i], 0, &ray_center, true));
-                }
+            let out = read_results(res_ptr, 32);
+            for i in 0..DYNAMIC_MESHES {
+                assert_eq!(
+                    out[i * 2],
+                    bvh::intersect(&expected_boxes[i], 5, &ray_center, true),
+                    "dynamic frame {f}, box {i}"
+                );
+                assert_eq!(
+                    out[i * 2 + 1],
+                    bvh::intersect(&expected_tris[i], 0, &ray_center, true),
+                    "dynamic frame {f}, triangle {i}"
+                );
             }
         }
     }
 
-    let mem_peak_mib = process_private_mib();
+    let mem_after_mib = process_private_mib();
     let [_, vram_bvh_bytes] = crate::shadow::vram_breakdown();
     let (arenas_count, pages_held, free_pages) = {
         let g = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -883,13 +911,6 @@ fn bench_bvh_static_and_dynamic_sustained() {
         (m.arenas.len(), m.pages.len(), m.free.len())
     };
 
-    let stats_summary = |mut v: Vec<u64>| -> (u64, u64, f64) {
-        v.sort_unstable();
-        let med = v[v.len() / 2];
-        let p95 = v[(v.len() * 95) / 100];
-        let mean = v.iter().sum::<u64>() as f64 / v.len() as f64;
-        (med, p95, mean)
-    };
     let (sp_med, sp_p95, sp_mean) = stats_summary(static_prep_us);
     let (sf_med, sf_p95, sf_mean) = stats_summary(static_frame_us);
     let (dp_med, dp_p95, dp_mean) = stats_summary(dyn_prep_us);
@@ -911,9 +932,15 @@ fn bench_bvh_static_and_dynamic_sustained() {
         dyn_card_bytes as f64 / FRAMES as f64,
         dyn_card_runs as f64 / FRAMES as f64,
     );
+    let (move_frames, stream_frames) = (move_frame_us.len(), stream_frame_us.len());
+    let (move_median, move_p95, _) = stats_summary(move_frame_us);
+    let (stream_median, stream_p95, _) = stats_summary(stream_frame_us);
     eprintln!(
-        "memory: private_before_mib={mem_before_mib:.1} private_after_mib={mem_peak_mib:.1} delta_mib={:.1} vram_bvh_mib={:.1} arenas={arenas_count} pages_held={pages_held} free_pages={free_pages}",
-        mem_peak_mib - mem_before_mib,
+        "dynamic_frame_classes: move_frames={move_frames} move_us(med/p95)={move_median}/{move_p95} stream_frames={stream_frames} replace_us(med/p95)={stream_median}/{stream_p95}"
+    );
+    eprintln!(
+        "memory: private_before_mib={mem_before_mib:.1} private_after_mib={mem_after_mib:.1} delta_mib={:.1} vram_bvh_mib={:.1} arenas={arenas_count} pages_held={pages_held} free_pages={free_pages}",
+        mem_after_mib - mem_before_mib,
         vram_bvh_bytes as f64 / (1024.0 * 1024.0),
     );
 }
