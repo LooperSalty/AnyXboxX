@@ -24,6 +24,12 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
         ));
     }
     let expression = match name {
+        "v_add_f32" => format!("F32Add({a}, {b})"),
+        "v_sub_f32" => format!("F32Sub({a}, {b})"),
+        "v_subrev_f32" => format!("F32Sub({b}, {a})"),
+        "v_mul_f32" => format!("F32Mul({a}, {b})"),
+        "v_min_f32" => format!("F32MinMax({a}, {b}, false)"),
+        "v_max_f32" => format!("F32MinMax({a}, {b}, true)"),
         "v_mul_legacy_f32" => format!("MulLegacyF32({a}, {b})"),
         "v_fmac_f32" => format!("FmaF32({a}, {b}, v[{d}])"),
         "v_fmac_legacy_f32" => format!("FmaLegacyF32({a}, {b}, v[{d}])"),

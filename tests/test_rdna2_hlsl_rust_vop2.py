@@ -49,11 +49,6 @@ def test_vop2_literal_and_lane_source(name, monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(128)) == struct.pack("<32I", *wave.v[1])
 
 
-def test_untranslated_vop2_is_named():
-    result = rust(program(vop2("v_add_f32", 1, V, 0)))
-    assert result.returncode != 0 and b"v_add_f32" in result.stderr
-
-
 @pytest.mark.parametrize("src", [0xe9, 0xea, 0xf9, 0xfa])
 def test_vop2_extensions_are_named(src):
     result = rust(program(vop2("v_add_nc_u32", 1, src, 0), 0))

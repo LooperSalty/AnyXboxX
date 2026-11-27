@@ -177,8 +177,8 @@ VECTOR = {
     "v_subrev_f32": "F32Sub({b}, {a})",
     "v_mul_f32": "F32Mul({a}, {b})",
     "v_mul_legacy_f32": "MulLegacyF32({a}, {b})",
-    "v_min_f32": "asuint(min(asfloat({a}), asfloat({b})))",
-    "v_max_f32": "asuint(max(asfloat({a}), asfloat({b})))",
+    "v_min_f32": "F32MinMax({a}, {b}, false)",
+    "v_max_f32": "F32MinMax({a}, {b}, true)",
     "v_fmac_f32": "FmaF32({a}, {b}, {d})",                 # arrondi unique : emu/rdna2_hlsl_fma.py
     "v_mac_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({d})))",
     "v_fma_f32": "FmaF32({a}, {b}, {c})",

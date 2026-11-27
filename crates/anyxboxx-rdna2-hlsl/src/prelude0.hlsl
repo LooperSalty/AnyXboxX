@@ -112,19 +112,38 @@ uint SadU32(uint a, uint b, uint c) {
 // Opérations f32 dans des fonctions `precise` (dxc ne replie plus x + 0, x - x ni 0 × x). Le pilote AMD
 // (RX 9070 XT) replie pourtant fadd x, 0.0 et fsub x, x, et Intel fsub 0.0, x : le signe d'un résultat
 // exactement nul et x - x sont donc fixés en entier.
+double F32ToF64(uint a);
+uint F64ToF32(double x);
 uint F32Add(uint a, uint b) {
-  precise float r = asfloat(a) + asfloat(b);
-  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & b & 0x80000000u : asuint(r);    // -0 seulement pour -0 + -0
+  if (IsNanF32(a)) return a | 0x400000u;
+  if (IsNanF32(b)) return b | 0x400000u;
+  uint x = a & 0x7FFFFFFFu, y = b & 0x7FFFFFFFu;
+  if (x == 0x7F800000u) return y == x && a != b ? 0xFFC00000u : a;
+  if (y == 0x7F800000u) return b;
+  if (x == y && (x == 0u || a != b)) return a & b & 0x80000000u;
+  precise double sum = F32ToF64(a) + F32ToF64(b);
+  return F64ToF32(sum);
 }
 uint F32Sub(uint a, uint b) {
-  if (a == b)                                     // NaN : lui-même, rendu silencieux ; ±infini : NaN par défaut
-    return (a & 0x7FFFFFFFu) > 0x7F800000u ? a | 0x400000u : (a & 0x7F800000u) == 0x7F800000u ? 0xFFC00000u : 0u;
-  precise float r = asfloat(a) - asfloat(b);
-  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & ~b & 0x80000000u : asuint(r);
+  if (IsNanF32(a)) return a | 0x400000u;
+  if (IsNanF32(b)) return b | 0x400000u;
+  return F32Add(a, b ^ 0x80000000u);
 }
 uint F32Mul(uint a, uint b) {
-  precise float r = asfloat(a) * asfloat(b);
-  return asuint(r);
+  if (IsNanF32(a)) return a | 0x400000u;
+  if (IsNanF32(b)) return b | 0x400000u;
+  uint x = a & 0x7FFFFFFFu, y = b & 0x7FFFFFFFu, sign = (a ^ b) & 0x80000000u;
+  if (x == 0x7F800000u || y == 0x7F800000u) return min(x, y) == 0u ? 0xFFC00000u : sign | 0x7F800000u;
+  if (min(x, y) == 0u) return sign;
+  precise double product = F32ToF64(a) * F32ToF64(b);
+  return F64ToF32(product);
+}
+uint F32MinMax(uint a, uint b, bool maximum) {
+  if (IsNanF32(a)) return a | 0x400000u;
+  if (IsNanF32(b) || ((a | b) & 0x7FFFFFFFu) == 0u) return a;
+  uint ka = a ^ ((a >> 31) != 0u ? 0xFFFFFFFFu : 0x80000000u);
+  uint kb = b ^ ((b >> 31) != 0u ? 0xFFFFFFFFu : 0x80000000u);
+  return (maximum ? kb > ka : kb < ka) ? b : a;
 }
 uint MulLegacyF32(uint a, uint b) {
   float x = asfloat(a), y = asfloat(b);
