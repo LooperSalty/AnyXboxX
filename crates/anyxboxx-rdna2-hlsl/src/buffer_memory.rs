@@ -41,11 +41,6 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     let data = (word >> 40) & 255;
     let resource = ((word >> 48) & 31) * 4;
     let soffset = ((word >> 56) & 255) as u32;
-    if !write && offen && count > 1 && (data..data + count).contains(&addr) {
-        return Err(format!(
-            "untranslated instruction: {name}: destination overlaps address"
-        ));
-    }
     if (193..=208).contains(&soffset) {
         return Err(format!(
             "untranslated instruction: {name}: negative inline SOFFSET"
@@ -108,30 +103,8 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
             "AllMemoryBarrierWithGroupSync();".into(),
         ])
     } else {
-        let loads = if matches!(width, "ushort" | "sshort") {
-            format!("v[{data}] = {};", crate::subword::half(width, &address))
-        } else if matches!(width, "ubyte" | "sbyte") {
-            let value = format!(
-                "((g_memory.Load(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & 0xFFu)"
-            );
-            let value = if width == "sbyte" {
-                format!("asuint((asint({value}) << 24) >> 24)")
-            } else {
-                value
-            };
-            format!("v[{data}] = {value};")
-        } else {
-            (0..count)
-                .map(|i| format!("v[{}] = g_memory.Load(({address}) + {}u);", data + i, 4 * i))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let zeros = (0..count)
-            .map(|i| format!("v[{}] = 0u;", data + i))
-            .collect::<Vec<_>>()
-            .join(" ");
-        Ok(vec![format!(
-            "if (((s[126] >> lane) & 1u) != 0) {{ if ({inside}) {{ {loads} }} else {{ {zeros} }} }}"
+        Ok(vec![crate::memory_load::statement(
+            width, count, data, &address, &inside,
         )])
     }
 }

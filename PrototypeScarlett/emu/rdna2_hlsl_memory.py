@@ -46,10 +46,13 @@ def _scalar(name, word):
     extra = "" if soffset == NULL else f" + s[{soffset}]"
     count = WIDTHS[found.group(2)] // 4
     if found.group(1):              # s_buffer_load : base du V#, borne en s[base + 2]
-        inside = f"(o + {4 * count}u <= s[{sbase + 2}])"
-        loads = " ".join(f"s[{sdata + i}] = {inside} ? g_memory.Load(s[{sbase}] + o + {4 * i}u) : 0u;"
-                         for i in range(count))
-        return [f"{{ uint o = {offset}{extra}; {loads} }}"]
+        immediate = signed((word >> 32) & 0x1FFFFF, 21)
+        register = "0u" if soffset == NULL else f"s[{soffset}]"
+        valid = f"{register} >= {-immediate}u" if immediate < 0 else f"{register} <= 0x{0xFFFFFFFF - immediate:X}u"
+        bound = f"s[{sbase + 2}]"
+        loads = " ".join(f"s[{sdata + i}] = ok ? g_memory.Load(a + {4 * i}u) : 0u;" for i in range(count))
+        return [f"{{ uint o = {offset}{extra}; uint a = s[{sbase}] + o; "
+                f"bool ok = {valid} && o <= {bound} && {4 * count}u <= {bound} - o; {loads} }}"]
     loads = " ".join(f"s[{sdata + i}] = g_memory.Load(a + {4 * i}u);" for i in range(count))
     return [f"{{ uint a = s[{sbase}] + {offset}{extra}; {loads} }}"]
 
@@ -105,9 +108,10 @@ def _vector_access(name, address, data, vdst, active, glc, inside):
             raise Untranslatable(f"non traduite en HLSL : {name} (écriture partielle d'un mot)")
         stores = " ".join(f"g_memory.Store({address} + {4 * i}u, v[{data + i}]);" for i in range(WIDTHS[kind] // 4))
         return [f"if (({active}) && {inside}) {{ {stores} }}", STORE_BARRIER]
-    loads = " ".join(_load_lines(vdst, address, kind))
+    prefix = f"uint a = {address}; " if WIDTHS[kind] > 4 else ""
+    loads = " ".join(_load_lines(vdst, "a" if prefix else address, kind))
     zeros = " ".join(f"v[{vdst + i}] = 0u;" for i in range(max(1, WIDTHS[kind] // 4)))
-    return [f"if ({active}) {{ if ({inside}) {{ {loads} }} else {{ {zeros} }} }}"]
+    return [f"if ({active}) {{ if ({inside}) {{ {prefix}{loads} }} else {{ {zeros} }} }}"]
 
 
 def _lds(name, word, active):

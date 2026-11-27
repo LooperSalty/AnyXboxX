@@ -31,21 +31,6 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     let raw = ((word >> 32) & 0x1f_ffff) as u32;
     let offset = ((raw << 11) as i32 >> 11) as u32;
     let soffset = (word >> 57) & 0x7f;
-    if !store && (sdata..sdata + count).contains(&sbase) {
-        return Err(format!(
-            "untranslated instruction: {name}: destination overlaps the address base"
-        ));
-    }
-    if !store && buffer && (sdata..sdata + count).contains(&(sbase + 2)) {
-        return Err(format!(
-            "untranslated instruction: {name}: destination overlaps the buffer bound"
-        ));
-    }
-    if !store && buffer && soffset == 125 && (offset as i32) < 0 {
-        return Err(format!(
-            "untranslated instruction: {name}: negative buffer offset"
-        ));
-    }
     let extra = if soffset == 125 {
         String::new()
     } else {
@@ -70,18 +55,31 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
         ]);
     }
     if buffer {
-        let inside = format!("(o + {}u <= s[{}])", count * 4, sbase + 2);
+        let register = if soffset == 125 {
+            "0u".into()
+        } else {
+            format!("s[{soffset}]")
+        };
+        let valid = if (offset as i32) < 0 {
+            format!("{register} >= {}u", offset.wrapping_neg())
+        } else {
+            format!("{register} <= 0x{:X}u", u32::MAX - offset)
+        };
+        let bound = format!("s[{}]", sbase + 2);
         let loads = (0..count)
             .map(|i| {
                 format!(
-                    "s[{}] = {inside} ? g_memory.Load(s[{sbase}] + o + {}u) : 0u;",
+                    "s[{}] = ok ? g_memory.Load(a + {}u) : 0u;",
                     sdata + i,
-                    i * 4
+                    4 * i
                 )
             })
             .collect::<Vec<_>>()
             .join(" ");
-        Ok(vec![format!("{{ uint o = {off}; {loads} }}")])
+        Ok(vec![format!(
+            "{{ uint o = {off}; uint a = s[{sbase}] + o; bool ok = {valid} && o <= {bound} && {}u <= {bound} - o; {loads} }}",
+            4 * count
+        )])
     } else {
         let loads = (0..count)
             .map(|i| format!("s[{}] = g_memory.Load(a + {}u);", sdata + i, i * 4))

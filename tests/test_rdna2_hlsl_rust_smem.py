@@ -51,9 +51,24 @@ def test_smem_atomic_remains_named():
     assert result.returncode != 0 and b"s_atomic_add_x2" in result.stderr
 
 
-@pytest.mark.parametrize("name,dest,offset", [("s_load_dwordx2", 4, 0),
-                                               ("s_buffer_load_dwordx4", 6, 0),
-                                               ("s_buffer_load_dwordx2", 8, -4)])
-def test_unsafe_smem_load_is_named(name, dest, offset):
-    result = rust(program(*smem(name, dest, 4, offset)))
-    assert result.returncode != 0 and name.encode() in result.stderr
+@pytest.mark.parametrize("name,dest,offset,soffset,scalar", [
+    ("s_load_dwordx2", 4, 0, 125, 0), ("s_buffer_load_dwordx4", 4, 0, 125, 0),
+    ("s_buffer_load_dwordx4", 6, 0, 125, 0), ("s_buffer_load_dwordx2", 8, -4, 125, 0),
+    ("s_buffer_load_dwordx2", 4, -4, 30, 8), ("s_buffer_load_dwordx2", 6, 8, 30, 0xFFFFFFFF),
+])
+def test_smem_load_snapshots_address_and_checks_offset(name, dest, offset, soffset, scalar):
+    if not rdna2_gpu.available():
+        pytest.skip("dxc or GPU runner unavailable")
+    data = program(*init(), sop1("s_mov_b32", 30, LITERAL), scalar, *smem(name, dest, 4, offset, soffset))
+    result = rust(data)
+    assert result.returncode == 0, result.stderr.decode()
+    hlsl = result.stdout.decode()
+    assert hlsl == rdna2_hlsl.translate(data)
+    initial = bytearray(512)
+    struct.pack_into("<32I", initial, 256, *range(0x101, 0x121))
+    wave = rdna2_exec.Wave()
+    wave.memory.write(0, initial)
+    rdna2_exec.run(data, wave)
+    stores = " ".join(f"g_memory.Store({4*i}u, s[{dest+i}]);" for i in range(4))
+    hlsl = hlsl.replace("  return;\n", f"  if (lane == 0u) {{ {stores} }}\n  return;\n")
+    assert rdna2_gpu.run(hlsl, bytes(initial))[:16] == struct.pack("<4I", *wave.s[dest:dest+4])

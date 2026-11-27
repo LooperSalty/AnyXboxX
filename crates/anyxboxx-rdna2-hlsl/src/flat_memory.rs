@@ -48,11 +48,6 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
     if addtid && saddr == 125 {
         return Err(format!("untranslated instruction: {name}: SADDR off"));
     }
-    if !store && !addtid && count > 1 && (vdst..vdst + count).contains(&addr) {
-        return Err(format!(
-            "untranslated instruction: {name}: destination overlaps address"
-        ));
-    }
     let address = if addtid {
         format!("(s[{saddr}] + 0x{offset:X}u + lane * 4u)")
     } else if family == "GLOBAL" && saddr != 125 {
@@ -70,30 +65,8 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
             "AllMemoryBarrierWithGroupSync();".into(),
         ])
     } else {
-        let loads = if matches!(width, "ushort" | "sshort") {
-            format!("v[{vdst}] = {};", crate::subword::half(width, &address))
-        } else if matches!(width, "ubyte" | "sbyte") {
-            let value = format!(
-                "((g_memory.Load(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & 0xFFu)"
-            );
-            let value = if width == "sbyte" {
-                format!("asuint((asint({value}) << 24) >> 24)")
-            } else {
-                value
-            };
-            format!("v[{vdst}] = {value};")
-        } else {
-            (0..count)
-                .map(|i| format!("v[{}] = g_memory.Load(({address}) + {}u);", vdst + i, 4 * i))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let zeros = (0..count)
-            .map(|i| format!("v[{}] = 0u;", vdst + i))
-            .collect::<Vec<_>>()
-            .join(" ");
-        Ok(vec![format!(
-            "if (((s[126] >> lane) & 1u) != 0) {{ if (true) {{ {loads} }} else {{ {zeros} }} }}"
+        Ok(vec![crate::memory_load::statement(
+            width, count, vdst, &address, "true",
         )])
     }
 }

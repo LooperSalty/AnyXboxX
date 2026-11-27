@@ -55,11 +55,10 @@ def test_raw_buffer_offset_overflow_is_out_of_bounds(monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(512))[:128] == struct.pack("<32I", *wave.v[10])
 
 
-def test_buffer_idxen_and_overlap_are_named():
+def test_buffer_idxen_is_named():
     low, high = mubuf("buffer_load_dwordx2", 1, 10, 20, offen=1)
-    for data in (program(low | (1 << 13), high), program(*mubuf("buffer_load_dwordx2", 1, 1, 20, offen=1))):
-        result = rust(data)
-        assert result.returncode != 0 and b"buffer_load_dwordx2" in result.stderr
+    result = rust(program(low | (1 << 13), high))
+    assert result.returncode != 0 and b"buffer_load_dwordx2" in result.stderr
 
 
 @pytest.mark.parametrize("soffset", [125, 128, 24])

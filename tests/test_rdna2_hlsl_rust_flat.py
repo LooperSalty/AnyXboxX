@@ -52,7 +52,6 @@ def test_word_access_text_and_warp(family, width, mask, monkeypatch):
 
 def test_unsafe_flat_forms_are_named():
     for data, name in [(program(*flat("flat_load_dword", 1, vdst=10, offset=0x800)), b"flat_load_dword"),
-                       (program(*flat("flat_load_dwordx2", 1, vdst=1)), b"flat_load_dwordx2"),
                        (program(*global_("global_atomic_sub", 1, data=4)), b"global_atomic_sub")]:
         result = rust(data)
         assert result.returncode != 0 and name in result.stderr
@@ -84,3 +83,22 @@ def test_global_addtid_text_and_warp(mask, monkeypatch):
 def test_global_addtid_requires_scalar_base():
     result = rust(program(*global_("global_load_dword_addtid", 0, vdst=10, saddr=OFF)))
     assert result.returncode != 0 and b"global_load_dword_addtid" in result.stderr
+
+
+@pytest.mark.parametrize("family", ["flat", "global", "buffer"])
+def test_multiword_load_uses_original_address_when_it_writes_the_address_vgpr(family):
+    from test_rdna2_exec_memory import INPUT, mubuf
+    from test_rdna2_hlsl import store_lane, with_lane_offset
+    from test_rdna2_hlsl_rust_half import verify
+
+    ops = [vop2("v_lshlrev_b32", 1, const(4), 0)]
+    if family == "flat":
+        ops += [vop2("v_add_nc_u32", 1, LITERAL, 1), INPUT, *flat("flat_load_dwordx4", 1, vdst=1)]
+    elif family == "global":
+        ops += global_("global_load_dwordx4", 1, vdst=1, saddr=0)
+    else:
+        ops += [sop1("s_mov_b32", 20, LITERAL), INPUT, sop1("s_mov_b32", 22, LITERAL), 512,
+                *mubuf("buffer_load_dwordx4", 1, 1, 20, offen=1)]
+    for i in range(4):
+        ops += store_lane(i + 1, i)
+    verify(with_lane_offset(*ops), bytes(INPUT) + struct.pack("<128I", *range(20001, 20129)))
