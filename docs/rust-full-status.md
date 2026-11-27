@@ -132,6 +132,8 @@ LDS ADDTID reads and writes use M0, the immediate offset and the lane ID in wave
 
 The VOP3b unsigned carry and borrow forms, with and without carry-in and saturation, and signed/unsigned 64-bit multiply-adds have WARP parity in wave32 and wave64.
 
+Rust emits all four f32 literal multiply-adds in VOP2 and VOP3. On WARP the unfused forms follow the interpreter’s binary64 intermediate rounding before the f32 result, and the fused forms round once. The rounding and NaN tests use memory operands. The VOP1/VOP3 nearest-even operation is also checked on half-way values and signed zeros.
+
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
 Two measured oracle disagreements prevent unconditional byte-for-byte parity. With M0 = 250, `v_movrels_b32 v1, v10` reads v260. Both HLSL emitters produce the same shader, which writes zero to all 32 lanes under WARP. The Python interpreter raises `Untranslated` before it can produce any bytes. For the valid input `v_cos_f32(0x3E800000)` (one quarter turn), WARP executing the Python shader returns `0xB33BBD2E` and the Python reference returns `0x248D3132`. Rust currently rejects this opcode by name. Both measurements used synthetic programs, DXC and WARP on Windows.

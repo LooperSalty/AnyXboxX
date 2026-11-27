@@ -91,7 +91,7 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         ),
         "v_fma_f32" => format!("FmaF32({a}, {b}, {c})"),
         "v_fma_legacy_f32" => format!("FmaLegacyF32({a}, {b}, {c})"),
-        "v_mad_f32" => format!("asuint(mad(asfloat({a}), asfloat({b}), asfloat({c})))"),
+        "v_mad_f32" => format!("MadF32({a}, {b}, {c})"),
         "v_add3_u32" => format!("({a} + {b} + {c})"),
         "v_lshl_add_u32" => format!("(({a} << ({b} & 31u)) + {c})"),
         "v_add_lshl_u32" => format!("(({a} + {b}) << ({c} & 31u))"),
@@ -143,8 +143,11 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
         "v_sad_hi_u8" => format!("((SadU8({a}, {b}) << 16) + {c})"),
         "v_sad_u32" => format!("SadU32({a}, {b}, {c})"),
         "v_mul_lo_i32" => format!("({a} * {b})"),
-        _ => crate::vector_binary::expression(name, &a, &b, f.vdst)
-            .or_else(|_| crate::vector_unary::expression(name, &a))?,
+        _ => match crate::vector_binary::literal_expression(name, &a, &b, literal)? {
+            Some(expr) => expr,
+            None => crate::vector_binary::expression(name, &a, &b, f.vdst)
+                .or_else(|_| crate::vector_unary::expression(name, &a))?,
+        },
     };
     if is_float && (f.clamp || f.omod != 0) {
         let scale = match f.omod {

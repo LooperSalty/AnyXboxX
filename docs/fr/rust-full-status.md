@@ -132,6 +132,8 @@ Les lectures et écritures LDS ADDTID utilisent M0, le déplacement immédiat et
 
 Les formes VOP3b avec retenue ou emprunt non signé, avec ou sans retenue en entrée et saturation, et les multiplications-additions 64 bits signées et non signées concordent sous WARP en wave32 et wave64.
 
+Rust traduit les quatre multiplications-additions f32 à littéral en VOP2 et VOP3. Sous WARP, les formes non fusionnées suivent l’arrondi intermédiaire de l’interpréteur en binaire64 avant le résultat f32, et les formes fusionnées arrondissent une seule fois. Les tests d’arrondi et de NaN utilisent des opérandes en mémoire. L’arrondi au pair VOP1/VOP3 est aussi vérifié sur des valeurs à mi-chemin et des zéros signés.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 Deux désaccords mesurés entre les oracles empêchent une parité inconditionnelle à l’octet près. Avec M0 = 250, `v_movrels_b32 v1, v10` lit v260. Les deux générateurs HLSL produisent le même shader, qui écrit zéro sur les 32 lignes sous WARP. L’interpréteur Python lève `Untranslated` avant de produire des octets. Pour une entrée valide, `v_cos_f32(0x3E800000)` (un quart de tour), le shader Python exécuté sur WARP donne `0xB33BBD2E` et la référence Python donne `0x248D3132`. Le port Rust refuse actuellement cet opcode en le nommant. Ces mesures utilisent des programmes synthétiques, DXC et WARP sous Windows.

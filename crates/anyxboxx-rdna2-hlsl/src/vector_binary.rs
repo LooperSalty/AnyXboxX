@@ -13,6 +13,11 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
     };
     let b = format!("v[{}]", (word >> 9) & 0xff);
     let d = (word >> 17) & 0xff;
+    if let Some(expr) = literal_expression(name, &a, &b, literal)? {
+        return Ok(format!(
+            "if (((s[126] >> lane) & 1u) != 0) v[{d}] = {expr};"
+        ));
+    }
     if let Some((result, carry)) = match name {
         "v_add_co_ci_u32" => Some(("x + y + k", "(r < x) || (k != 0 && r == x)")),
         "v_sub_co_ci_u32" => Some(("x - y - k", "(x < y) || (k != 0 && x == y)")),
@@ -40,7 +45,7 @@ pub fn expression(name: &str, a: &str, b: &str, d: u32) -> Result<String, String
         "v_mul_legacy_f32" => format!("MulLegacyF32({a}, {b})"),
         "v_fmac_f32" => format!("FmaF32({a}, {b}, v[{d}])"),
         "v_fmac_legacy_f32" => format!("FmaLegacyF32({a}, {b}, v[{d}])"),
-        "v_mac_f32" => format!("asuint(mad(asfloat({a}), asfloat({b}), asfloat(v[{d}])))"),
+        "v_mac_f32" => format!("MadF32({a}, {b}, v[{d}])"),
         "v_cndmask_b32" => format!("(((s[106] >> lane) & 1u) != 0 ? {b} : {a})"),
         "v_add_nc_u32" => format!("({a} + {b})"),
         "v_sub_nc_u32" => format!("({a} - {b})"),
@@ -64,4 +69,23 @@ pub fn expression(name: &str, a: &str, b: &str, d: u32) -> Result<String, String
         }
         _ => return Err(format!("untranslated instruction: {name}")),
     })
+}
+
+pub fn literal_expression(
+    name: &str,
+    a: &str,
+    b: &str,
+    literal: Option<u32>,
+) -> Result<Option<String>, String> {
+    let function = match name {
+        "v_madmk_f32" | "v_madak_f32" => "MadF32",
+        "v_fmamk_f32" | "v_fmaak_f32" => "FmaF32",
+        _ => return Ok(None),
+    };
+    let k = literal.ok_or_else(|| format!("{name}: missing literal"))?;
+    Ok(Some(if name.ends_with("mk_f32") {
+        format!("{function}({a}, 0x{k:X}u, {b})")
+    } else {
+        format!("{function}({a}, {b}, 0x{k:X}u)")
+    }))
 }

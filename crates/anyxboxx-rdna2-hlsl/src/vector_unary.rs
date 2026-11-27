@@ -32,6 +32,7 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<Option<S
 
 pub fn expression(name: &str, a: &str) -> Result<String, String> {
     Ok(match name {
+        "v_rndne_f32" => format!("RndneF32({a})"),
         "v_mov_b32" => a.to_owned(),
         "v_not_b32" => format!("(~{a})"),
         "v_bfrev_b32" => format!("reversebits({a})"),

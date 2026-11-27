@@ -53,16 +53,17 @@ uint FmaRoundPack(uint sign, int e, uint sig) {
   if (sig == 0u) e = 0;
   return (sign << 31) + (uint(e) << 23) + sig;
 }
-uint FmaF32(uint a, uint b, uint c) {
+uint MultiplyAddF32(uint a, uint b, uint c, bool doubleSum) {
   uint ea = (a >> 23) & 0xFFu, eb = (b >> 23) & 0xFFu, ec = (c >> 23) & 0xFFu;
   uint ma = a & 0x7FFFFFu, mb = b & 0x7FFFFFu, mc = c & 0x7FFFFFu;
   uint sp = (a ^ b) >> 31, sc = c >> 31;
   if (ea == 0xFFu && ma != 0u) return a | 0x400000u;
   if (eb == 0xFFu && mb != 0u) return b | 0x400000u;
-  if (ec == 0xFFu && mc != 0u) return c | 0x400000u;
   bool za = (a & 0x7FFFFFFFu) == 0u, zb = (b & 0x7FFFFFFFu) == 0u, zc = (c & 0x7FFFFFFFu) == 0u;
+  if (doubleSum && (ea == 0xFFu || eb == 0xFFu) && (za || zb)) return 0xFFC00000u;
+  if (ec == 0xFFu && mc != 0u) return c | 0x400000u;
   if (ea == 0xFFu || eb == 0xFFu) {
-    if (za || zb || (ec == 0xFFu && sc != sp)) return 0x7FC00000u;
+    if (za || zb || (ec == 0xFFu && sc != sp)) return doubleSum ? 0xFFC00000u : 0x7FC00000u;
     return (sp << 31) | 0x7F800000u;
   }
   if (ec == 0xFFu) return c;
@@ -88,8 +89,22 @@ uint FmaF32(uint a, uint b, uint c) {
   if ((z.x | z.y) == 0u) return 0u;
   uint lz = LeadingZeros64(z);
   z = ShiftLeft64(z, lz - 1u);
+  if (doubleSum) {
+    // The Python MAD oracle first rounds the sum to binary64. Bit 62 is the leading one.
+    uint discarded = z.x & 0x3FFu;
+    uint kept = z.x & ~0x3FFu;
+    if (discarded > 0x200u || (discarded == 0x200u && (kept & 0x400u) != 0u)) {
+      uint incremented = kept + 0x400u;
+      z.y += incremented < kept ? 1u : 0u;
+      kept = incremented;
+    }
+    z.x = kept;
+    if (z.y == 0x80000000u) { z.y = 0x40000000u; ++fx; }
+  }
   return FmaRoundPack(sz, fx - int(lz) + 189, z.y | (z.x != 0u ? 1u : 0u));
 }
+uint FmaF32(uint a, uint b, uint c) { return MultiplyAddF32(a, b, c, false); }
+uint MadF32(uint a, uint b, uint c) { return MultiplyAddF32(a, b, c, true); }
 uint FmaLegacyF32(uint a, uint b, uint c) {
   // DX9 : 0 × n'importe quoi = 0, le résultat est alors c (rendu silencieux s'il est NaN).
   if ((a & 0x7FFFFFFFu) == 0u || (b & 0x7FFFFFFFu) == 0u) {
