@@ -766,6 +766,90 @@ fn synthetic_bvh_arena_locality_packing_move_remove_and_lifetime_on_gpu() {
         host.run_test_list_sync(&list);
     }
     assert_eq!(read_results(res_ptr, 1)[0], bvh::intersect(&seed_box_moved, 5, &ray, true), "dyn moved box must miss");
+
+    // 4. Fence-gated retirement under lowest-arena-first reuse:
+    //    Submit Flight 1 reading `big_addr` asynchronously (`run_test_list_async`),
+    //    then immediately evict `big_addr` via `gone()` and allocate a brand-new
+    //    4-page packed BVH `repl_addr` BEFORE waiting for Flight 1's fence.
+    //    Retired slots MUST stay out of Arena 0's bitmap until Flight 1 finishes,
+    //    so Flight 1 still sees `big_box_p0` intact and `repl_addr` gets fresh
+    //    slots without overwriting Flight 1's pages!
+    let (res_f1_buf, res_f1_ptr) = host.shared_buffer((THREADS as usize * 16) as u64).expect("res f1");
+    heap.raw_uav_at(2, &rec_buf, 0, (THREADS as usize * RECORD_BYTES) as u64);
+    heap.raw_uav_at(3, &res_f1_buf, 0, (THREADS as usize * 16) as u64);
+    write_ray_record(rec_ptr, 0, (big_addr + 64) as u64, 5, &ray);
+    crate::frame::test_advance();
+    let list_f1 = host.new_list().expect("flight 1");
+    let r_f1 = ready(&list_f1, &heap, &[], &[], &[], Use::Reads, None).unwrap();
+    pipe.dispatch(&list_f1, &heap, &r_f1, 2, 1, None);
+    list_f1.close();
+    let (sub_f1, fence_f1) = host.run_test_list_async(&list_f1);
+
+    let big_slot_before = MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.pages.get(&((big_addr as u64) / PAGE)).map(|h| (h.copy, h.at)))
+        .expect("big_addr page must be held");
+
+    // Evict `big_addr` while Flight 1 may still be in flight.
+    // SAFETY: zeroing header of synthetic packed BVH.
+    unsafe { std::ptr::write_unaligned(big_addr as *mut u64, 0) };
+    {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_mut().unwrap().gone(big_addr as u64);
+    }
+
+    // Stream a replacement 4-page packed BVH with different geometry right away.
+    let repl_addr = region.base + (5 << 20);
+    let repl_box_p0 = make_box32(
+        [0x777, bvh::NONE, bvh::NONE, bvh::NONE],
+        [[-1.0, -1.0, 20.5, 1.0, 1.0, 21.5], [f32::NAN; 6], [f32::NAN; 6], [f32::NAN; 6]],
+    );
+    write_packed_bvh_2page(repl_addr, 4095, &repl_box_p0, &big_box_p1, &big_tri_p1);
+    crate::frame::test_advance();
+    let list_f2 = host.new_list().expect("flight 2");
+    let r_f2 = ready(&list_f2, &heap, &[repl_addr as u64], &[], &[], Use::Builds { back: false }, None).unwrap();
+    if sub_f1 != 0 {
+        let repl_slot = MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.pages.get(&((repl_addr as u64) / PAGE)).map(|h| (h.copy, h.at)))
+            .expect("repl_addr page must be held");
+        assert_ne!(
+            repl_slot, big_slot_before,
+            "retired slot must not be handed back to Arena 0 bitmap while Flight 1 is still in flight"
+        );
+    }
+    list_f2.close();
+    host.wait_test_fence(fence_f1);
+    assert_eq!(
+        read_results(res_f1_ptr, 1)[0],
+        bvh::intersect(&big_box_p0, 5, &ray, true),
+        "in-flight Flight 1 must still read pre-removal geometry"
+    );
+
+    // Now submit Flight 2 and verify `repl_addr` renders cleanly AND retired
+    // pages return to the arena bitmap once Flight 1 has completed.
+    write_ray_record(rec_ptr, 0, (repl_addr + 64) as u64, 5, &ray);
+    let list_f2_trace = host.new_list().expect("flight 2 trace");
+    pipe.dispatch(&list_f2_trace, &heap, &r_f2, 0, 1, None);
+    list_f2_trace.close();
+    host.run_test_list_sync(&list_f2);
+    host.run_test_list_sync(&list_f2_trace);
+    assert_eq!(
+        read_results(res_ptr, 1)[0],
+        bvh::intersect(&repl_box_p0, 5, &ray, true),
+        "replacement packed BVH must intersect cleanly"
+    );
+    let retiring_left = {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let m = guard.as_mut().unwrap();
+        m.reclaim_retired();
+        m.retiring.len()
+    };
+    assert_eq!(retiring_left, 0, "all retired pages must return to arena bitmap after GPU fence completes");
 }
 
 /// Sustained-load GPU benchmark measuring arena locality, split multi-page BVHs,

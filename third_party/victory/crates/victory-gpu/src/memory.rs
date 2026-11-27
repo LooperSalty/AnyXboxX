@@ -66,7 +66,7 @@
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
@@ -288,6 +288,9 @@ struct Memory {
     arenas: Vec<Arena>,
     /// Total free pages across `arenas`.
     free_pages: usize,
+    /// Reclaimed arena pages waiting for in-flight GPU submissions to finish
+    /// before returning to their arena bitmap: `(retire_gate, copy, at)`.
+    retiring: VecDeque<(crate::host::BvhRetire, usize, usize)>,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
@@ -378,6 +381,7 @@ impl Memory {
             numbers: HashMap::new(),
             arenas: Vec::new(),
             free_pages: 0,
+            retiring: VecDeque::new(),
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
@@ -521,6 +525,7 @@ impl Memory {
     /// Allocates the lowest free page from the lowest-numbered arena with space,
     /// optionally creating a new arena when all existing arenas are full.
     fn alloc_one(&mut self, allow_new: bool) -> Option<(usize, usize)> {
+        self.reclaim_retired();
         for arena in &mut self.arenas {
             if let Some(at) = arena.take_one() {
                 self.free_pages -= 1;
@@ -544,13 +549,18 @@ impl Memory {
         if need == 0 || need > ARENA_PAGES {
             return None;
         }
+        self.reclaim_retired();
         for arena in &mut self.arenas {
             if let Some(at) = arena.take_run(need) {
                 self.free_pages -= need;
                 return Some((arena.copy, at));
             }
         }
-        if allow_new && self.free_pages < need && self.pages.len() + self.free_pages < MOST && self.another() {
+        if allow_new
+            && self.free_pages < need
+            && self.pages.len() + self.free_pages + self.retiring.len() < MOST
+            && self.another()
+        {
             let arena = self.arenas.last_mut()?;
             if let Some(at) = arena.take_run(need) {
                 self.free_pages -= need;
@@ -586,6 +596,18 @@ impl Memory {
             && arena.give_back(at)
         {
             self.free_pages += 1;
+        }
+    }
+
+    /// Moves retired arena pages whose GPU submissions have completed back
+    /// into their owning arenas' free bitmaps.
+    fn reclaim_retired(&mut self) {
+        while let Some(front) = self.retiring.front_mut() {
+            if !crate::host::bvh_retire_ready(&mut front.0) {
+                break;
+            }
+            let (_, copy, at) = self.retiring.pop_front().unwrap();
+            self.give_back(copy, at);
         }
     }
 
@@ -670,16 +692,24 @@ impl Memory {
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
-    /// given back.
+    /// invalidated in the directory immediately and fence-retired until every
+    /// in-flight or queued GPU submission completes before returning to their
+    /// arena bitmap.
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
+        let mut target = crate::host::bvh_retire_target();
+        let ready_now = crate::host::bvh_retire_ready(&mut target);
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
             if held.owners == 0 && held.theirs {
                 let (copy, at) = (held.copy, held.at);
                 self.pages.remove(&page);
-                self.give_back(copy, at);
+                if ready_now {
+                    self.give_back(copy, at);
+                } else {
+                    self.retiring.push_back((target, copy, at));
+                }
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
             }
@@ -860,9 +890,19 @@ impl Memory {
         self.stats.packed += 1;
     }
 
+    /// Finishes placing `page` into an already-allocated arena slot `(copy, at)`
+    /// at submission time (shared by [`Memory::place`] and
+    /// [`Memory::place_packed_pages`]).
+    fn finish_placed_page(&mut self, page: u64, copy: usize, at: usize) {
+        self.hold(page, at, copy);
+        crate::watch::wrote(self.entry(page) as usize, 8);
+        self.take(page, 0, PAGE as usize, true);
+    }
+
     /// Places unmapped pages of a packed structure (`first..=last`) at
     /// submission time, preferring a contiguous run in the lowest arena so
     /// late-streamed multi-page BVHs also stay contiguous inside one arena.
+    /// Enforces `MOST` and skips title-buffer pages identically to `place()`.
     fn place_packed_pages(&mut self, first: u64, last: u64) {
         let count = (last.saturating_sub(first) + 1) as usize;
         if count > 1 && count <= ARENA_PAGES {
@@ -877,12 +917,10 @@ impl Memory {
                     unmapped.push(p);
                 }
             }
-            if unmapped.len() > 1 {
+            if unmapped.len() > 1 && self.pages.len() + unmapped.len() <= MOST {
                 if let Some((copy, base)) = self.alloc_run(unmapped.len(), false) {
                     for (k, p) in unmapped.iter().copied().enumerate() {
-                        self.hold(p, base + k * PAGE as usize, copy);
-                        crate::watch::wrote(self.entry(p) as usize, 8);
-                        self.take(p, 0, PAGE as usize, true);
+                        self.finish_placed_page(p, copy, base + k * PAGE as usize);
                     }
                     for p in first..=last {
                         let new = unmapped.binary_search(&p).is_ok();
@@ -895,9 +933,7 @@ impl Memory {
                 }
                 if let Some((copy, addrs)) = self.alloc_single_arena(unmapped.len()) {
                     for (&p, at) in unmapped.iter().zip(addrs) {
-                        self.hold(p, at, copy);
-                        crate::watch::wrote(self.entry(p) as usize, 8);
-                        self.take(p, 0, PAGE as usize, true);
+                        self.finish_placed_page(p, copy, at);
                     }
                     for p in first..=last {
                         let new = unmapped.binary_search(&p).is_ok();
@@ -928,6 +964,7 @@ impl Memory {
     fn place(&mut self, page: u64) -> bool {
         if page < 0x1_0000
             || page >= u64::from(MEMORY_PAGES) - 1
+            || self.pages.len() >= MOST
             || !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize)
             || crate::shadow::in_buffer(page * PAGE, PAGE).is_some()
         {
@@ -936,9 +973,7 @@ impl Memory {
         let Some((copy, at)) = self.alloc_one(false) else {
             return false;
         };
-        self.hold(page, at, copy);
-        crate::watch::wrote(self.entry(page) as usize, 8);
-        self.take(page, 0, PAGE as usize, true);
+        self.finish_placed_page(page, copy, at);
         true
     }
 
@@ -1266,7 +1301,8 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free_pages < SPARE && m.pages.len() + m.free_pages < MOST && m.another() {}
+    m.reclaim_retired();
+    while builds && m.free_pages < SPARE && m.pages.len() + m.free_pages + m.retiring.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.

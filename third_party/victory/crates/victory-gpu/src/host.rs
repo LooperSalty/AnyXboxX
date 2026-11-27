@@ -92,7 +92,12 @@ fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, 
     RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Submissions started and finished (waited for).
+/// Submissions entered (`ISSUED`), begun under the submission lock (`STARTED`),
+/// and finished on the GPU (`FINISHED`). Every call to [`Host::submit`]
+/// increments `ISSUED` once on entry and `STARTED` once under `self.submitted`,
+/// so `FINISHED >= target` for any `target = ISSUED.load(Acquire)` guarantees
+/// every submission that had entered `submit` has completed on the GPU.
+static ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -586,6 +591,40 @@ fn sweep() {
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
+/// Exact retirement barrier for a freed BVH arena page: either waiting for
+/// async-submit entries queued in `queue::behind` at retire time (`< limit`)
+/// to reach [`Host::submit`], or waiting for an exact [`Host::submit`]
+/// submission number to finish on the GPU (`FINISHED >= target`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BvhRetire {
+    Queued(u64),
+    Submitted(u64),
+}
+
+/// Captures an exact retirement barrier covering every in-flight or queued
+/// GPU submission at retire time.
+pub(crate) fn bvh_retire_target() -> BvhRetire {
+    if let Some(limit) = crate::queue::pending_mark() {
+        BvhRetire::Queued(limit)
+    } else {
+        BvhRetire::Submitted(ISSUED.load(Ordering::Acquire))
+    }
+}
+
+/// Whether every submission covered by `gate` has completed on the GPU.
+pub(crate) fn bvh_retire_ready(gate: &mut BvhRetire) -> bool {
+    if let BvhRetire::Queued(limit) = *gate {
+        if !crate::queue::passed_mark(limit) {
+            return false;
+        }
+        *gate = BvhRetire::Submitted(ISSUED.load(Ordering::Acquire));
+    }
+    match *gate {
+        BvhRetire::Submitted(target) => FINISHED.load(Ordering::Acquire) >= target,
+        BvhRetire::Queued(_) => false,
+    }
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -5607,15 +5646,32 @@ impl Host {
         land();
     }
 
-    /// Sends `list`, a closed list of ours (the present's copy), as a
-    /// flight ([`late_free_present`]): not waited for, settled with the
-    /// others. The caller keeps the list and does not reset it before the
-    /// submission whose number comes back has finished ([`FINISHED`]); 0 if
-    /// it ran and was waited for after all. The second value is the queue
-    /// fence covering the list in either case.
     #[cfg(test)]
     pub(crate) fn run_test_list_sync(&self, list: &HostList) {
         let _ = self.submit(&[list], &[], false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_test_list_async(&self, list: &HostList) -> (u64, u64) {
+        self.execute_own(list)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_test_fence(&self, fence: u64) {
+        // SAFETY: live fence and event owned by Host; wait until GPU reaches `fence`.
+        unsafe {
+            if self.fence.GetCompletedValue() < fence {
+                let _ = self.fence.SetEventOnCompletion(fence, self.event);
+                WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+        if late() {
+            settle_now(WHY_SYNC);
+        } else {
+            let started = STARTED.load(Ordering::Acquire);
+            FINISHED.store(started, Ordering::Release);
+            bury(started);
+        }
     }
 
     #[cfg(test)]
@@ -5643,6 +5699,12 @@ impl Host {
         }
     }
 
+    /// Sends `list`, a closed list of ours (the present's copy), as a
+    /// flight ([`late_free_present`]): not waited for, settled with the
+    /// others. The caller keeps the list and does not reset it before the
+    /// submission whose number comes back has finished ([`FINISHED`]); 0 if
+    /// it ran and was waited for after all. The second value is the queue
+    /// fence covering the list in either case.
     fn execute_own(&self, list: &HostList) -> (u64, u64) {
         late_threads();
         let Submission { fence, ahead: flight } = self.submit(&[list], &[], true);
@@ -5883,6 +5945,7 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Submission<'a> {
+        ISSUED.fetch_add(1, Ordering::AcqRel);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
