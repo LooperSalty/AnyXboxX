@@ -9389,6 +9389,42 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    times: Option<FrameTimes>,
+}
+
+#[derive(Default)]
+struct FrameTimes {
+    last: Option<std::time::Instant>,
+    intervals: Vec<f32>,
+}
+
+impl FrameTimes {
+    fn tick(&mut self, now: std::time::Instant) {
+        if let Some(last) = self.last.replace(now) {
+            self.intervals.push((now - last).as_secs_f32() * 1000.0);
+        }
+    }
+}
+
+fn frame_times(mut times: Vec<f32>) -> String {
+    if times.is_empty() {
+        return "frame times since the last such line: no frames".into();
+    }
+    let over = |ms: f32| times.iter().filter(|&&t| t > ms).count();
+    let (over50, over100) = (over(50.0), over(100.0));
+    let long: Vec<String> = times.iter().filter(|&&t| t > 50.0).map(|t| format!("{t:.0}")).collect();
+    times.sort_unstable_by(f32::total_cmp);
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    format!(
+        "frame times since the last such line: {} frames, median {:.1} ms, 95% under {:.1}, 99% under {:.1}; {over50} over 50 ms, \
+         {over100} over 100 ms, the longest {:.0} ms; over 50 ms: [{}]",
+        times.len(),
+        (times[(times.len() - 1) / 2] + times[times.len() / 2]) * 0.5,
+        at(0.95),
+        at(0.99),
+        times[times.len() - 1],
+        long.join(", ")
+    )
 }
 
 impl Meter {
@@ -9402,6 +9438,7 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            times: crate::switch::on("VICTORY_FRAME_TIMES").then(FrameTimes::default),
         }
     }
 
@@ -9438,7 +9475,11 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let now = std::time::Instant::now();
+        if let Some(times) = &mut self.times {
+            times.tick(now);
+        }
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -9460,7 +9501,11 @@ impl Meter {
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
+        let intervals = self.times.as_mut().filter(|_| five).map(|t| std::mem::take(&mut t.intervals));
         meter_lines(move || {
+            if let Some(times) = intervals {
+                tracing::info!("{}", frame_times(times));
+            }
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -9780,6 +9825,7 @@ mod present_status_tests {
     #[test]
     fn the_meter_counts_successful_presents_across_a_failure() {
         let mut meter = Meter::new();
+        meter.times = Some(super::FrameTimes::default());
         let hwnd = HWND::default();
         assert!(meter.record_present(hwnd, S_OK));
         assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
@@ -9788,6 +9834,18 @@ mod present_status_tests {
         assert!(meter.record_present(hwnd, S_OK));
         assert_eq!(meter.frames, 2);
         assert_eq!(meter.last_present, S_OK);
+        assert_eq!(meter.times.unwrap().intervals.len(), 1);
+    }
+
+    #[test]
+    fn interval_percentiles_and_strict_hitch_thresholds() {
+        let mut times = vec![40.0; 94];
+        times.extend([50.0, 100.0, 101.0, 250.0, 70.0, 55.0]);
+        let line = super::frame_times(times);
+        assert!(line.contains("100 frames, median 40.0 ms, 95% under 50.0, 99% under 101.0"), "{line}");
+        assert!(line.contains("5 over 50 ms, 2 over 100 ms, the longest 250 ms; over 50 ms: [100, 101, 250, 70, 55]"), "{line}");
+        assert!(super::frame_times(vec![18.0, 56.0]).contains("median 37.0 ms"));
+        assert!(super::frame_times(Vec::new()).contains("no frames"));
     }
 }
 
