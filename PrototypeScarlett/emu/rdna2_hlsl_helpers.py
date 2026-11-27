@@ -120,8 +120,23 @@ uint SadU32(uint a, uint b, uint c) {
 // Opérations f32 dans des fonctions `precise` (dxc ne replie plus x + 0, x - x ni 0 × x). Le pilote AMD
 // (RX 9070 XT) replie pourtant fadd x, 0.0 et fsub x, x, et Intel fsub 0.0, x : le signe d'un résultat
 // exactement nul et x - x sont donc fixés en entier.
-double F32ToF64(uint a);
-uint F64ToF32(double x);
+uint F32ShiftJam(uint value, uint distance) {
+  if (distance == 0u) return value;
+  if (distance >= 32u) return value != 0u ? 1u : 0u;
+  return (value >> distance) | ((value << (32u - distance)) != 0u ? 1u : 0u);
+}
+uint F32Round(uint sign, int exponent, uint sig) {
+  // Biased exponent, hidden bit at 26, three guard/round/sticky bits.
+  if (exponent < 1) { sig = F32ShiftJam(sig, uint(1 - exponent)); exponent = 1; }
+  uint rounded = (sig + 3u + ((sig >> 3) & 1u)) >> 3;
+  if (rounded >= 0x1000000u) { rounded >>= 1; ++exponent; }
+  if (exponent >= 255) return sign | 0x7F800000u;
+  if (rounded < 0x800000u) return sign | rounded;
+  return sign | (uint(exponent) << 23) | (rounded & 0x7FFFFFu);
+}
+uint F32Significand(uint magnitude) {
+  return (magnitude & 0x7FFFFFu) | (magnitude >= 0x800000u ? 0x800000u : 0u);
+}
 uint F32Add(uint a, uint b) {
   if (IsNanF32(a)) return a | 0x400000u;
   if (IsNanF32(b)) return b | 0x400000u;
@@ -129,8 +144,21 @@ uint F32Add(uint a, uint b) {
   if (x == 0x7F800000u) return y == x && a != b ? 0xFFC00000u : a;
   if (y == 0x7F800000u) return b;
   if (x == y && (x == 0u || a != b)) return a & b & 0x80000000u;
-  precise double sum = F32ToF64(a) + F32ToF64(b);
-  return F64ToF32(sum);
+  uint large = max(x, y), small = min(x, y), sign = (x >= y ? a : b) & 0x80000000u;
+  int e = int(max(1u, large >> 23));
+  uint u = F32Significand(large) << 3;
+  uint v = F32ShiftJam(F32Significand(small) << 3, uint(e) - max(1u, small >> 23));
+  uint r;
+  if (((a ^ b) >> 31) == 0u) {
+    r = u + v;
+    if (r >= 0x8000000u) { r = F32ShiftJam(r, 1u); ++e; }
+  } else {
+    r = u - v;
+    uint shift = min(uint(e - 1), 26u - firstbithigh(r));
+    r <<= shift;
+    e -= int(shift);
+  }
+  return F32Round(sign, e, r);
 }
 uint F32Sub(uint a, uint b) {
   if (IsNanF32(a)) return a | 0x400000u;
@@ -143,8 +171,14 @@ uint F32Mul(uint a, uint b) {
   uint x = a & 0x7FFFFFFFu, y = b & 0x7FFFFFFFu, sign = (a ^ b) & 0x80000000u;
   if (x == 0x7F800000u || y == 0x7F800000u) return min(x, y) == 0u ? 0xFFC00000u : sign | 0x7F800000u;
   if (min(x, y) == 0u) return sign;
-  precise double product = F32ToF64(a) * F32ToF64(b);
-  return F64ToF32(product);
+  uint u = F32Significand(x), v = F32Significand(y);
+  uint i = 23u - firstbithigh(u), j = 23u - firstbithigh(v);
+  u <<= i; v <<= j;
+  uint hi = MulHiU32(u, v), lo = u * v;
+  uint extra = hi >> 15, shift = 20u + extra;
+  int e = int(max(1u, x >> 23) + max(1u, y >> 23) + extra) - 127 - int(i + j);
+  uint sig = (hi << (32u - shift)) | (lo >> shift) | ((lo << (32u - shift)) != 0u ? 1u : 0u);
+  return F32Round(sign, e, sig);
 }
 uint F32MinMax(uint a, uint b, bool maximum) {
   if (IsNanF32(a)) return a | 0x400000u;
