@@ -11,9 +11,19 @@ use library::*;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::*;
+use crate::object::Object;
 use windows::Win32::Graphics::Dxgi::*;
 
+mod device;
+mod upscale;
+pub(crate) use device::device_made;
+pub use upscale::*;
+
+const VIEWPORT_DLSS: u32 = 1;
 const INTERPOSER: &str = "sl.interposer.dll";
 /// The project id NGX is given (engine "custom", no NVIDIA application id).
 const PROJECT_ID: &CStr = c"6f0d7b2e-3a41-4c1e-9b57-2d8e4f1a9c30";
@@ -226,4 +236,60 @@ pub fn check() -> Result<(), String> {
     if code != 0 { return Err(format!("slShutdown: {} ({code})", abi::result_name(code))); }
     if !available.dlss && !available.framegen { return Err("no requested feature is supported".into()); }
     Ok(())
+}
+/// The per-feature functions, once the device is set.
+#[derive(Default)]
+struct Functions {
+    dlss_optimal: Option<abi::SlDlssGetOptimalSettings>,
+    dlss_set_options: Option<abi::SlDlssSetOptions>,
+}
+
+static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
+static DLSS_READY: AtomicBool = AtomicBool::new(false);
+/// Library calls that are not thread safe, and what the upscaling keeps
+/// between frames, one caller at a time.
+#[derive(Default)]
+struct Calls {
+    /// Optimal render sizes by output size and mode.
+    optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
+    /// The mode, sizes and preset the last options named.
+    last: Option<(u32, [u32; 2], [u32; 2])>,
+}
+static CALLS: Mutex<Calls> = Mutex::new(Calls {
+    optimal: Vec::new(),
+    last: None,
+});
+fn calls() -> std::sync::MutexGuard<'static, Calls> {
+    CALLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+static EVALUATED: AtomicU64 = AtomicU64::new(0);
+static FAILED: AtomicU64 = AtomicU64::new(0);
+static FORWARDED: AtomicU64 = AtomicU64::new(0);
+static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: an out pointer and an index.
+    let code = unsafe { (sl.get_new_frame_token)(&mut token, &index) };
+    (code == 0 && !token.is_null()).then_some(token)
+}
+
+
+pub(crate) fn line(frames: f64) {
+    if !serving() { return; }
+    let [done, failed, forwarded] = [&EVALUATED, &FAILED, &FORWARDED].map(|n| n.swap(0, Relaxed) as f64 / frames);
+    tracing::info!("DLSS per frame: {done:.2} recorded, {failed:.2} failed, {forwarded:.2} left to FidelityFX");
+}
+
+/// Select the title's FidelityFX path only after the host device is ready.
+pub fn title_mode() -> Option<Mode> {
+    if !std::env::var_os("VICTORY_DLSS").is_some_and(|v| v == "1") { return None; }
+    let mut asked = Asked::from_env().map_err(|why| tracing::warn!("Streamline: {why}; using the title's upscaler")).ok()?;
+    asked.framegen = false;
+    if !init(&asked).dlss { return None; }
+    if crate::host::host().is_none() || !serving() {
+        tracing::warn!("Streamline device unavailable; using the title's upscaler");
+        return None;
+    }
+    Some(asked.mode)
 }

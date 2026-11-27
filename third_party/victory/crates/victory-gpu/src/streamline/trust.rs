@@ -55,8 +55,6 @@ fn signer_is_nvidia(data: &WINTRUST_DATA) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn rejects_unsigned_dll_before_loading() {
         let dir = tempfile::tempdir().unwrap();

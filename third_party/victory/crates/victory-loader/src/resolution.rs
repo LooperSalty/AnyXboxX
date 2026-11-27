@@ -277,6 +277,16 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// code yet.
 #[cfg(windows)]
 pub unsafe fn apply_asked(base: usize, size: usize) {
+    unsafe { apply_with_fidelityfx(base, size, None) };
+}
+
+/// Apply the existing FidelityFX selector and scale when the host upscaler is
+/// ready. An explicit FidelityFX scale takes precedence.
+///
+/// # Safety
+/// The image is mapped and no title thread has started.
+#[cfg(windows)]
+pub unsafe fn apply_with_fidelityfx(base: usize, size: usize, scale: Option<f32>) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
@@ -287,10 +297,10 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     if let Some(s) = asked_render_scale() {
         asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
     }
-    if let Some(s) = asked_ffx_scale() {
+    if let Some(s) = asked_ffx_scale().or(scale) {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
     }
-    if let Some(kind) = asked_upscaler() {
+    if let Some(kind) = scale.map(|_| 7).or_else(asked_upscaler) {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
     }
     for (site, code, value) in asked {
