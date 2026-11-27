@@ -112,6 +112,8 @@ Rust translates the f16 arithmetic and transcendental operations and the f16 int
 
 Typed MUBUF/MTBUF loads and stores, including d16, are covered by 34 WARP/interpreter comparisons, one per encoding.
 
+MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
+
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.
 
 **Still Python:**

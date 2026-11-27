@@ -8,6 +8,7 @@ mod flat_atomic;
 mod flat_memory;
 mod half;
 mod half_templates;
+mod image;
 mod lds;
 mod lds_lanes;
 mod scalar;
@@ -116,6 +117,7 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "MIMG" => return image::statements(name, bytes),
         "MTBUF" | "MUBUF" if anyxboxx_rdna2_ref::format_access::supports(name) => {
             return typed_buffer::statements(name, pair);
         }
