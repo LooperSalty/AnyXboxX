@@ -13,6 +13,8 @@ pub fn cards(app: &mut App, ui: &mut Ui) {
         keyboard_card(app, &mut columns[1]);
     });
     ui.add_space(tokens::M);
+    streamline_card(app, ui);
+    ui.add_space(tokens::M);
     ui.columns(2, |columns| {
         performance_card(app, &mut columns[0]);
         diagnostics_card(app, &mut columns[1]);
@@ -96,6 +98,24 @@ fn keyboard_card(app: &mut App, ui: &mut Ui) {
         ui.label("Look: I J K L (up, left, down, right)");
         ui.label(keyboard.shoulder_keys());
         ui.label("Confirm: Enter. Back: Backspace. Menu: Esc.");
+    });
+}
+
+fn streamline_card(app: &mut App, ui: &mut Ui) {
+    theme::card(ui, |ui| {
+        card_title(ui, "NVIDIA Streamline");
+        let options = &mut app.settings.options.streamline;
+        toggle_row(ui, "DLSS Super Resolution", &mut options.dlss);
+        toggle_row(ui, "DLSS Frame Generation 2×", &mut options.framegen);
+        ui.add_space(tokens::S);
+        ui.label("Streamline DLL folder");
+        let browse = ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut options.directory)
+                .hint_text("Default under %LOCALAPPDATA%")
+                .desired_width((ui.available_width() - 90.0).max(100.0)));
+            ui.button("Browse…").clicked()
+        }).inner;
+        if browse { app.open_dialog(crate::picker::Pick::StreamlineFolder); }
     });
 }
 

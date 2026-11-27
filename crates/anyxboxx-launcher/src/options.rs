@@ -304,6 +304,7 @@ pub struct LaunchOptions {
     /// NVIDIA Smooth Motion (driver frame generation) for victory.exe: written into the driver's
     /// profile before each launch (`smooth_motion`), not into VIctory's environment.
     pub smooth_motion: bool,
+    pub streamline: crate::streamline::Options,
 }
 
 impl Default for LaunchOptions {
@@ -324,6 +325,7 @@ impl Default for LaunchOptions {
             auto_a: false,
             frametime_dump: false,
             smooth_motion: false,
+            streamline: Default::default(),
         }
     }
 }
@@ -349,6 +351,7 @@ impl LaunchOptions {
     /// default. The user's own overrides go after these and win.
     pub fn env_pairs(&self) -> Vec<Pair> {
         let mut pairs = self.preset.overrides();
+        self.streamline.append_env(&mut pairs);
         if let Some((w, h)) = self.size() {
             pairs.push((DISPLAY_MODE.to_string(), format!("{w}x{h}")));
             if TITLE_MODES.contains(&(w, h)) {

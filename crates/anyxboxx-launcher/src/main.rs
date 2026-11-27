@@ -40,6 +40,7 @@ mod session;
 mod setup;
 mod shade;
 mod smooth_motion;
+mod streamline;
 mod splash;
 mod store;
 mod theme;

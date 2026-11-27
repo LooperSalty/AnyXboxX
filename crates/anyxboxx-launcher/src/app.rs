@@ -211,12 +211,13 @@ impl App {
         self.open_dialog(Pick::XgLibrary);
     }
 
-    fn open_dialog(&mut self, kind: Pick) {
+    pub(crate) fn open_dialog(&mut self, kind: Pick) {
         if self.pick_rx.is_some() {
             return;
         }
         let start = match kind {
             Pick::GameFolder => self.settings.game_path(),
+            Pick::StreamlineFolder => Some(PathBuf::from(&self.settings.options.streamline.directory)),
             Pick::XgLibrary => PathBuf::from(self.settings.xg_dll.trim())
                 .parent()
                 .map(PathBuf::from),
@@ -251,6 +252,7 @@ impl App {
         };
         match kind {
             Pick::GameFolder => self.set_game_folder(&path),
+            Pick::StreamlineFolder => self.settings.options.streamline.directory = path.display().to_string(),
             Pick::XgLibrary => self.settings.xg_dll = path.display().to_string(),
         }
     }

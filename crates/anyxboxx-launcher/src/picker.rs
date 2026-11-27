@@ -12,6 +12,7 @@ pub const GAME_EXE: &str = "game_scarlett_master.exe";
 pub enum Pick {
     GameFolder,
     XgLibrary,
+    StreamlineFolder,
 }
 
 /// Checks that `dir` is the game folder.
@@ -66,6 +67,7 @@ pub fn open(kind: Pick, start_in: Option<PathBuf>) -> Receiver<(Pick, Option<Pat
             Pick::GameFolder => dialog
                 .set_title("Choose the game folder (it holds game_scarlett_master.exe)")
                 .pick_folder(),
+            Pick::StreamlineFolder => dialog.set_title("Choose the folder containing sl.interposer.dll").pick_folder(),
             Pick::XgLibrary => dialog
                 .set_title("Choose your xg_xs.dll")
                 .add_filter("xg_xs.dll", &["dll"])
