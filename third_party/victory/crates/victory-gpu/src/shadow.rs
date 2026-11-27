@@ -5882,18 +5882,6 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
-    by_address_inner(start, len, false)
-}
-
-/// An owned buffer for [`crate::memory`] (its directory and BVH arenas):
-/// writes go directly into its CPU-cached `L0 WRITE_BACK` staging buffer
-/// (`data_mut()`) and notify the card via `mark_card_dirty*`, avoiding a
-/// duplicate write-watched host mirror and redundant full-arena refreshes.
-pub(crate) fn by_address_owned(len: u64) -> Option<Arc<Shadow>> {
-    by_address_inner(0, len, true)
-}
-
-fn by_address_inner(start: u64, len: u64, owned: bool) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -5941,13 +5929,10 @@ fn by_address_inner(start: u64, len: u64, owned: bool) -> Option<Arc<Shadow>> {
                 true,
             )
         }
-        None if owned => {
-            // VRAM full fallback: shaders read the L0 WRITE_BACK buffer
-            // directly, avoiding a second L0 allocation and L0->L0 copies.
-            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address (shared)"));
-            (staging, None, false)
-        }
         None => {
+            // Keep the shader's copy separate from staging even in shared
+            // memory. The CPU can change a directory entry or update a BVH
+            // while a previous submission still needs its old contents.
             let buffer = host.shared_buffer(len)?.0;
             crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
             crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address (shared)"));
@@ -5978,6 +5963,13 @@ fn by_address_inner(start: u64, len: u64, owned: bool) -> Option<Arc<Shadow>> {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
     Some(shadow)
+}
+
+/// An owned buffer for [`crate::memory`]'s directory and arenas. The caller
+/// writes to the staging mapping directly and marks the changed ranges for
+/// upload in submission order.
+pub(crate) fn by_address_owned(len: u64) -> Option<Arc<Shadow>> {
+    by_address(0, len)
 }
 
 /// Copies of title memory outside buffers, by (start, length).

@@ -392,6 +392,29 @@ impl Drop for TitleRegion {
 /// Serializes GPU memory tests in one process since `MEMORY` is global.
 static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Lets the test change scene state while an earlier GPU submission is pending.
+struct QueueBlock(ID3D12Fence);
+
+impl QueueBlock {
+    fn new(host: &Host) -> Self {
+        // SAFETY: the new fence belongs to the queue's device; Drop signals it.
+        unsafe {
+            let block = Self(host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("test fence"));
+            host.queue().Wait(&block.0, 1).expect("queue test fence");
+            block
+        }
+    }
+}
+
+impl Drop for QueueBlock {
+    fn drop(&mut self) {
+        // SAFETY: the queue only waits on this live CPU-signaled fence.
+        unsafe {
+            let _ = self.0.Signal(1);
+        }
+    }
+}
+
 fn run_trace(
     host: &Host,
     heap: &HostHeap,
@@ -425,6 +448,7 @@ fn run_trace(
     (read_results(results_ptr, count), refreshes, prepare_us)
 }
 
+/// Set `VICTORY_MEMORY_CARD_MB=0` to exercise the shared-memory fallback.
 #[test]
 fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
     let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -582,16 +606,17 @@ fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
     let (out_c0, _, _) = run_trace(host, &heap, &pipe, 0, res_ptr, &[bvh_c as u64], &[bvh_c as u64], 2);
     assert_eq!(out_c0[0], bvh::intersect(&box_c, 5, &ray_hit_a, true));
 
-    // Launch Flight 1 tracing BVH C without waiting!
+    // Hold Flight 1 on the GPU queue until the CPU has removed BVH C.
     unsafe { std::ptr::write_bytes(res_ptr, 0xAA, 32) };
     crate::frame::test_advance();
     let list_f1 = host.new_list().expect("list_f1");
     let rf1 = ready(&list_f1, &heap, &[bvh_c as u64], &[], &[], Use::Reads, None).expect("ready f1");
     pipe.dispatch(&list_f1, &heap, &rf1, 0);
     list_f1.close();
+    let queue_block = QueueBlock::new(host);
     let (_, fence_f1) = host.run_test_list_async(&list_f1);
 
-    // Immediately remove BVH C and stream fresh BVH B while Flight 1 may still be running!
+    // Retire C while Flight 1 still has to read its old directory entry.
     unsafe { std::ptr::write_unaligned(bvh_c as *mut u64, 0) };
     let retired_while_in_flight = {
         let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -604,6 +629,7 @@ fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
         retired_while_in_flight >= 1,
         "freed arena page must stay in fence-gated retiring queue while Flight 1 is in flight"
     );
+    drop(queue_block);
     write_packed_bvh(bvh_b, 1023, &box_b, &tri_b);
     write_ray_record(rec2_ptr, 0, (bvh_b + 64) as u64, 5, &ray_hit_a);
     write_ray_record(rec2_ptr, 1, (bvh_b + 192) as u64, 0, &ray_hit_a);
