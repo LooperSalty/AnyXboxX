@@ -41,7 +41,7 @@ pub enum Taken {
 /// Whether the title's FidelityFX calls are to be served (DLSS or frame
 /// generation is on): `victory_hle` then puts its own in front of them.
 pub fn serving() -> bool {
-    DLSS_READY.load(Acquire)
+    DLSS_READY.load(Acquire) || FG_READY.load(Acquire)
 }
 
 /// Whether DLSS is to take the title's upscale dispatches (`VICTORY_DLSS=1`
@@ -59,7 +59,8 @@ pub fn upscale(up: &Upscale) -> Taken {
         return Taken::No("Streamline is not loaded");
     };
     let dlss = plan.dlss && DLSS_READY.load(Acquire);
-    if !dlss {
+    let framegen = plan.framegen && FG_READY.load(Acquire);
+    if !dlss && !framegen {
         return Taken::No("Streamline has no device yet, or its features did not start");
     }
     if [COLOUR, DEPTH, MOTION, OUTPUT].iter().any(|&i| up.resources[i].0.is_null()) {
@@ -76,13 +77,19 @@ pub fn upscale(up: &Upscale) -> Taken {
     let asked = crate::list::external(
         up.list,
         Box::new(move |host| {
-            evaluate(host, &up, id)
+            if dlss && !evaluate(host, &up, id) {
+                return false;
+            }
+            if framegen {
+                note(host, &up, id);
+            }
+            true
         }),
     );
     if !asked {
         return Taken::No("DLSS could not record into the command list");
     }
-    Taken::Dlss
+    if dlss { Taken::Dlss } else { Taken::Noted }
 }
 
 /// The title's own upscaling ran for this reason.
@@ -186,7 +193,7 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
 
 /// Colour, depth, motion vectors, exposure, reactive mask, (transparency),
 /// output: the host textures DLSS is given and the states they are in.
-type Textures = [Option<(ID3D12Resource, u32)>; 7];
+pub(super) type Textures = [Option<(ID3D12Resource, u32)>; 7];
 
 fn formats(textures: &Textures) -> Vec<i32> {
     textures
@@ -200,9 +207,9 @@ fn formats(textures: &Textures) -> Vec<i32> {
 }
 
 /// What [`record`] recorded.
-struct Recorded {
-    mode: u32,
-    optimal: Option<[u32; 2]>,
+pub(super) struct Recorded {
+    pub(super) mode: u32,
+    pub(super) optimal: Option<[u32; 2]>,
     /// Another mode or size than the last time.
     changed: bool,
     jitter: [f32; 2],
@@ -213,14 +220,26 @@ struct Recorded {
 /// `list`: the mode whose render size holds the title's, the options, the
 /// frame's constants (frame `id` of the upscaling's viewport), the textures
 /// as local tags. The textures are left in the states given.
-fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exposure: f32, id: u64) -> Result<Recorded, String> {
+pub(super) fn record(
+    list: *mut c_void,
+    textures: &Textures,
+    camera: &plan::Camera,
+    pre_exposure: f32,
+    id: u64,
+) -> Result<Recorded, String> {
     let (Some(plan), Some(sl), Some(functions)) = (PLAN.get(), SL.get(), FUNCTIONS.get()) else {
         return Err("Streamline is not ready".into());
     };
     let (Some(optimal_of), Some(set_options)) = (functions.dlss_optimal, functions.dlss_set_options) else {
         return Err("no DLSS functions".into());
     };
+    // (Timed with frame generation: its present shares this lock and
+    // Streamline with the upscaling.)
+    let began = plan.framegen.then(std::time::Instant::now);
     let mut calls = calls();
+    if let Some(began) = began {
+        spent(T_UPSCALE_LOCK, began);
+    }
     let output = camera.output;
     let optimal = |calls: &mut Calls, mode: u32| -> Option<[u32; 2]> {
         if let Some(&(_, _, size)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
@@ -230,8 +249,8 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         let mut settings = abi::DlssOptimalSettings::default();
         // SAFETY: filled options and a structure to fill.
         let code = unsafe { optimal_of(&options, &mut settings) };
-        let size = (code == 0 && settings.optimal_render_width > 0)
-            .then_some([settings.optimal_render_width, settings.optimal_render_height]);
+        let size =
+            (code == 0 && settings.optimal_render_width > 0).then_some([settings.optimal_render_width, settings.optimal_render_height]);
         calls.optimal.push((output, mode, size));
         size
     };
@@ -268,9 +287,7 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     ];
     let mut resources: Vec<(abi::Resource, u32, [u32; 2])> = kinds
         .iter()
-        .filter_map(|&(i, kind, size)| {
-            textures[i].as_ref().map(|(t, state)| (abi::Resource::texture(t.as_raw(), *state), kind, size))
-        })
+        .filter_map(|&(i, kind, size)| textures[i].as_ref().map(|(t, state)| (abi::Resource::texture(t.as_raw(), *state), kind, size)))
         .collect();
     let mut tags: Vec<abi::ResourceTag> = resources
         .iter_mut()
@@ -282,6 +299,9 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let code = unsafe { (sl.evaluate_feature)(abi::FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, list) };
     if code != 0 {
         return Err(format!("slEvaluateFeature: {} ({code})", abi::result_name(code)));
+    }
+    if let Some(began) = began {
+        spent(T_UPSCALE, began);
     }
     Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
 }

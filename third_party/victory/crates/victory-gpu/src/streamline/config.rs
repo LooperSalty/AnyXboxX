@@ -33,16 +33,14 @@ impl Asked {
         let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
         let framegen = on("VICTORY_FRAMEGEN");
         let mode = match var("VICTORY_DLSS_MODE") {
-            Some(name) => Mode::from_name(&name).ok_or_else(|| {
-                format!("VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, ultraperformance")
-            })?,
+            Some(name) => Mode::from_name(&name)
+                .ok_or_else(|| format!("VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, ultraperformance"))?,
             // Frame generation alone keeps the scene at the output's size.
             None if framegen && !on("VICTORY_DLSS") => Mode::Dlaa,
             None => Mode::Quality,
         };
         let preset = match var("VICTORY_DLSS_PRESET") {
-            Some(name) => plan::preset(&name)
-                .ok_or_else(|| format!("VICTORY_DLSS_PRESET={name}: not one of default, e, f, j, k, l, m"))?,
+            Some(name) => plan::preset(&name).ok_or_else(|| format!("VICTORY_DLSS_PRESET={name}: not one of default, e, f, j, k, l, m"))?,
             None => 0,
         };
         Ok(Asked {
@@ -73,12 +71,12 @@ pub struct Available {
     pub framegen: bool,
 }
 
-
 fn streamline_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("VICTORY_STREAMLINE_DIR").filter(|dir| !dir.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty())
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join("victory/nvidia-sdk/Streamline/bin/x64"))
         .ok_or_else(|| "set VICTORY_STREAMLINE_DIR to the folder containing sl.interposer.dll".into())
 }

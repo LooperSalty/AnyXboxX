@@ -112,7 +112,17 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
-    let dlss_mode = execute.then(victory_gpu::streamline::title_mode).flatten();
+    let dlss_mode = execute.then(victory_gpu::streamline::title_mode).flatten().filter(|mode| {
+        if victory_gpu::streamline::upscaling() { return true; }
+        let output = victory_loader::resolution::asked_output().unwrap_or(match console {
+            Console::SeriesS => (1920, 1080), Console::SeriesX => (3840, 2160),
+        });
+        let scale = victory_loader::resolution::asked_ffx_scale().unwrap_or(mode.scale());
+        let render = [(output.0 as f32 * scale) as u32, (output.1 as f32 * scale) as u32];
+        if output == (1920, 1080) && matches!(render, [1280, 720] | [1920, 1080]) { return true; }
+        tracing::warn!(?output, ?render, "Frame Generation alone requires a supported native FidelityFX size; using the title's renderer. Enable DLSS for this output.");
+        false
+    });
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());

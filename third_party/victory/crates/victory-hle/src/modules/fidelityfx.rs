@@ -164,7 +164,11 @@ fn interpose(name: &str, original: usize) -> Option<usize> {
         ffxQuery as *const () as usize,
         ffxDispatch as *const () as usize,
     ][i];
-    tracing::info!(name, original = format_args!("{original:#x}"), "FidelityFX: the title's import goes through ours (DLSS / frame generation)");
+    tracing::info!(
+        name,
+        original = format_args!("{original:#x}"),
+        "FidelityFX: the title's import goes through ours (DLSS / frame generation)"
+    );
     Some(ours)
 }
 
@@ -187,7 +191,8 @@ const SHIPPING_MAX_RENDER: [u32; 2] = [1280, 720];
 /// The sizes the title's shipping FSR4 accepts for a context, if `render` and
 /// `output` are not those: (render, output).
 fn shipping_sizes(render: [u32; 2], output: [u32; 2]) -> Option<([u32; 2], [u32; 2])> {
-    (output != SHIPPING_MAX_OUTPUT || (render != SHIPPING_MAX_RENDER && render != SHIPPING_MAX_OUTPUT)).then_some((SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT))
+    (output != SHIPPING_MAX_OUTPUT || (render != SHIPPING_MAX_RENDER && render != SHIPPING_MAX_OUTPUT))
+        .then_some((SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT))
 }
 
 extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, memory: *const c_void) -> u32 {
@@ -263,7 +268,10 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
     // The native function may clear the handle on success.
     let handle = unsafe { context.as_ref() }.map(|p| *p as usize);
     let code = unsafe { std::mem::transmute::<*const (), Destroy>(destroy)(context, memory) };
-    if code == OK && let Some(handle) = handle && contexts(|c| c.remove(&handle)).is_some() {
+    if code == OK
+        && let Some(handle) = handle
+        && contexts(|c| c.remove(&handle)).is_some()
+    {
         streamline::upscaler_destroyed(handle);
     }
     code
