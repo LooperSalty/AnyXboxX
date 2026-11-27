@@ -253,7 +253,12 @@ mod tests {
         settings.overrides = "VICTORY_DLSS=0".into();
         let plan = make_plan(&settings, Path::new("."), None, &profile(), true).unwrap();
         assert!(crate::streamline::check_launch(&plan.env).is_ok());
-        assert!(!plan.env.iter().any(|(k, _)| k == "VICTORY_UPSCALER"));
+        // The profile itself may set the upscaler (the local player build does);
+        // what the options add must not.
+        let advanced = env::parse_overrides(&settings.overrides).unwrap();
+        let added = settings.options.dlss.env_pairs(true, &advanced);
+        assert!(!added.iter().any(|(k, _)| k == "VICTORY_UPSCALER"));
+        assert!(plan.env.iter().any(|(k, v)| k == "VICTORY_DLSS" && v == "0"));
     }
 
     #[test]
