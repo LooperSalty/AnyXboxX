@@ -286,12 +286,10 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 });
 
 /// Lock-free mirrors of [`BUILDER`] state so hot-path checks (`builder_runs`,
-/// `builder_active` from `ambient::on`) do not contend on `BUILDER` or block a
+/// `builder_ready` from `ambient::on`) do not contend on `BUILDER` or block a
 /// lighting thread compiling builder pipelines.
 #[cfg(windows)]
 static BUILDER_WHOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(windows)]
-static BUILDER_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(windows)]
 static BUILDER_RESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -301,21 +299,28 @@ fn builder_allowed() -> bool {
     *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
 
-/// Pure policy helper for [`builder_active`]: true when the BVH builder is
-/// enabled by env and has not failed to compile its pipeline set.
+/// Pure policy helper for [`builder_ready`]: true only when the BVH builder is
+/// enabled, all registered builder pipelines have compiled (`whole`), and the
+/// builder is not resting for the current frame.
 #[cfg(windows)]
-fn builder_active_for(allowed: bool, failed: bool) -> bool {
-    allowed && !failed
+fn builder_ready_for(allowed: bool, whole: bool, frame: u64, rests: u64) -> bool {
+    allowed && whole && frame >= rests
 }
 
-/// Non-blocking query for passes such as `crate::ambient`: whether ray-tracing
-/// structure building is enabled and has not failed. Never acquires [`BUILDER`]
-/// and never triggers synchronous pipeline compilation on a lighting thread.
+/// Non-blocking query for passes such as `crate::ambient`: whether the whole
+/// ray-tracing structure builder is ready to run (enabled, all registered
+/// builder pipelines compiled, and not resting). Never acquires [`BUILDER`]
+/// and never triggers synchronous pipeline compilation on a lighting thread,
+/// while keeping the ambient stand-in active during warm-up before the BVH
+/// builder is ready.
 #[cfg(windows)]
-pub(crate) fn builder_active() -> bool {
-    builder_active_for(
+pub(crate) fn builder_ready() -> bool {
+    use std::sync::atomic::Ordering;
+    builder_ready_for(
         builder_allowed(),
-        BUILDER_FAILED.load(std::sync::atomic::Ordering::Acquire),
+        BUILDER_WHOLE.load(Ordering::Acquire),
+        crate::frame::current(),
+        BUILDER_RESTS.load(Ordering::Acquire),
     )
 }
 
@@ -407,7 +412,6 @@ pub(crate) fn builder_runs() -> bool {
             b.off = count;
             b.whole = false;
             BUILDER_WHOLE.store(false, Ordering::Release);
-            BUILDER_FAILED.store(b.off == b.pipelines.len(), Ordering::Release);
             tracing::warn!(
                 missing = missing.len(),
                 of = count,
@@ -422,7 +426,6 @@ pub(crate) fn builder_runs() -> bool {
         }
         b.off = 0;
         b.whole = true;
-        BUILDER_FAILED.store(false, Ordering::Release);
         BUILDER_WHOLE.store(true, Ordering::Release);
         tracing::info!(
             pipelines = count,
@@ -653,7 +656,6 @@ fn hand_out(
         b.pipelines.push(host.clone());
         b.whole = false;
         BUILDER_WHOLE.store(false, std::sync::atomic::Ordering::Release);
-        BUILDER_FAILED.store(false, std::sync::atomic::Ordering::Release);
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -987,12 +989,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn builder_active_follows_enable_and_failure_state() {
-        assert!(!builder_active_for(false, false));
-        assert!(!builder_active_for(false, true));
-        // Enabled and not failed: active immediately (even before builder pipelines register).
-        assert!(builder_active_for(true, false));
-        // Enabled, but a builder pipeline failed to compile: falls back cleanly.
-        assert!(!builder_active_for(true, true));
+    fn builder_ready_follows_whole_and_rest_state() {
+        assert!(!builder_ready_for(false, true, 10, 0));
+        // Enabled, but builder pipelines have not finished compiling yet (warm-up)
+        // or failed: stays false so ambient does not treat an empty BVH as ready.
+        assert!(!builder_ready_for(true, false, 10, 0));
+        // Whole builder compiled, but currently resting for this frame and the next.
+        assert!(!builder_ready_for(true, true, 10, 12));
+        // Enabled, whole builder compiled, and past any rest window.
+        assert!(builder_ready_for(true, true, 12, 12));
+        assert!(builder_ready_for(true, true, 15, 12));
     }
 }
