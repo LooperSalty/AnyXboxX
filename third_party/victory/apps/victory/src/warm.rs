@@ -56,7 +56,16 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
 fn run_in(dir: &Path, options: Options) -> Result<()> {
     let began = Instant::now();
     known::use_translations(dir.with_file_name("shaders"));
-    let fingerprint = known::warm_cache_metadata().map(journal::fingerprint);
+    let fingerprint = match known::warm_cache_metadata() {
+        Ok(metadata) => Some(journal::fingerprint(metadata)),
+        Err(error) => {
+            eprintln!(
+                "Warning from victory warm. Compiler context unavailable ({error:#}). \
+                 Eligible pipelines will be attempted again on subsequent warm runs."
+            );
+            None
+        }
+    };
     run_with_worker(dir, options, &known::keys(dir), fingerprint.as_deref(), began, start_worker)
 }
 

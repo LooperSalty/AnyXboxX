@@ -1,5 +1,5 @@
 use std::fs;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -192,4 +192,33 @@ fn an_unknown_context_cannot_suppress_or_record_an_attempt() {
     assert!(journal.keys.is_empty());
     journal.append(KEYS[1], "device removed").unwrap();
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn unavailable_warm_device_reports_a_warning() {
+    // A separate process selects the adapter before this test binary caches its host.
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "warm::tests::clean_first_run_creates_both_shaders_and_pipelines_cache_dirs",
+            "--nocapture",
+        ])
+        .env(
+            "VICTORY_D3D12_ADAPTER",
+            "__synthetic_warm_adapter_unavailable__",
+        )
+        .env_remove("VICTORY_D3D12_WARP")
+        .output()
+        .unwrap();
+    let warning = String::from_utf8_lossy(&child.stderr);
+    assert!(child.status.success(), "{warning}");
+    assert!(warning.contains("Warning from victory warm"), "{warning}");
+    assert!(
+        warning.contains("D3D12 warm device unavailable"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("Eligible pipelines will be attempted again"),
+        "{warning}"
+    );
 }

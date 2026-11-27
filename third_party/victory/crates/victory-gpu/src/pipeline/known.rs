@@ -24,6 +24,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use anyhow::Context;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::{
@@ -263,18 +264,19 @@ pub struct WarmCacheMetadata {
 
 /// Read the selected adapter rather than inferring the backend from a switch.
 /// A journal cannot establish a match when the host or driver is unknown.
-pub fn warm_cache_metadata() -> Option<WarmCacheMetadata> {
-    let host = crate::host::host()?;
+pub fn warm_cache_metadata() -> anyhow::Result<WarmCacheMetadata> {
+    let host = crate::host::host().context("D3D12 warm device unavailable")?;
     let driver = host.driver();
-    if driver == 0 {
-        return None;
-    }
+    anyhow::ensure!(driver != 0, "DXGI driver version unavailable for the warm adapter");
     // SAFETY: query the adapter description by its live device's LUID.
     let desc = unsafe {
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        factory.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()).ok()?.GetDesc1().ok()?
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            .context("creating the DXGI factory for warm adapter metadata")?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid())
+            .context("finding the selected warm adapter in DXGI")?;
+        adapter.GetDesc1().context("reading the selected warm adapter description")?
     };
-    Some(WarmCacheMetadata {
+    Ok(WarmCacheMetadata {
         // Host creation establishes the adapter's wave settings first.
         translation: crate::shader_cache::translation(),
         software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
