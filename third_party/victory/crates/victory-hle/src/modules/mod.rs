@@ -21,6 +21,7 @@ pub mod files;
 pub mod gameinput;
 pub mod kernel;
 pub mod keymap;
+pub mod mouse;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
@@ -42,6 +43,7 @@ pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
+pub mod window_identity;
 pub mod xsystem;
 pub mod xuser;
 

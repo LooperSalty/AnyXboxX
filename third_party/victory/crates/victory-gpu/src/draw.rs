@@ -8,6 +8,11 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+#[cfg(test)]
+mod cut_tables_tests;
+#[cfg(all(test, windows))]
+mod texture_read_tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -36,6 +41,7 @@ pub(crate) struct TablePlan {
 }
 
 struct TableGroup {
+    reader_id: u64,
     slot: u8,
     has_cbv: bool,
     has_uav: bool,
@@ -55,9 +61,11 @@ impl TablePlan {
             .collect();
         slots.sort_unstable();
         slots.dedup();
+        static NEXT_READER: AtomicU64 = AtomicU64::new(1);
         let mut groups: Vec<_> = slots
             .iter()
             .map(|&slot| TableGroup {
+                reader_id: NEXT_READER.fetch_add(1, Ordering::Relaxed),
                 slot,
                 has_cbv: false,
                 has_uav: false,
@@ -531,9 +539,8 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Dynamic slots for a table snapshot, scoped to its owning host heap.
+    fresh_tables: std::collections::HashMap<FreshTableKey, FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Title heap address, host heap identity, first slot, and slot count.
     /// Given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
@@ -1336,9 +1343,10 @@ impl State {
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// draw anyway. Dynamic descriptor slots already allocated stay in
+    /// `dynamic` until the title's last part finishes. Build fresh tables and
+    /// an indirect window for the new host list: CBVs and indirect data in the
+    /// earlier list's scratch upload memory may be recycled before this runs.
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -1347,6 +1355,9 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.fresh_tables.clear();
+        self.recording = 0;
+        self.window = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -3869,10 +3880,10 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                FreshTableKey { heap: host.id(), table, count: n, contents: h.0 }
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = (group.reader_id, STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -3883,7 +3894,7 @@ impl State {
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
                     if *depth {
-                        TESTED_DEPTH.set((reader.3, true));
+                        TESTED_DEPTH.set((reader.2, true));
                     }
                     made.push((slot, first * 32));
                     continue;
@@ -4002,6 +4013,7 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    Some(view @ View::Constant(_, 0)) => host.make_at(index, &view),
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
@@ -4786,6 +4798,14 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FreshTableKey {
+    heap: u64,
+    table: u64,
+    count: u32,
+    contents: u64,
+}
+
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
@@ -4794,7 +4814,7 @@ struct FreshTable {
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
-    ready: Vec<((usize, usize, bool, usize), bool)>,
+    ready: Vec<((u64, bool, usize), bool)>,
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -4852,10 +4872,24 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_copy(*resource as This)
-                && t.flags() & 0x7 == 0
-            {
+            // The depth target the draw only tests is read in both ways at
+            // once: both read states, which its preparation asks for too.
+            let (tested, _) = TESTED_DEPTH.get();
+            let state = if tested != 0 && tested == *resource {
+                TESTED_DEPTH.set((tested, true));
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
+            // One lookup of the host copy (and twin) for the upload, the
+            // twin and the state: each lookup takes the texture's lock.
+            // Without a host side (a buffer, or a texture the host refused
+            // to make: `resource::hosted` says no again each time) there is
+            // nothing to upload, pair or move, as before.
+            let Some((copy, twin)) = crate::resource::host_side(*resource as This) else {
+                return;
+            };
+            if !aliased && copy.flags() & 0x7 == 0 {
                 // (A texture the title writes: no target, depth or unordered
                 // access, `crate::texture::title_written`.)
                 // Of a texture the title placed, the levels the view shows.
@@ -4866,23 +4900,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 crate::texture::upload_from(list, *resource as This, first);
             }
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
-            // The depth target the draw only tests is read in both ways at
-            // once: both read states, which its preparation asks for too.
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
-            };
-            crate::list::ensure_state(list, *resource as This, state);
+            if let Some(twin) = &twin {
+                list.twin_use_held(&copy, twin, false, false);
+            }
+            crate::list::ensure_held_state(list, &copy, state);
             #[cfg(feature = "diagnostics")]
-            if tracing::enabled!(tracing::Level::DEBUG)
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-            {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
+                let d = unsafe { copy.texture.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
                     tracing::debug!(
                         resource = format_args!("{resource:#x}"),
@@ -5202,5 +5227,38 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod descriptor_cache_identity_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_with_the_same_address_and_contents_are_scoped_to_the_heap() {
+        let first = FreshTableKey { heap: 1, table: 32, count: 2, contents: 17 };
+        let second = FreshTableKey { heap: 2, ..first };
+        let mut state = State::default();
+        state.fresh_tables.insert(first, FreshTable { first: 7, epoch: 0, ready: Vec::new() });
+        assert!(state.fresh_tables.get(&second).is_none());
+    }
+
+    #[test]
+    fn table_readiness_ids_belong_to_live_access_groups() {
+        let used = |offset| UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            slot: 0,
+            table_offset_dwords: offset,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+        };
+        let first = TablePlan::new(&[used(0)], &[]);
+        let old_id = first.groups[0].reader_id;
+        drop(first);
+        let second = TablePlan::new(&[used(8)], &[]);
+        assert_ne!(second.groups[0].reader_id, old_id);
     }
 }
