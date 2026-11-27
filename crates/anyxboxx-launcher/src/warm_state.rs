@@ -13,19 +13,30 @@ use anyxboxx::run::Env;
 
 pub const MARKER_FILE: &str = "warm-state.txt";
 /// `VICTORY_*` variables that affect `victory warm`: cache location/key, compute pipeline filters
-/// (`victory-gpu/src/pipeline`), host wave/view overrides, and shader translator switches
-/// (`third_party/victory/crates/victory-shader`). Runtime-only options (resolution, window mode,
-/// keyboard, overlay, Auto-A, frametime dump, presets, relay, XG DLL, log level) leave the warmed
-/// cache unchanged and must not force a redundant ~7-minute re-warm.
+/// and root/descriptor layout (`victory-gpu/src`), host wave/view overrides, and shader translator
+/// switches (`third_party/victory/crates/victory-shader`). Runtime-only options (resolution,
+/// window mode, keyboard, overlay, Auto-A, frametime dump, presets, relay, XG DLL, log level)
+/// leave the warmed cache unchanged and must not force a redundant ~7-minute re-warm.
+///
+/// The guard test in `warm_state_tests.rs` scans both `victory-shader/src` and `victory-gpu/src`
+/// so any newly added `VICTORY_*` switch fails CI until explicitly classified here or as
+/// runtime-only.
 const CACHE_KEYS: &[&str] = &[
     // Cache location and cache-key mode (`victory-core/src/config.rs`, `shader_cache.rs`).
     "VICTORY_CACHE_DIR",
     "VICTORY_CONFIG",
     "VICTORY_SHADER_KEY",
     "VICTORY_SHADER_FRESH",
-    // Compute pipelines kept or skipped during `victory warm` (`pipeline.rs`, `pipeline/make.rs`).
+    // Compute pipelines, root layout, descriptor layout, and device selection (`victory-gpu/src`).
     "VICTORY_ACTIVATE_RAYS",
     "VICTORY_BVH_BUILDER",
+    "VICTORY_BVH_QUARANTINE",
+    "VICTORY_D3D12_WARP",
+    "VICTORY_DYNAMIC_SLOTS",
+    "VICTORY_EARLY_ALL",
+    "VICTORY_PIPELINE_HISTORY",
+    "VICTORY_RAW_VIEWS",
+    "VICTORY_ROOT_SRV_DIRECT",
     "VICTORY_RT_RESOLVE",
     "VICTORY_SKIP_PIPELINES",
     // Host wave/view overrides that enter `translation_fingerprint`.
@@ -178,295 +189,5 @@ pub fn forget_marker(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsString;
-
-    #[test]
-    fn a_forgotten_marker_makes_the_next_launch_warm() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("warm-state.txt");
-        write_marker(&path, "fp").expect("write");
-        assert!(!needs_warm(false, read_marker(&path).as_deref(), "fp"));
-        forget_marker(&path).expect("forget");
-        assert!(needs_warm(false, read_marker(&path).as_deref(), "fp"));
-        forget_marker(&path).expect("a missing marker is fine");
-    }
-
-    fn env(pairs: &[(&str, &str)]) -> Env {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
-            .collect()
-    }
-
-    fn archives() -> Vec<String> {
-        vec!["a.rpf:10:5".to_string()]
-    }
-
-    #[test]
-    fn a_missing_marker_means_the_warm_runs() {
-        let fp = fingerprint("1:2", &env(&[("VICTORY_RELAY", "2")]), &archives());
-        assert!(needs_warm(false, None, &fp));
-    }
-
-    #[test]
-    fn the_same_fingerprint_in_the_marker_skips_the_warm() {
-        let fp = fingerprint("1:2", &env(&[("VICTORY_RELAY", "2")]), &archives());
-        assert!(!needs_warm(false, Some(&format!("{fp}\n")), &fp));
-    }
-
-    #[test]
-    fn a_different_marker_means_the_warm_runs() {
-        let fp = fingerprint("1:2", &env(&[]), &archives());
-        assert!(needs_warm(false, Some("0000000000000000"), &fp));
-    }
-
-    #[test]
-    fn always_re_warm_ignores_a_current_marker() {
-        let fp = fingerprint("1:2", &env(&[]), &archives());
-        assert!(needs_warm(true, Some(&fp), &fp));
-    }
-
-    #[test]
-    fn a_new_victory_build_changes_the_fingerprint() {
-        let before = fingerprint("100:1", &env(&[]), &archives());
-        let after = fingerprint("100:2", &env(&[]), &archives());
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn a_changed_cache_variable_changes_the_fingerprint() {
-        let before = fingerprint("1:1", &env(&[("VICTORY_SHADER_OPT", "1")]), &archives());
-        let after = fingerprint("1:1", &env(&[("VICTORY_SHADER_OPT", "0")]), &archives());
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn the_game_folder_and_log_level_do_not_change_the_fingerprint() {
-        let base = fingerprint("1:1", &env(&[("VICTORY_SHADER_OPT", "1")]), &archives());
-        let moved = fingerprint(
-            "1:1",
-            &env(&[
-                ("VICTORY_SHADER_OPT", "1"),
-                ("VICTORY_GAME_DIR", "D:\\Other"),
-                ("VICTORY_LOG", "debug"),
-            ]),
-            &archives(),
-        );
-        assert_eq!(base, moved);
-    }
-
-    #[test]
-    fn non_cache_variables_are_not_part_of_the_key() {
-        assert_eq!(
-            env_key(&env(&[
-                ("PATH", "x"),
-                ("VKD3D_CONFIG", "y"),
-                ("VICTORY_RELAY", "2"),
-                ("VICTORY_DISPLAY_MODE", "1920x1080"),
-            ])),
-            ""
-        );
-        assert_eq!(
-            env_key(&env(&[
-                ("VICTORY_SHADER_OPT", "2"),
-                ("VICTORY_GROUP_SYNC", "1")
-            ])),
-            "VICTORY_GROUP_SYNC=1\nVICTORY_SHADER_OPT=2"
-        );
-    }
-
-    #[test]
-    fn a_changed_archive_changes_the_fingerprint() {
-        let before = fingerprint("1:1", &env(&[]), &["a.rpf:10:5".to_string()]);
-        let after = fingerprint("1:1", &env(&[]), &["a.rpf:11:5".to_string()]);
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn the_marker_round_trips_through_its_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir
-            .path()
-            .join("AnyXboxX")
-            .join("launcher")
-            .join(MARKER_FILE);
-        assert!(read_marker(&path).is_none());
-        write_marker(&path, "abc").expect("write");
-        let text = read_marker(&path).expect("read");
-        assert!(!needs_warm(false, Some(&text), "abc"));
-    }
-
-    #[test]
-    fn the_marker_lives_under_appdata() {
-        let path = marker_path(Some(std::ffi::OsStr::new(r"C:\L"))).expect("path");
-        assert!(path.ends_with(Path::new("AnyXboxX").join("launcher").join(MARKER_FILE)));
-        assert!(marker_path(None).is_none());
-        assert!(marker_path(Some(std::ffi::OsStr::new(""))).is_none());
-    }
-
-    #[test]
-    fn overridden_victory_variables_keep_only_the_last_value() {
-        let overridden = env(&[
-            ("VICTORY_SHADER_OPT", "2"),
-            ("VICTORY_GROUP_SYNC", "1"),
-            ("VICTORY_SHADER_OPT", "0"),
-        ]);
-        let direct = env(&[("VICTORY_GROUP_SYNC", "1"), ("VICTORY_SHADER_OPT", "0")]);
-        assert_eq!(
-            env_key(&overridden),
-            "VICTORY_GROUP_SYNC=1\nVICTORY_SHADER_OPT=0"
-        );
-        assert_eq!(
-            fingerprint("1:1", &overridden, &archives()),
-            fingerprint("1:1", &direct, &archives())
-        );
-    }
-
-    #[test]
-    fn every_shader_translator_switch_is_in_the_warm_key() {
-        let shader_src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("third_party")
-            .join("victory")
-            .join("crates")
-            .join("victory-shader")
-            .join("src");
-        if !shader_src.is_dir() {
-            return;
-        }
-        let mut files = Vec::new();
-        collect_rs(&shader_src, &mut files);
-        for path in files {
-            let rel = path
-                .strip_prefix(&shader_src)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if rel.ends_with("_tests.rs")
-                || matches!(
-                    rel.as_str(),
-                    "emit/host.rs" | "emit/validator.rs" | "emit/bitcode/census.rs"
-                )
-            {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let mut rest = text.as_str();
-            while let Some(at) = rest.find("\"VICTORY_") {
-                let tail = &rest[at + 1..];
-                let end = tail
-                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-                    .unwrap_or(tail.len());
-                if tail[end..].starts_with('"') {
-                    let name = &tail[..end];
-                    let ignored = name.ends_with("_WHY")
-                        || matches!(
-                            name,
-                            "VICTORY_SHADER_SOURCE_HASH"
-                                | "VICTORY_SHADER_SWITCHES"
-                                | "VICTORY_WAVE_DUMP"
-                                | "VICTORY_REF_VS"
-                                | "VICTORY_REF_PS"
-                        );
-                    if !ignored {
-                        assert!(
-                            affects_shader_cache(name),
-                            "{name} (in {rel}) affects shader translation and must be in CACHE_KEYS"
-                        );
-                    }
-                }
-                rest = &tail[end..];
-            }
-        }
-    }
-
-    fn collect_rs(dir: &Path, into: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rs(&path, into);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                into.push(path);
-            }
-        }
-    }
-
-    #[test]
-    fn a_missing_victory_exe_is_its_own_build_identity() {
-        assert_eq!(
-            build_id(Path::new("does-not-exist/victory.exe")),
-            "not-built"
-        );
-    }
-
-    #[test]
-    fn play_page_runtime_options_do_not_invalidate_the_warm_marker() {
-        use crate::options::{Keyboard, LaunchOptions, Preset, Resolution, WindowMode};
-        use crate::profile::Profiles;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("game_scarlett_master.exe"), b"x").expect("write");
-        let profile = Profiles::embedded()
-            .expect("profiles")
-            .by_id("windows-nvidia")
-            .expect("profile")
-            .clone();
-        let base_env = crate::env::build_env(dir.path(), &profile, &[], None).expect("env");
-        let base_fp = fingerprint("1:1", &base_env, &archives());
-
-        for options in [
-            LaunchOptions {
-                resolution: Resolution::P1080,
-                window: WindowMode::Borderless,
-                keyboard: Keyboard::Azerty,
-                overlay: false,
-                auto_a: true,
-                frametime_dump: true,
-                ..LaunchOptions::default()
-            },
-            LaunchOptions {
-                preset: Preset::Quality,
-                ..LaunchOptions::default()
-            },
-            LaunchOptions {
-                preset: Preset::MidVram,
-                ..LaunchOptions::default()
-            },
-            LaunchOptions {
-                preset: Preset::LowVram,
-                ..LaunchOptions::default()
-            },
-        ] {
-            let env = crate::env::build_env(dir.path(), &profile, &options.env_pairs(), None)
-                .expect("env");
-            assert_eq!(
-                fingerprint("1:1", &env, &archives()),
-                base_fp,
-                "runtime-only Play options {options:?} must not force a shader cache re-warm"
-            );
-        }
-
-        for (key, value) in [
-            ("VICTORY_SHADER_OPT", "0"),
-            ("VICTORY_RT_RESOLVE", "0"),
-            ("VICTORY_CACHE_DIR", "D:\\other-cache"),
-            ("VICTORY_SKIP_PIPELINES", "0123456789abcdef"),
-        ] {
-            let overrides = vec![(key.to_string(), value.to_string())];
-            let env = crate::env::build_env(dir.path(), &profile, &overrides, None).expect("env");
-            assert_ne!(
-                fingerprint("1:1", &env, &archives()),
-                base_fp,
-                "cache-affecting switch {key} must invalidate the warm marker"
-            );
-        }
-    }
-}
+#[path = "warm_state_tests.rs"]
+mod tests;
