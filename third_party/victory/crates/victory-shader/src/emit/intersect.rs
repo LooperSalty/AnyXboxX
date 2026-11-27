@@ -252,6 +252,7 @@ impl<'a> Lower<'a> {
             results.push((phi, zero));
         }
         let results = self.end_guarded(gate, &results);
+        // Partial masks assume ordinary MIMG packing into consecutive VGPRs.
         let mut out_reg = 0u8;
         for (k, &r) in results.iter().enumerate() {
             if (*dmask >> k) & 1 != 0 {

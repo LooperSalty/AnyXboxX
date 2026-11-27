@@ -3689,6 +3689,7 @@ impl<'a> Lower<'a> {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
         let places = k(self, MEMORY_FAULTS - 1);
+        // Out-of-range addresses log the clamped sentinel page.
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;
