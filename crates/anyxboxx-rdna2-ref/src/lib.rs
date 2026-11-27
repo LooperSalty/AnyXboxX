@@ -43,6 +43,7 @@ pub mod image_exec;
 pub mod image_sample;
 pub mod image_texel;
 pub mod interp;
+pub mod listing;
 pub mod memory;
 pub mod mnemonics;
 pub mod movrel;

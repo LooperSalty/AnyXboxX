@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use anyxboxx::{banc, carte, jour_j, rapport, run, traduction};
 use clap::{Parser, Subcommand};
+mod rdna2;
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect a RDNA 2 shader or execute a wave32 in the reference interpreter.
+    Rdna2(rdna2::Args),
     /// Build VIctory and launch it on your own game folder (replaces the former tools/lancer_victory.ps1).
     Run(run::RunArgs),
     /// Compatibility report of an executable or package folder (replaces scarlett.py --rapport).
@@ -41,6 +44,7 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
+        Command::Rdna2(args) => rdna2::command(args),
         Command::Run(args) => launch(&args),
         Command::Rapport(args) => match rapport::rapport(&args) {
             Ok(text) => {
