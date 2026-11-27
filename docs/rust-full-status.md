@@ -112,7 +112,7 @@ Rust translates the f16 arithmetic and transcendental operations and the f16 int
 
 Typed MUBUF/MTBUF loads and stores, including d16, are covered by 34 WARP/interpreter comparisons, one per encoding.
 
-The Rust wave32 emitter also covers all 40 VOP3/VOP3P integer 16-bit encodings in the Python model. One shader compares the half selects, saturation, packed results, constants and partial EXEC against interpreter memory on WARP.
+The Rust wave32 emitter also covers all 40 VOP3/VOP3P integer 16-bit encodings in the Python model. One shader compares the half selects, saturation, packed results, constants and partial EXEC against interpreter memory on WARP. The masked byte SAD and all three sliding-window SAD instructions also match interpreter memory on WARP.
 
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 

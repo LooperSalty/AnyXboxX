@@ -13,6 +13,7 @@ mod int16;
 mod int16_templates;
 mod lds;
 mod lds_lanes;
+mod sad;
 mod scalar;
 mod scalar_atomic;
 mod scalar_binary;
@@ -119,6 +120,7 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "VOP3" if sad::supports(name) => sad::statement(name, pair, literal)?,
         "VOP3" | "VOP3P" if int16::supports(name) => {
             int16::statement(name, family == "VOP3P", pair, literal)?
         }

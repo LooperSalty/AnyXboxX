@@ -112,7 +112,7 @@ Rust traduit en wave32 l’arithmétique et les transcendantes f16, les conversi
 
 Les lectures et écritures typées MUBUF/MTBUF, y compris d16, sont couvertes par 34 comparaisons WARP/interpréteur, une par encodage.
 
-En wave32, le générateur Rust couvre aussi les 40 encodages entiers 16 bits VOP3/VOP3P du modèle Python. Un shader vérifie sous WARP la sélection des moitiés, la saturation, les résultats compactés, les constantes et les écritures sous EXEC partiel en comparant la mémoire à celle de l’interpréteur.
+En wave32, le générateur Rust couvre aussi les 40 encodages entiers 16 bits VOP3/VOP3P du modèle Python. Un shader vérifie sous WARP la sélection des moitiés, la saturation, les résultats compactés, les constantes et les écritures sous EXEC partiel en comparant la mémoire à celle de l’interpréteur. Le SAD masqué sur des octets et les trois instructions SAD à fenêtre glissante donnent également la même mémoire sous WARP et dans l’interpréteur.
 
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
