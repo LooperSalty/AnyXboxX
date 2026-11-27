@@ -1,7 +1,5 @@
-//! The launch options of the Play page and the environment each one sets. Every option that
-//! reaches VIctory goes through the one table in `env_pairs`, and `ENV_NAMES` lists the variable
-//! names it may use: a test checks each of them against VIctory's own sources in this tree, so an
-//! option never names a variable nothing reads.
+//! The Play page's launch options. Display, input and performance settings are mapped here.
+//! Streamline's variables and their dependencies are mapped in `dlss`.
 //!
 //! Not offered, because the Neptune tree of VIctory has nothing behind them: the Series S console
 //! profile. Discord presence stays off (VICTORY_DISCORD=0, set by `anyxboxx run`).
@@ -286,6 +284,7 @@ impl LogLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaunchOptions {
+    pub dlss: crate::dlss::DlssOptions,
     pub preset: Preset,
     pub resolution: Resolution,
     pub custom_width: u32,
@@ -309,6 +308,7 @@ pub struct LaunchOptions {
 impl Default for LaunchOptions {
     fn default() -> Self {
         LaunchOptions {
+            dlss: Default::default(),
             preset: Preset::Fast,
             // Full HD by default: the title renders at 1280x720 inside instead of 2560x1440
             // (4K, the size a Series X wrote in its settings). Measured on an RTX 4070 SUPER,
