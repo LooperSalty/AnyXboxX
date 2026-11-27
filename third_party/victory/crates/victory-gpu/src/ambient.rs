@@ -672,14 +672,16 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         match role {
             Role::Radiance => {
                 // Wait only on the title's radiance UAV before sampling it;
-                // `mean` writes only our private `cells` buffer, consumed later
-                // by `Role::Resolve`, so no trailing global UAV barrier is needed.
+                // flush our private `cells` UAV after `mean` so `Role::Air` and
+                // `Role::Resolve` (`place`/`gather`/`raise`) observe `cells[CELLS]`
+                // without a global UAV barrier.
                 l.ResourceBarrier(&[uav_barrier_of(target)]);
                 l.SetPipelineState(&pass.keep);
                 l.Dispatch(8, 9, 1);
                 l.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
                 l.SetPipelineState(&pass.mean);
                 l.Dispatch(1, 1, 1);
+                l.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => {
@@ -690,9 +692,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Resolve => {
                 if constant == 0.0 {
-                    // `place` and `gather` only read `depth` (SRV) and `cells`,
-                    // independent of the title's `light` UAV, so they can run
-                    // before waiting for the title's resolve write to `light`.
+                    // `place` and `gather` read only `depth` (SRV) and our private
+                    // `cells` buffer. `depth` cannot have an unsynchronized UAV
+                    // write here: before the title's Resolve dispatch ran, `draw.rs`
+                    // already flushed any depth color-twin UAV writes via
+                    // `list.twin_use(..., false, false)` and transitioned `depth`
+                    // into `SHADER_RESOURCE` (`ensure_state`), and `pass.cells` was
+                    // synchronized after `mean` in `Role::Radiance`. They are
+                    // therefore independent of the title's `light` UAV write and
+                    // can run before waiting on `target` prior to `raise`.
                     l.SetPipelineState(&pass.place);
                     l.Dispatch(8, 9, 1);
                     l.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
