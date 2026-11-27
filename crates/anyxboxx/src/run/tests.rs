@@ -383,7 +383,7 @@ fn big_pools_come_after_the_tuned_set_and_before_quality_and_overrides() {
     assert_eq!(thin, Some(OsString::from("12")));
     let under = value(&env, "VICTORY_UNDER_THREADS");
     assert_eq!(under, Some(OsString::from("8")));
-    assert_eq!(value(&env, "VICTORY_LAND_THREADS"), Some(OsString::from("6")));
+    assert_eq!(value(&env, "VICTORY_LAND_THREADS"), Some(OsString::from("8")));
     let positions = |name: &str| -> Vec<usize> {
         (0..env.len()).filter(|i| env[*i].0 == name).collect()
     };
