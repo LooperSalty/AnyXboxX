@@ -75,21 +75,20 @@ def _flat(family, name, word, active):
 
 def _buffer(name, word, active):
     offset, offen, idxen = word & 0xFFF, (word >> 12) & 1, (word >> 13) & 1
-    if idxen:
-        raise Untranslatable(f"non traduite en HLSL : {name} avec idxen")
     vaddr, vdata, resource = (word >> 32) & 0xFF, (word >> 40) & 0xFF, ((word >> 48) & 0x1F) * 4
+    if idxen and offen and vaddr == 255:
+        raise Untranslatable(f"{name} : la paire d’adresse dépasse v255")
     soffset = (word >> 56) & 0xFF
-    extra = "" if soffset in (NULL, 128) else f" + {source(soffset)}"
-    byte_offset = f"({offset}u{f' + v[{vaddr}]' if offen else ''})"
+    if 193 <= soffset <= 208:
+        raise Untranslatable(f"{name} : SOFFSET immédiat négatif hors du modèle 32 bits")
+    index = f"v[{vaddr}]" if idxen else "0u"
+    vector_offset = f"v[{vaddr + idxen}]" if offen else "0u"
     found = VECTOR_PATTERN.match(name)
     size = WIDTHS[found.group(3)] if found else 4
-    # A structured descriptor bounds the index (zero here), not the byte offset. For a raw
-    # descriptor, subtract before comparing so a large offset cannot wrap the bounds check.
-    no_overflow = f"v[{vaddr}] <= 0xFFFFFFFFu - {offset}u && " if offen else ""
-    inside = (f"(((s[{resource + 1}] >> 16) & 0x3FFFu) != 0u ? s[{resource + 2}] != 0u : "
-              f"({no_overflow}{byte_offset} <= s[{resource + 2}] && {size}u <= s[{resource + 2}] - {byte_offset}))")
-    address = f"(s[{resource}]{extra} + {byte_offset})"
-    return _vector_access(name, address, vdata, vdata, active, glc=(word >> 14) & 1, inside=inside)
+    setup = (f"uint addr; bool inside = BufferAddress(s[{resource}], s[{resource + 1}], s[{resource + 2}], "
+             f"{source(soffset)}, {index}, {vector_offset}, {offset}u, {size}u, addr);")
+    access, *barrier = _vector_access(name, "addr", vdata, vdata, active, glc=(word >> 14) & 1, inside="inside")
+    return [f"{{ {setup} {access} }}", *barrier]
 
 
 def _vector_access(name, address, data, vdst, active, glc, inside):

@@ -1,4 +1,4 @@
-//! Untyped MUBUF word accesses without an index register.
+//! Untyped MUBUF accesses with index and byte-offset VGPRs.
 use crate::scalar::source;
 
 pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
@@ -32,12 +32,13 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
         "dwordx4" => 4,
         _ => return Err(format!("untranslated instruction: {name}")),
     };
-    if word >> 13 & 1 != 0 {
-        return Err(format!("untranslated instruction: {name}: idxen"));
-    }
+    let idxen = (word >> 13) & 1 != 0;
     let offset = word & 0xfff;
     let offen = (word >> 12) & 1 != 0;
     let addr = (word >> 32) & 255;
+    if idxen && offen && addr == 255 {
+        return Err(format!("{name}: address pair past v255"));
+    }
     let data = (word >> 40) & 255;
     let resource = ((word >> 48) & 31) * 4;
     let soffset = ((word >> 56) & 255) as u32;
@@ -46,24 +47,17 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
             "untranslated instruction: {name}: negative inline SOFFSET"
         ));
     }
-    let extra = if matches!(soffset, 125 | 128) {
-        String::new()
+    let index = if idxen {
+        format!("v[{addr}]")
     } else {
-        format!(
-            " + {}",
-            source(soffset, None).map_err(|e| format!("{name}: {e}"))?
-        )
+        "0u".into()
     };
-    let byte_offset = if offen {
-        format!("({offset}u + v[{addr}])")
+    let vector_offset = if offen {
+        format!("v[{}]", addr + u64::from(idxen))
     } else {
-        format!("({offset}u)")
+        "0u".into()
     };
-    let no_overflow = if offen {
-        format!("v[{addr}] <= 0xFFFFFFFFu - {offset}u && ")
-    } else {
-        String::new()
-    };
+    let scalar_offset = source(soffset, None).map_err(|e| format!("{name}: {e}"))?;
     let size = if matches!(width, "ubyte" | "sbyte") {
         1
     } else if matches!(width, "ushort" | "sshort") {
@@ -71,40 +65,41 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     } else {
         count * 4
     };
-    let inside = format!(
-        "(((s[{}] >> 16) & 0x3FFFu) != 0u ? s[{}] != 0u : ({no_overflow}{byte_offset} <= s[{}] && {}u <= s[{}] - {byte_offset}))",
+    let setup = format!(
+        "uint addr; bool inside = BufferAddress(s[{resource}], s[{}], s[{}], {scalar_offset}, {index}, {vector_offset}, {offset}u, {size}u, addr);",
         resource + 1,
-        resource + 2,
-        resource + 2,
-        size,
         resource + 2
     );
-    let address = format!("(s[{resource}]{extra} + {byte_offset})");
-    if let Some(function) = atomic {
+    let (access, barrier) = if let Some(function) = atomic {
         let keep = if (word >> 14) & 1 != 0 {
             format!(" v[{data}] = old;")
         } else {
             String::new()
         };
-        return Ok(vec![
+        (
             format!(
-                "if ((((s[126] >> lane) & 1u) != 0) && {inside}) {{ uint old; g_memory.{function}({address}, v[{data}], old);{keep} }}"
+                "if ((((s[126] >> lane) & 1u) != 0) && inside) {{ uint old; g_memory.{function}(addr, v[{data}], old);{keep} }}"
             ),
-            "AllMemoryBarrierWithGroupSync();".into(),
-        ]);
-    }
-    if write {
+            true,
+        )
+    } else if write {
         let writes = (0..count)
-            .map(|i| format!("g_memory.Store({address} + {}u, v[{}]);", 4 * i, data + i))
+            .map(|i| format!("g_memory.Store(addr + {}u, v[{}]);", 4 * i, data + i))
             .collect::<Vec<_>>()
             .join(" ");
-        Ok(vec![
-            format!("if ((((s[126] >> lane) & 1u) != 0) && {inside}) {{ {writes} }}"),
-            "AllMemoryBarrierWithGroupSync();".into(),
-        ])
+        (
+            format!("if ((((s[126] >> lane) & 1u) != 0) && inside) {{ {writes} }}"),
+            true,
+        )
     } else {
-        Ok(vec![crate::memory_load::statement(
-            width, count, data, &address, &inside,
-        )])
+        (
+            crate::memory_load::statement(width, count, data, "addr", "inside"),
+            false,
+        )
+    };
+    let mut lines = vec![format!("{{ {setup} {access} }}")];
+    if barrier {
+        lines.push("AllMemoryBarrierWithGroupSync();".into());
     }
+    Ok(lines)
 }

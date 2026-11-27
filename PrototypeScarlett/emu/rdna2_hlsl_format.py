@@ -42,6 +42,17 @@ _TABLE = ", ".join(f"0x{info(formats.FORMATS[code]) if code in formats.FORMATS e
 HELPERS = f"""
 static const uint BUF_FORMAT_INFO[{formats.FORMAT_CODES}] = {{ {_TABLE} }};
 
+bool BufferAddress(uint base, uint descriptorHi, uint records, uint scalarOffset, uint index,
+                   uint vectorOffset, uint offset, uint size, out uint address) {{
+  uint stride = (descriptorHi >> 16) & 0x3FFFu;
+  uint bytes = vectorOffset + offset, element = index * stride;
+  uint start = base + scalarOffset, indexed = start + element;
+  address = indexed + bytes;
+  bool fits = stride != 0u ? index < records : bytes <= records && size <= records - bytes;
+  return fits && (descriptorHi & 0xFFFFu) == 0u && MulHiU32(index, stride) == 0u
+      && bytes >= vectorOffset && start >= base && indexed >= start && address >= indexed
+      && size - 1u <= 0xFFFFFFFFu - address;
+}}
 uint BufFormatInfo(uint code, uint4 d) {{
   if (((d.y >> {formats.SWIZZLE_ENABLE_BIT}) & 1u) != 0u || ((d.w >> {formats.ADD_TID_BIT}) & 1u) != 0u) return 0u;
   return BUF_FORMAT_INFO[code & 0x7Fu];

@@ -144,6 +144,17 @@ uint ImageAtomic32(uint4 t, uint x, uint y, uint op, uint data0, uint data1) {
 
 static const uint BUF_FORMAT_INFO[128] = { 0x00000000u, 0x00007049u, 0x0000704Au, 0x0000704Bu, 0x0000704Cu, 0x0000784Du, 0x0000784Eu, 0x0000F089u, 0x0000F08Au, 0x0000F08Bu, 0x0000F08Cu, 0x0000F88Du, 0x0000F88Eu, 0x0000F08Fu, 0x000E7091u, 0x000E7092u, 0x000E7093u, 0x000E7094u, 0x000E7895u, 0x000E7896u, 0x0001F90Du, 0x0001F90Eu, 0x0001F90Fu, 0x001EF111u, 0x001EF112u, 0x001EF113u, 0x001EF114u, 0x001EF915u, 0x001EF916u, 0x001EF117u, 0x0254A119u, 0x0254A11Au, 0x0254A11Bu, 0x0254A11Cu, 0x0254A91Du, 0x0254A91Eu, 0x00000000u, 0x02949119u, 0x0294911Au, 0x0294911Bu, 0x0294911Cu, 0x0294991Du, 0x0294991Eu, 0x00000000u, 0x4A521121u, 0x4A521122u, 0x4A521123u, 0x4A521124u, 0x4A521925u, 0x4A521926u, 0x0A529121u, 0x0A529122u, 0x0A529123u, 0x0A529124u, 0x0A529925u, 0x0A529926u, 0x39CE7121u, 0x39CE7122u, 0x39CE7123u, 0x39CE7124u, 0x39CE7925u, 0x39CE7926u, 0x003FFA15u, 0x003FFA16u, 0x003FFA17u, 0x7BDEF221u, 0x7BDEF222u, 0x7BDEF223u, 0x7BDEF224u, 0x7BDEFA25u, 0x7BDEFA26u, 0x7BDEF227u, 0x07FFFB1Du, 0x07FFFB1Eu, 0x07FFFB1Fu, 0xFFFFFC25u, 0xFFFFFC26u, 0xFFFFFC27u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u };
 
+bool BufferAddress(uint base, uint descriptorHi, uint records, uint scalarOffset, uint index,
+                   uint vectorOffset, uint offset, uint size, out uint address) {
+  uint stride = (descriptorHi >> 16) & 0x3FFFu;
+  uint bytes = vectorOffset + offset, element = index * stride;
+  uint start = base + scalarOffset, indexed = start + element;
+  address = indexed + bytes;
+  bool fits = stride != 0u ? index < records : bytes <= records && size <= records - bytes;
+  return fits && (descriptorHi & 0xFFFFu) == 0u && MulHiU32(index, stride) == 0u
+      && bytes >= vectorOffset && start >= base && indexed >= start && address >= indexed
+      && size - 1u <= 0xFFFFFFFFu - address;
+}
 uint BufFormatInfo(uint code, uint4 d) {
   if (((d.y >> 31) & 1u) != 0u || ((d.w >> 23) & 1u) != 0u) return 0u;
   return BUF_FORMAT_INFO[code & 0x7Fu];

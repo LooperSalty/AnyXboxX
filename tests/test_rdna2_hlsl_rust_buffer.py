@@ -55,12 +55,6 @@ def test_raw_buffer_offset_overflow_is_out_of_bounds(monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(512))[:128] == struct.pack("<32I", *wave.v[10])
 
 
-def test_buffer_idxen_is_named():
-    low, high = mubuf("buffer_load_dwordx2", 1, 10, 20, offen=1)
-    result = rust(program(low | (1 << 13), high))
-    assert result.returncode != 0 and b"buffer_load_dwordx2" in result.stderr
-
-
 @pytest.mark.parametrize("soffset", [125, 128, 24])
 def test_buffer_without_vector_offset(soffset, monkeypatch):
     if not rdna2_gpu.available():
@@ -85,5 +79,8 @@ def test_buffer_without_vector_offset(soffset, monkeypatch):
 
 
 def test_negative_inline_buffer_offset_is_named():
-    result = rust(program(*mubuf("buffer_load_dword", 1, 10, 20, offset=4, soffset=193)))
+    data = program(*mubuf("buffer_load_dword", 1, 10, 20, offset=4, soffset=193))
+    with pytest.raises(rdna2_hlsl.Untranslatable, match="buffer_load_dword"):
+        rdna2_hlsl.translate(data)
+    result = rust(data)
     assert result.returncode != 0 and b"buffer_load_dword" in result.stderr
