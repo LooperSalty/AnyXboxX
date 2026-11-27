@@ -558,7 +558,9 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    static KEEP_SCRATCH: OnceLock<bool> = OnceLock::new();
+    let keep = *KEEP_SCRATCH.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_KEEP"));
+    if should_trim_scratch(crate::residency::pressured(), keep, crate::residency::critical_commit) {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -2086,6 +2088,12 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// With VICTORY_SCRATCH_KEEP=1, reuse the bounded spare pool through
+/// ordinary RAM pressure. Sample commit only when it can affect the sweep.
+fn should_trim_scratch(pressure: bool, keep: bool, critical_commit: impl FnOnce() -> bool) -> bool {
+    pressure && (!keep || critical_commit())
 }
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
@@ -10807,7 +10815,17 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, should_trim_scratch};
+
+    #[test]
+    fn keeping_idle_scratch_changes_only_noncritical_pressure_sweeps() {
+        for keep in [false, true] {
+            assert!(!should_trim_scratch(false, keep, || panic!("no pressure")));
+        }
+        assert!(should_trim_scratch(true, false, || panic!("ordinary sweep")));
+        assert!(!should_trim_scratch(true, true, || false));
+        assert!(should_trim_scratch(true, true, || true));
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
