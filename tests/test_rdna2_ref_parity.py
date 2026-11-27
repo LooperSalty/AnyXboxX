@@ -21,6 +21,7 @@ from emu import rdna2_exec, rdna2_image
 from emu.rdna2_exec import VOP2_CARRY, Wave
 from emu.rdna2_exec_cmp64 import COMPARE64
 from emu.rdna2_exec_dot import OPERATIONS as DOT_OPERATIONS
+from emu.rdna2_exec_f16 import OPERATIONS as F16_OPERATIONS
 from emu.rdna2_exec_int16 import PACKED
 from emu.rdna2_exec_pkf16 import PACKED_F16, VOP3P as PKF16_VOP3P
 from emu.rdna2_exec_memory import PAGE
@@ -340,6 +341,7 @@ def random_program(rng):
             or name in COMPARE64
             or name in WIDE_GENERIC
             or name in MOVREL_VECTOR
+            or name in F16_ARITH_NAMES
         ):
             names[family].append((opcode, name))
         if family == "VOP1" and (name in WIDE_GENERIC or name in MOVREL_VECTOR):
@@ -348,7 +350,9 @@ def random_program(rng):
             names[family].append((opcode, name))
         if family == "VOPC" and (name in VECTOR_COMPARE or name in COMPARE64):
             names[family].append((opcode, name))
-        if family in VECTOR_FAMILIES and (name in VECTOR or name in VECTOR_NO_OPERATION or name in VOP2_CARRY):
+        if family in VECTOR_FAMILIES and (
+            name in VECTOR or name in VECTOR_NO_OPERATION or name in VOP2_CARRY or name in F16_ARITH_NAMES
+        ):
             names[family].append((opcode, name))
     blocks = []  # (words, branch template or None): a branch's offset is patched once the layout is known
     for _ in range(rng.randrange(1, 11)):
@@ -426,6 +430,8 @@ def instruction(rng, names):
 # for the Python model (which indexes SGPRs and register pairs directly).
 # Operations whose constant is a literal: the VOP3 form has no literal word unless a source is the literal code.
 LITERAL_OPERATION_NAMES = ("v_madmk_f32", "v_madak_f32", "v_fmamk_f32", "v_fmaak_f32")
+F16_TRANSCENDENTALS = frozenset({"v_rcp_f16", "v_sqrt_f16", "v_rsq_f16", "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16"})
+F16_ARITH_NAMES = tuple(name for name in F16_OPERATIONS if name not in F16_TRANSCENDENTALS)
 # The 64-bit operations (including v_fma_f64 now that overflow returns ±infinity in both models).
 WIDE_GENERIC = tuple(WIDE_OPERATIONS)
 DIV_NAMES = (
@@ -444,8 +450,8 @@ def vop3_words(rng, opcode, name):
     if name in COMPARE64 and not name.endswith("class_f32"):
         pool = [code for code in OPERANDS if code != LITERAL] + list(range(256, 511))
     sources = [rng.choice(OPERANDS + pool) for _ in range(3)]
-    # The SAD forms refuse any modifier: most of them get none, so that the executed path is covered too.
-    plain = (name in SAD_NAMES or name in MOVREL_VECTOR) and rng.random() < 0.7
+    # The SAD and f16 forms refuse unsupported modifiers: most of them get none, so the executed path is covered too.
+    plain = (name in SAD_NAMES or name in MOVREL_VECTOR or name in F16_ARITH_NAMES) and rng.random() < 0.7
     if name in MOVREL_VECTOR:
         sources[0] = rng.randrange(256, 511)
     abs_bits = 0 if plain else rng.randrange(8)
@@ -461,7 +467,7 @@ def vop3_words(rng, opcode, name):
     if name.endswith("_f64") and name not in COMPARE64:
         vdst = rng.randrange(255)                                    # a 64-bit result takes vdst and vdst + 1
         field_8_14 = rng.randrange(126)                              # the carry SGPR pair sdst
-    low = 0x35 << 26 | opcode << 16 | vdst | field_8_14 << 8 | rng.randrange(16) << 11 | clamp << 15
+    low = 0x35 << 26 | opcode << 16 | vdst | field_8_14 << 8 | (0 if plain else rng.randrange(16)) << 11 | clamp << 15
     high = sources[0] | sources[1] << 9 | sources[2] << 18 | (0 if plain else rng.randrange(4)) << 27 | (
         0 if plain else rng.randrange(8)) << 29
     words = [low, high]
@@ -1494,6 +1500,23 @@ def test_a_register_group_past_v255_is_an_operand_error_in_rust():
         state = run_python(32, False, [], fits)
         assert state.startswith("steps")
         assert_same(exe, 32, False, [], fits)
+
+
+def test_cndmask_mask_refusals_do_not_depend_on_exec_in_both_models():
+    """VOP3 v_cndmask_b32 reads its lane mask (S2) as a scalar operand. A VGPR or a reserved code there is
+    refused by both models whatever EXEC holds; a readable mask (VCC) runs in both, with or without lanes."""
+    exe = binary()
+    lanes_off = [(126, 0), (127, 0)]
+    for lanes in (32, 64):
+        for mask_code in (V0 + 4, 209):
+            words = program(*vop3("v_cndmask_b32", 3, (V0 + 1, V0 + 2, mask_code)))
+            for scalars in ([], lanes_off):
+                assert run_python(lanes, False, scalars, words) == "error untranslated\n"
+                assert_same(exe, lanes, False, scalars, words)
+        words = program(vop1("v_mov_b32", 2, LITERAL), 0x5555, *vop3("v_cndmask_b32", 3, (V0 + 1, V0 + 2, 106)))
+        for scalars in ([(106, 0xF0F0_F0F0), (107, 0x0F0F_0F0F)], [(106, 0xF0F0_F0F0), *lanes_off]):
+            assert run_python(lanes, False, scalars, words).startswith("steps")
+            assert_same(exe, lanes, False, scalars, words)
 
 
 def test_vop3_integer_clamp_matches_the_python_model():

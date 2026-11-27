@@ -70,5 +70,6 @@ Les réglages sont des profils par système et par fabricant de carte (`crates/a
 - **Un jeu tourne déjà** : le lanceur n'autorise qu'un jeu à la fois, car deux partageraient le dossier des sauvegardes.
 - **La fenêtre s'est fermée seule** : le journal indique `window closed: suspending the title` quand c'est vous qui l'avez fermée ; un plantage est écrit dans `crashes.log` sous `%LOCALAPPDATA%\victory\data\`.
 - **Erreur Windows 1455 dans `crashes.log`** : le fichier d'échange est trop petit ; fermez d'autres applications ou agrandissez-le.
+- **Le lanceur n'ouvre jamais sa fenêtre** (le processus reste dans le Gestionnaire des tâches) : sous Windows, sa fenêtre est dessinée avec Direct3D 12. Pour essayer une autre API graphique, lancez-le depuis une invite de commandes après `set WGPU_BACKEND=vulkan` (ou `dx12`, la valeur par défaut) ; voir l'issue #483.
 
 Sous Proton ou Wine, le lanceur ne peut pas compiler VIctory (pas de cargo) : utilisez `anyxboxx run` comme décrit dans [lancer-gta6.md](lancer-gta6.md).
