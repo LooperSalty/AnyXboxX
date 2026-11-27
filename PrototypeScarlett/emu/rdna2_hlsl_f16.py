@@ -93,8 +93,14 @@ uint F16Sqrt(uint h) {
   if (a == 0u) return h;
   if ((h & 0x8000u) != 0u) return 0x7E00u;
   if (a == 0x7C00u) return 0x7C00u;
-  precise float r = sqrt(asfloat(F16ToF32(h)));
-  return F32ToF16(asuint(r));
+  // D3D lets the f32 sqrt miss by an ulp (Intel UHD 730 does on 1 - 2^-11): narrowed to f16, it can
+  // then cross a half-way point. Half-way points between f16 neighbours have 12 significant bits, so
+  // their squares are exact in f32 and say which side x is on; x is never exactly on one.
+  precise float x = asfloat(F16ToF32(h));
+  uint c = F32ToF16(asuint(sqrt(x)));             // sqrt(x) >= 2^-12: always a normal f16
+  precise float below = (asfloat(F16ToF32(c - 1u)) + asfloat(F16ToF32(c))) * 0.5f;
+  precise float above = (asfloat(F16ToF32(c)) + asfloat(F16ToF32(c + 1u))) * 0.5f;
+  return below * below > x ? c - 1u : (above * above < x ? c + 1u : c);
 }
 uint F16Rsq(uint h) {
   uint s = h & 0x8000u, a = h & 0x7FFFu;

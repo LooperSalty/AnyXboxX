@@ -282,3 +282,20 @@ def test_f16_transcendentals_exhaustive_parity_on_gpu(name):
         if actual[h] != expected[h]
     ]
     assert not mismatches, f"{name}: {len(mismatches)} mismatches (first 10: {mismatches[:10]})"
+
+
+@gpu
+@pytest.mark.parametrize("error", ["+ 1u", "- 1u"])
+def test_f16_sqrt_absorbs_a_one_ulp_f32_sqrt_error_on_gpu(error):
+    """D3D lets the f32 sqrt miss by an ulp (Intel UHD 730 does): F16Sqrt must still round like the interpreter."""
+    data = _exhaustive_program("v_sqrt_f16")
+    size = 65536 * 4
+    wave = rdna2_exec.Wave()
+    wave.memory.write(0, bytes(size))
+    wave.s[2] = 0
+    rdna2_exec.run(data, wave)
+    exact = "F32ToF16(asuint(sqrt(x)))"
+    hlsl = rdna2_hlsl.translate(data, {2: 0})
+    assert hlsl.count(exact) == 1
+    actual = rdna2_gpu.run(hlsl.replace(exact, f"F32ToF16(asuint(sqrt(x)) {error})"), bytes(size))
+    assert actual == wave.memory.read(0, size)
