@@ -51,10 +51,10 @@ const HEIGHT_RANGE: (u32, u32) = (360, 4320);
 /// The windows and buffer values are the ones measured on that card at a 5.8 fps median in the
 /// world (2026-11-26, Series X, 1080p display mode, Neptune base; Vice-Tay reads no list pool variable).
 /// `VICTORY_TEXTURE_MAX_SIZE=1024` keeps the levels of the title's textures over 1024 texels off the
-/// card (`victory-gpu` `tiles::max_size`; three quarters of a texture for each level cut), so the
-/// texture queue has room for every texture instead of being refused. It works through the
-/// `VICTORY_LEVELS_ON_DEMAND=1` of the Neptune profile (Vice-Tay's tuned set does not set it, and
-/// it no longer reads `VICTORY_TEXTURE_MAX_SIZE`: see `UNREAD_BY_VICE_TAY` in the tests).
+/// card (`victory-gpu` `tiles::max_size`; three quarters of a texture for each level cut): the host
+/// copy of such a texture begins at its first level within the cap (`resource.rs` `cap_base`), so
+/// the texture queue has room for every texture instead of being refused. The title still sees
+/// its textures at their own size; textures the card copies into or out of keep every level.
 pub const LOW_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_WINDOWS_MB", "512"),
     ("VICTORY_CARD_BUFFERS_MB", "512"),
@@ -545,11 +545,6 @@ mod tests {
         assert!(Keyboard::Qwertz.shoulder_keys().contains("Y C"));
     }
 
-    /// Names the launcher still offers that the Vice-Tay base does not read (checked by grep on its
-    /// crates and apps on 2026-11-26): these options do nothing on this base until its sources read
-    /// them or the options are removed.
-    const UNREAD_BY_VICE_TAY: [&str; 1] = ["VICTORY_TEXTURE_MAX_SIZE"];
-
     #[test]
     fn every_variable_an_option_names_exists_in_victorys_sources() {
         let victory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -575,9 +570,6 @@ mod tests {
             .copied()
             .chain(preset_names.iter().map(String::as_str))
         {
-            if UNREAD_BY_VICE_TAY.contains(&name) {
-                continue;
-            }
             assert!(
                 sources.contains(&format!("\"{name}\"")),
                 "{name} is read nowhere in third_party/victory"

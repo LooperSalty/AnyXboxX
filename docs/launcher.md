@@ -70,5 +70,6 @@ Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profile
 - **A game is already running**: the launcher allows one game at a time, because two would share the save folder.
 - **The window closed by itself**: the log says `window closed: suspending the title` when you closed it; a crash is written to `crashes.log` under `%LOCALAPPDATA%\victory\data\`.
 - **Windows error 1455 in `crashes.log`**: the paging file is too small; close other applications or enlarge it.
+- **The launcher never opens its window** (the process stays in Task Manager): its window is drawn with Direct3D 12 on Windows. To try another graphics API, start it from a Command Prompt after `set WGPU_BACKEND=vulkan` (or `dx12`, the default); see issue #483.
 
 Under Proton or Wine the launcher cannot build VIctory (no cargo): use `anyxboxx run` as described in [running-gta6.md](running-gta6.md).
