@@ -1247,6 +1247,7 @@ mod tests {
         let mixed = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]);
         let mut per_target = blending(true);
         per_target.RenderTarget[1].LogicOpEnable = true.into();
+        per_target.RenderTarget[7].LogicOpEnable = true.into();
         let mut both = blending(false);
         both.RenderTarget[0].LogicOpEnable = true.into();
         for (blend, t) in [
@@ -1256,12 +1257,8 @@ mod tests {
             (per_target, mixed),
         ] {
             let host = host_blend(&blend, &t);
-            if host.IndependentBlendEnable.as_bool() {
-                assert!(
-                    host.RenderTarget.iter().all(|r| !r.LogicOpEnable.as_bool()),
-                    "LogicOpEnable left on with IndependentBlendEnable"
-                );
-            }
+            assert!(host.IndependentBlendEnable.as_bool());
+            assert!(host.RenderTarget.iter().all(|r| !r.LogicOpEnable.as_bool()));
         }
         // One integer target alone stays on one description, switched off.
         let host = host_blend(&logic_op(false), &targets(&[DXGI_FORMAT_R8_UINT]));
@@ -1290,7 +1287,7 @@ mod tests {
         // SAFETY: `sub` is a complete subobject 15.
         unsafe { g.read(15, (&raw const sub).cast()) };
         assert_eq!(g.targets.NumRenderTargets, 1);
-        assert_ne!(g.targets.RTFormats[0], DXGI_FORMAT_UNKNOWN);
+        assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
         assert!(g.targets.RTFormats[1..].iter().all(|&f| f == DXGI_FORMAT_UNKNOWN));
         // A count past 8 is bounded, never indexing out of the array.
         let mut rts = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
@@ -1301,56 +1298,7 @@ mod tests {
         assert_eq!(g.targets.NumRenderTargets, 8);
     }
 
-    /// The host really creates the pipelines the sanitising is for.
-    #[test]
-    fn logic_op_and_stale_formats_pipelines_are_accepted() {
-        let Some(host) = host() else {
-            return; // no host GPU here
-        };
-        let Some(dxc) = dxc() else {
-            eprintln!("no PC dxc.exe; skipped");
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
-        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
-        let make = |g: &GraphicsState| {
-            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                // SAFETY: borrowed pointer, never released by the descriptor.
-                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                VS: code(&vs),
-                PS: code(&ps),
-                BlendState: host_blend(&g.blend, &g.targets),
-                SampleMask: g.sample_mask,
-                RasterizerState: g.rasterizer,
-                DepthStencilState: g.depth,
-                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                NumRenderTargets: g.targets.NumRenderTargets,
-                RTVFormats: g.targets.RTFormats,
-                SampleDesc: g.samples,
-                ..Default::default()
-            };
-            // SAFETY: live root signature and bytecode slices.
-            unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) }
-        };
-        let mut g = single_color_target(DXGI_FORMAT_R8G8B8A8_UNORM);
-        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-        g.blend = logic_op(false);
-        g.targets = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]);
-        make(&g).expect("UNORM + UINT with LogicOpEnable must be accepted");
-        // Stale formats past the count, as a reused console stream leaves them.
-        #[repr(C, align(8))]
-        struct Sub15(u32, D3D12_RT_FORMAT_ARRAY);
-        let mut rts = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
-        rts.RTFormats[1] = DXGI_FORMAT_R8_UINT;
-        let sub = Sub15(15, rts);
-        let mut g = single_color_target(DXGI_FORMAT_R8G8B8A8_UNORM);
-        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-        // SAFETY: `sub` is a complete subobject 15.
-        unsafe { g.read(15, (&raw const sub).cast()) };
-        make(&g).expect("stale formats past the count must be cleared");
-    }
+    mod render_targets;
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
