@@ -135,7 +135,7 @@ fn parse_band(set: &str) -> Option<Band> {
 /// Whether the stand-in is on: set, and the title's rays find nothing (or
 /// the band is asked for with them).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_active())
 }
 
 /// The title's leftover light is kept between these multiples of the
@@ -143,7 +143,7 @@ pub(crate) fn on() -> bool {
 /// most four times it.
 fn bounds() -> (f32, f32) {
     match rt_band() {
-        Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
+        Some(b) if crate::pipeline::builder_active() => (b.least, b.most),
         _ => (1.0, 4.0),
     }
 }

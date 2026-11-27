@@ -285,6 +285,40 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     rests: 0,
 });
 
+/// Lock-free mirrors of [`BUILDER`] state so hot-path checks (`builder_runs`,
+/// `builder_active` from `ambient::on`) do not contend on `BUILDER` or block a
+/// lighting thread compiling builder pipelines.
+#[cfg(windows)]
+static BUILDER_WHOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static BUILDER_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static BUILDER_RESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Pure policy helper for [`builder_active`]: true when the BVH builder is
+/// enabled by env and has not failed to compile its pipeline set.
+#[cfg(windows)]
+fn builder_active_for(allowed: bool, failed: bool) -> bool {
+    allowed && !failed
+}
+
+/// Non-blocking query for passes such as `crate::ambient`: whether ray-tracing
+/// structure building is enabled and has not failed. Never acquires [`BUILDER`]
+/// and never triggers synchronous pipeline compilation on a lighting thread.
+#[cfg(windows)]
+pub(crate) fn builder_active() -> bool {
+    builder_active_for(
+        builder_allowed(),
+        BUILDER_FAILED.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -326,7 +360,9 @@ pub(crate) fn is_builder(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_rests(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    b.rests = crate::frame::current() + 2;
+    let until = crate::frame::current() + 2;
+    b.rests = until;
+    BUILDER_RESTS.store(until, std::sync::atomic::Ordering::Release);
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
         tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
@@ -337,35 +373,63 @@ pub(crate) fn builder_rests(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    use std::sync::atomic::Ordering;
+    if !builder_allowed() {
         return false;
     }
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
-        return false;
+    let frame = crate::frame::current();
+    if BUILDER_WHOLE.load(Ordering::Acquire) {
+        return frame >= BUILDER_RESTS.load(Ordering::Acquire);
     }
-    if b.whole {
-        return true;
-    }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
-    if !missing.is_empty() {
-        b.off = b.pipelines.len();
-        tracing::warn!(
-            missing = missing.len(),
-            of = b.pipelines.len(),
-            which = ?missing,
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+    loop {
+        let (to_build, count) = {
+            let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+            if b.off == b.pipelines.len() || frame < b.rests {
+                return false;
+            }
+            if b.whole {
+                return true;
+            }
+            (b.pipelines.clone(), b.pipelines.len())
+        };
+        // Fan out compilation across the pipeline worker pool before joining
+        // on this thread, without holding the global BUILDER mutex.
+        for p in &to_build {
+            make::enqueue_requested(p);
+        }
+        let missing: Vec<String> = to_build
+            .iter()
+            .filter(|p| !make::now(p))
+            .map(|p| make::hashes(p))
+            .collect();
+        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        if !missing.is_empty() {
+            b.off = count;
+            b.whole = false;
+            BUILDER_WHOLE.store(false, Ordering::Release);
+            BUILDER_FAILED.store(b.off == b.pipelines.len(), Ordering::Release);
+            tracing::warn!(
+                missing = missing.len(),
+                of = count,
+                which = ?missing,
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            return false;
+        }
+        if b.pipelines.len() != count {
+            // Another builder pipeline was registered while compiling; include it.
+            continue;
+        }
+        b.off = 0;
+        b.whole = true;
+        BUILDER_FAILED.store(false, Ordering::Release);
+        BUILDER_WHOLE.store(true, Ordering::Release);
+        tracing::info!(
+            pipelines = count,
+            "the ray-tracing structure builder runs: all of its programs have host pipelines"
         );
-        return false;
+        return frame >= b.rests;
     }
-    b.off = 0;
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
-    true
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -588,6 +652,8 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        BUILDER_WHOLE.store(false, std::sync::atomic::Ordering::Release);
+        BUILDER_FAILED.store(false, std::sync::atomic::Ordering::Release);
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -917,5 +983,16 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builder_active_follows_enable_and_failure_state() {
+        assert!(!builder_active_for(false, false));
+        assert!(!builder_active_for(false, true));
+        // Enabled and not failed: active immediately (even before builder pipelines register).
+        assert!(builder_active_for(true, false));
+        // Enabled, but a builder pipeline failed to compile: falls back cleanly.
+        assert!(!builder_active_for(true, true));
     }
 }
