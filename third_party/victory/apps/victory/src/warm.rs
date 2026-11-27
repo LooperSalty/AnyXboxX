@@ -12,6 +12,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use victory_hle::known_pipelines as known;
 
+mod journal;
+use journal::Journal;
+
+#[cfg(test)]
+mod bad_journal_tests;
+
 /// Pipelines a process makes before another takes its place: the compiler's
 /// and the translations' memory goes with it.
 const AT_ONCE: usize = 40;
@@ -31,12 +37,12 @@ fn folder() -> Result<PathBuf> {
     pipelines_folder(&cfg)
 }
 
-fn open_journal(path: &Path) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))
+#[derive(Clone, Copy, Default)]
+struct Options {
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
 }
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
@@ -44,56 +50,56 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     if let Some(these) = these {
         return make(&dir, &these);
     }
-    run_in(&dir, jobs, limit, again, used)
+    run_in(&dir, Options { jobs, limit, again, used })
 }
 
-fn run_in(dir: &Path, jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool) -> Result<()> {
+fn run_in(dir: &Path, options: Options) -> Result<()> {
     let began = Instant::now();
-    victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
-    let fingerprint = known::fingerprint();
-    let done_file = dir.join("warm-done.txt");
-    let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(dir);
-    let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
-            done.insert(key);
-        }
-    }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    known::use_translations(dir.with_file_name("shaders"));
+    let fingerprint = known::warm_cache_metadata().map(journal::fingerprint);
+    run_with_worker(dir, options, &known::keys(dir), fingerprint.as_deref(), began, start_worker)
+}
+
+fn run_with_worker(
+    dir: &Path,
+    options: Options,
+    keys: &[String],
+    fingerprint: Option<&str>,
+    began: Instant,
+    start: impl Fn(&[usize]) -> Result<Child> + Sync,
+) -> Result<()> {
+    let done = Journal::open(&dir.join("warm-done.txt"), fingerprint)?;
+    let bad = Journal::open(&dir.join("warm-bad.txt"), fingerprint)?;
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            (options.again || !done.keys.contains(key))
+                && !bad.keys.contains(key)
+                && (!options.used || early.contains(key))
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
-    all.truncate(limit.unwrap_or(usize::MAX));
+    all.truncate(options.limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    let jobs = options.jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} completed before ({}), {} bad. {} to make with {jobs} processes",
         keys.len(),
-        done.len(),
-        bad.len(),
+        done.keys.len(),
+        fingerprint.unwrap_or("compiler context unavailable"),
+        bad.keys.len(),
         all.len()
     );
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
-    let done_out = Mutex::new(open_journal(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
-    let slow_out = Mutex::new(open_journal(&dir.join("slow-pipelines.txt"))?);
-    let bad_out = Mutex::new(open_journal(&bad_file)?);
+    let slow_out = Mutex::new(journal::open_append(&dir.join("slow-pipelines.txt"))?);
     run_batches(
         &all,
         jobs,
-        start_worker,
+        start,
         |n, ms, there| {
             if ms >= SLOW_MS {
                 writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]).context("writing slow-pipelines.txt")?;
@@ -106,11 +112,12 @@ fn run_in(dir: &Path, jobs: Option<usize>, limit: Option<usize>, again: bool, us
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            writeln!(lock(&done_out), "{fingerprint} {}", keys[n]).context("writing warm-done.txt")
+            let outcome = if there { "made" } else { "refused" };
+            done.append(&keys[n], outcome).context("writing warm-done.txt")
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            writeln!(lock(&bad_out), "{} {why}", keys[n]).context("writing warm-bad.txt")?;
+            bad.append(&keys[n], &why).context("writing warm-bad.txt")?;
             lock(&state).2 += 1;
             Ok(())
         },
@@ -119,7 +126,7 @@ fn run_in(dir: &Path, jobs: Option<usize>, limit: Option<usize>, again: bool, us
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
-        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
+        "{} attempts completed in {:.0} s ({refused} have no host pipeline, {crashed} ended their process). Times in ms are median {:.1}, p90 {:.1}, p99 {:.1}, and maximum {:.0}. Total {:.0} s",
         times.len(),
         began.elapsed().as_secs_f64(),
         at(0.5),
@@ -353,7 +360,7 @@ mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
 
-    fn fake_child(script: &str, stdout: Stdio) -> Result<Child> {
+    pub(super) fn fake_child(script: &str, stdout: Stdio) -> Result<Child> {
         let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
         Ok(Command::new(cmd)
             .args(["/d", "/c"])
@@ -547,7 +554,7 @@ mod tests {
         let dir = pipelines_folder(&cfg).unwrap();
         assert!(cfg.cache_dir.join("shaders").is_dir());
         assert!(dir.is_dir());
-        run_in(&dir, Some(1), None, false, false).unwrap();
+        run_in(&dir, Options { jobs: Some(1), ..Options::default() }).unwrap();
         assert!(dir.join("warm-done.txt").is_file());
         assert!(dir.join("slow-pipelines.txt").is_file());
         assert!(dir.join("warm-bad.txt").is_file());
