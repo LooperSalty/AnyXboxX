@@ -149,7 +149,7 @@ pub(crate) struct IndexView {
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
-const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+pub(crate) const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
 thread_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
@@ -4834,6 +4834,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
 
 fn readable_untimed(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    if crate::list::thin::fast::active()
+        && let (View::Shader(resource, _), ResourceType::Srv) = (view, kind)
+        && TESTED_DEPTH.get().0 != *resource
+        && !(cfg!(feature = "diagnostics") && tracing::enabled!(tracing::Level::DEBUG))
+        && crate::resource::thin_read::prepare(list, *resource as This)
+    {
+        return;
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
