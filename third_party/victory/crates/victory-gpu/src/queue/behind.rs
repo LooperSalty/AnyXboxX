@@ -784,6 +784,8 @@ impl Work for Job {
             }
             Job::Present(texture, overlay, shown, book) => {
                 if let Some((texture, state)) = texture {
+                    // All title submissions in front of this present have been sent.
+                    crate::streamline::latency::mark(|| shown.token, crate::streamline::latency::Phase::Submitted);
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
                     let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
@@ -1043,6 +1045,9 @@ pub(super) fn present(
     shown: super::Shown,
     called: Option<Instant>,
 ) {
+    // A display-only frame can reach PresentX without ExecuteCommandLists.
+    // This is its first submission; simulation still ends on the title thread.
+    crate::streamline::latency::mark(|| shown.token, crate::streamline::latency::Phase::RenderSubmit);
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
     let (book, timing) = called.map(|called| {

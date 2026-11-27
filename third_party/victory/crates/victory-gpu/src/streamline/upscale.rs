@@ -76,11 +76,14 @@ pub fn upscale(up: &Upscale) -> Taken {
         return Taken::No(why);
     }
     let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
+    // Capture the title's frame before thin-list playback can lag behind.
+    // id still identifies individual submissions for depth/motion freshness.
+    let frame = if framegen { crate::frame::current() } else { id };
     let up = *up;
     let asked = crate::list::external(
         up.list,
         Box::new(move |host| {
-            if dlss && !evaluate(host, &up, id) {
+            if dlss && !evaluate(host, &up, frame) {
                 return false;
             }
             if framegen {

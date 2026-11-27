@@ -569,6 +569,12 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    execute_for_frame(this, count, lists, 0);
+}
+
+fn execute_for_frame(this: This, count: u32, lists: *const This, token: u64) {
+    #[cfg(not(windows))]
+    let _ = token;
     if lists.is_null() {
         return;
     }
@@ -580,6 +586,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         if behind::on() && !this.is_null() {
+            if !lists.is_empty() {
+                crate::streamline::latency::mark(
+                    || if token != 0 { token } else { crate::frame::current() },
+                    crate::streamline::latency::Phase::RenderSubmit,
+                );
+            }
             behind::submit(this, lists);
             return;
         }
@@ -692,8 +704,8 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
+    execute_for_frame(this, count, lists, token);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
@@ -970,17 +982,12 @@ extern "system" fn present(
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let base_res = if planes > 0
-            // SAFETY: the title passes `planes` plane descriptions.
-            && let Some(plane) = unsafe { plane_parameters.as_ref() }
-            && plane.count > 0
-            && !plane.resources.is_null()
-        {
+        // SAFETY: the title passes a first plane when the count is nonzero.
+        let base = (planes > 0).then(|| unsafe { plane_parameters.as_ref() }).flatten();
+        let base_res = base.filter(|plane| plane.count > 0 && !plane.resources.is_null()).map(|plane| {
             // SAFETY: the plane lists `count` resources.
-            Some(unsafe { *plane.resources })
-        } else {
-            None
-        };
+            unsafe { *plane.resources }
+        });
         let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
@@ -1002,7 +1009,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, token: base.map_or(0, |p| p.token), resource },
             book_call,
         );
         called.end();
@@ -1039,7 +1046,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, token: plane.token, resource: resource as usize },
         );
         if shown && let Some(start) = book_call {
             crate::framebook::presented(start, None);
@@ -1087,6 +1094,9 @@ fn frame_ends() {
 #[derive(Clone, Copy)]
 struct Shown {
     frame: u64,
+    /// Frame-origin token supplied by PresentX. The capture ordinal above
+    /// may differ after a skipped origin or an extra present.
+    token: u64,
     resource: usize,
 }
 
@@ -1101,7 +1111,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return false;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes_for_frame(texture, state, overlay, what.frame, what.token);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

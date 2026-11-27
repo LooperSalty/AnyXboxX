@@ -11,7 +11,7 @@ pub(crate) struct Planes<'a> {
 /// What [`present_begins`] began, for [`present_ends`].
 pub(crate) struct Presenting {
     token: *mut abi::FrameToken,
-    frame: u32,
+    frame: u64,
     // VALID_UNTIL_PRESENT. The title may already have released its handles.
     _inputs: Option<Noted>,
     hudless: Option<ID3D12Resource>,
@@ -50,25 +50,17 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     let (sl, functions, plan) = (SL.get()?, FUNCTIONS.get()?, PLAN.get()?);
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
     let began = std::time::Instant::now();
-    let frame = frame as u32;
-    let Some(token) = frame_token(sl, frame) else {
+    let markers_ok = latency::submitted(frame);
+    if !markers_ok {
+        once!(warn, frame, "Streamline: present without a complete simulation and render submission; skipping frame generation");
+    }
+    let mut calls = calls();
+    let Some(token) = frame_token(sl, frame as u32) else {
+        drop(calls);
         lock(&SUBMITTED).take();
         resizing();
         return None;
     };
-    let mark = |m: u32| {
-        let began = std::time::Instant::now();
-        // SAFETY: a marker for a token of ours.
-        let ok = latency_marker(marker, m, token);
-        spent(T_MARKERS, began);
-        ok
-    };
-    let mut calls = calls();
-    let mut markers_ok = calls.simulating == Some(frame) || mark(abi::SIMULATION_START);
-    calls.simulating = None;
-    markers_ok &= mark(abi::SIMULATION_END);
-    markers_ok &= mark(abi::RENDER_SUBMIT_START);
-    markers_ok &= mark(abi::RENDER_SUBMIT_END);
     let fresh = lock(&SUBMITTED).take();
     let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
     let on = markers_ok
@@ -117,7 +109,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         }
     }
     super::options::set_mode(
-        frame,
+        frame as u32,
         planes.size,
         &viewport,
         functions,
@@ -127,7 +119,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         on,
     );
     drop(calls);
-    if !mark(abi::PRESENT_START) {
+    if !latency::present_marker(frame, latency::Phase::Present, marker, token) {
         resizing();
     }
     spent(T_BEFORE, began);
@@ -248,14 +240,13 @@ fn tag_inputs(
     true
 }
 
-/// After our swap chain's Present: the frame's last marker, the next
-/// frame's first, and what frame generation reports.
+/// After our swap chain's Present: the frame's last marker and what frame generation reports.
 pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core::HRESULT) {
     let Some(ref presenting) = presenting else {
         return;
     };
     let (token, frame) = (presenting.token, presenting.frame);
-    let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else {
+    let Some(functions) = FUNCTIONS.get() else {
         return;
     };
     let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state)
@@ -263,19 +254,14 @@ pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core
         return;
     };
     let began = std::time::Instant::now();
-    // SAFETY: a marker for this frame's token.
-    latency_marker(marker, abi::PRESENT_END, token);
-    let mut calls = calls();
-    if let Some(next) = frame_token(sl, frame.wrapping_add(1)) {
-        // SAFETY: as above, for the next frame.
-        if latency_marker(marker, abi::SIMULATION_START, next) {
-            calls.simulating = Some(frame.wrapping_add(1));
-        }
-    }
-    spent(T_MARKERS, began);
+    let marker_ok = latency::present_marker(frame, latency::Phase::Presented, marker, token);
     if status != windows::Win32::Foundation::S_OK {
+        if !marker_ok {
+            resizing();
+        }
         return;
     }
+    let calls = calls();
     if calls.framegen_on {
         FG_ON.fetch_add(1, Relaxed);
         let presents = FG_ON_ALL.fetch_add(1, Relaxed) + 1;
@@ -322,6 +308,12 @@ pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core
     } else {
         FG_OFF.fetch_add(1, Relaxed);
     }
+    drop(calls);
+    // The setting above was in effect during Present. Disable it for the
+    // following frame if Streamline rejected the final marker.
+    if !marker_ok {
+        resizing();
+    }
     spent(T_AFTER, began);
 }
 
@@ -351,19 +343,4 @@ pub(crate) fn resizing() -> bool {
         calls.framegen_times = 0;
     }
     true
-}
-
-fn latency_marker(marker: abi::SlPclSetMarker, kind: u32, token: *mut abi::FrameToken) -> bool {
-    // SAFETY: token belongs to the current or next frame on the presenting thread.
-    let code = unsafe { marker(kind, token) };
-    if code != 0 {
-        once!(
-            warn,
-            kind,
-            code,
-            result = abi::result_name(code),
-            "Streamline refused a Reflex latency marker"
-        );
-    }
-    code == 0
 }
