@@ -75,6 +75,22 @@ pub fn bind(
     tombox_folder: &Path,
     measuring: bool,
 ) -> Result<(), ResolveError> {
+    bind_with(
+        image,
+        runtime,
+        &|name| Some(game_folder.join(name)).filter(|p| p.exists()),
+        tombox_folder,
+        measuring,
+    )
+}
+
+pub(crate) fn bind_with(
+    image: &mut Image,
+    runtime: &[Module; 6],
+    local_dll: &dyn Fn(&std::ffi::OsStr) -> Option<PathBuf>,
+    tombox_folder: &Path,
+    measuring: bool,
+) -> Result<(), ResolveError> {
     let entries = imports::imports(image).map_err(|_| ResolveError::InvalidTable)?;
     let mut modules = HashMap::new();
     for entry in &entries {
@@ -89,8 +105,7 @@ pub fn bind(
         let module = if let Some(index) = runtime_for(&display) {
             Some(runtime[index])
         } else {
-            let local = game_folder.join(&name);
-            if local.exists() {
+            if let Some(local) = local_dll(&name) {
                 let module = Module::load(&local, 8).ok();
                 if let Some(module) = module {
                     let base = module.handle().cast::<u8>();

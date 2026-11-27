@@ -260,10 +260,13 @@ checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 name = "anyxboxx"
 version = "0.1.0"
 dependencies = [
+ "anyxboxx-native-launcher",
+ "anyxboxx-pe",
  "anyxboxx-rdna2-ref",
  "anyxboxx-report",
  "clap",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "victory-hle",
  "victory-pe",

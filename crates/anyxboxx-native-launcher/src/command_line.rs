@@ -36,7 +36,7 @@ fn replace<T: Copy + PartialEq + Default>(buffer: &mut [T], line: &[T]) -> bool 
 ///
 /// # Safety
 /// This mutates process-wide Windows buffers. The caller must ensure no other thread reads them.
-pub unsafe fn adopt(path: &Path) {
+pub unsafe fn adopt(path: &Path) -> bool {
     let line: Vec<u16> = [b'"' as u16]
         .into_iter()
         .chain(path.as_os_str().encode_wide())
@@ -53,7 +53,7 @@ pub unsafe fn adopt(path: &Path) {
     }
     // SAFETY: the caller guarantees no concurrent readers and the original buffer includes NUL.
     let buffer = unsafe { std::slice::from_raw_parts_mut(wide, wide_len + 1) };
-    replace(buffer, &line);
+    let wide_replaced = replace(buffer, &line);
     let mut ansi = vec![0u8; line.len().saturating_mul(2).saturating_add(1)];
     let terminated: Vec<u16> = line.into_iter().chain([0]).collect();
     // SAFETY: input is terminated and output has the indicated capacity.
@@ -70,7 +70,7 @@ pub unsafe fn adopt(path: &Path) {
         )
     };
     if count <= 0 {
-        return;
+        return false;
     }
     let mut narrow_len = 0;
     // SAFETY: Windows returns a NUL-terminated ANSI buffer.
@@ -81,7 +81,7 @@ pub unsafe fn adopt(path: &Path) {
     }
     // SAFETY: the caller guarantees no concurrent readers and the original buffer includes NUL.
     let buffer = unsafe { std::slice::from_raw_parts_mut(narrow, narrow_len + 1) };
-    replace(buffer, &ansi[..count as usize - 1]);
+    replace(buffer, &ansi[..count as usize - 1]) && wide_replaced
 }
 
 #[cfg(test)]
