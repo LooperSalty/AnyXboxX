@@ -69,6 +69,10 @@ VICTORY_LEAVE_OPEN = "0"
 VICTORY_LET_GO_BESIDE = "0"
 VICTORY_FRAME_TIMES = "1"
 VICTORY_FRAME_BOOK = "50"
+VICTORY_UPSCALER = "7"
+VICTORY_DLSS = "1"
+VICTORY_DLSS_MODE = "quality"
+VICTORY_STREAMLINE_DIR = 'C:\Users\ANAKIN\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\outils\voisins\victory-nvidia\nvidia-sdk\Streamline\bin\x64'
 
 # ---------------------------------------------------------------------------------------------
 # Linux (Proton) + AMD: the settings of PR #199's measured Linux run (Exorion1er, Fedora 44,

@@ -280,11 +280,28 @@ mod tests {
     }
 
     #[test]
-    fn windows_nvidia_is_exactly_the_tuned_set() {
+    fn windows_nvidia_embeds_the_tuned_set_and_local_play_settings() {
         use anyxboxx::run::TUNED;
         let profile = embedded().by_id("windows-nvidia").expect("profile").clone();
+        let local = [
+            ("VICTORY_FRAME_INTERVAL_MS", "16.667"),
+            ("VICTORY_WIDE_COPY", "1"),
+            ("VICTORY_THIN_FAST", "1"),
+            ("VICTORY_LEAVE_OPEN", "0"),
+            ("VICTORY_LET_GO_BESIDE", "0"),
+            ("VICTORY_FRAME_TIMES", "1"),
+            ("VICTORY_FRAME_BOOK", "50"),
+            ("VICTORY_UPSCALER", "7"),
+            ("VICTORY_DLSS", "1"),
+            ("VICTORY_DLSS_MODE", "quality"),
+            (
+                "VICTORY_STREAMLINE_DIR",
+                r"C:\Users\ANAKIN\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\outils\voisins\victory-nvidia\nvidia-sdk\Streamline\bin\x64",
+            ),
+        ];
         let mut expected: Vec<(String, String)> = TUNED
             .iter()
+            .chain(&local)
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let mut actual: Vec<(String, String)> = profile
