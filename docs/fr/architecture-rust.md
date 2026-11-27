@@ -73,15 +73,13 @@ Un seul espace Cargo à la racine du dépôt (`Cargo.toml`), les crates dans `cr
 | `anyxboxx-gdk` | lib | logique de `runtime/xgameruntime`, `xmem`, `kernelx`, `d3d12_xs`, `tls`, `xcrdapi` | modules de `victory-hle` (`xgameruntime`, `xmem`, `xasync`, `xgamesave`, `xstore`, `xuser`…) |
 | `anyxboxx-xgameruntime`, `-xmem`, `-kernelx`, `-d3d12-xs`, `-tls`, `-xcrdapi` | cdylib | les DLL C++, mêmes symboles exportés | `anyxboxx-gdk` ; compilées comme les cdylib `compat/*` de TomBox |
 | `anyxboxx-rdna2-ref` | lib | `rdna2_exec*.py`, `rdna2_operands*.py`, `rdna2_image.py`, `rdna2_buffer_format.py` | décodeur de TomBox via `anyxboxx-rdna2` ; tables générées depuis LLVM |
+| `anyxboxx-rdna2-hlsl` | lib + bin | `rdna2_hlsl*.py` (en cours) | Décodeur de `anyxboxx-rdna2-ref`, HLSL Python et interpréteur comme oracles de parité |
 | `anyxboxx-gpu-run` | bin | `runtime/gpu_runner` | code de périphérique de `victory-gpu`, crate `windows` |
 | `anyxboxx-texture`, `anyxboxx-audio`, `anyxboxx-rdna2` | lib + bin | quittent `rust/` | puis fusion dans `victory-formats` là où il couvre déjà le format |
 | `anyxboxx` | bin | `scarlett.py`, l'ancien `anyxboxx run` | `clap`, tout ce qui précède, `apps/victory` pour lancer le jeu |
 | `xtask` | bin | générateurs et vérifications de `tools/*.py` | les mêmes fichiers de test de LLVM (téléchargés en local, jamais committés) |
 
-Ce qui **n'est pas** porté, parce que VIctory le fait déjà : le recompilateur HLSL
-(`rdna2_hlsl*.py`, remplacé par le chemin DXIL de `victory-shader` quand la couverture est
-égale), le bac à sable Unicorn (voir la décision D2) et le retarget DXIL (supprimé avec
-Python).
+La commande Rust `anyxboxx rdna2 FICHIER --hlsl` expose le compilateur autonome. Les instructions portées figurent dans [le suivi du portage](rust-full-status.md). VIctory assure la traduction des shaders en jeu. La suppression du bac à sable Unicorn (D2) et du retarget DXIL est prévue avec celle de Python.
 
 ```mermaid
 graph TD
