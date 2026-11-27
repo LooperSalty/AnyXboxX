@@ -1,4 +1,5 @@
 use super::*;
+use crate::frame_rate::FrameGeneration;
 
 /// The planes a present shows (Series S: the scene and the interface over
 /// it), the host states they are in, and the back buffer's size.
@@ -108,6 +109,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             );
         }
     }
+    let was_on = calls.framegen_on;
     super::options::set_mode(
         frame as u32,
         planes.size,
@@ -118,6 +120,15 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         super::options::framegen_times(),
         on,
     );
+    if calls.framegen_on && (!was_on || !calls.fg_count_valid) {
+        // GetState counts since its last read. Drain the interval before this
+        // Present when FG starts or a previous present/report was unsuccessful.
+        calls.fg_count_valid = functions.dlssg_get_state.is_some_and(|get_state| {
+            let mut state = abi::DlssgState::default();
+            // SAFETY: a live viewport and writable state, no estimate requested.
+            unsafe { get_state(&viewport, &mut state, std::ptr::null()) == 0 }
+        });
+    }
     drop(calls);
     if !latency::present_marker(frame, latency::Phase::Present, marker, token) {
         resizing();
@@ -241,27 +252,29 @@ fn tag_inputs(
 }
 
 /// After our swap chain's Present: the frame's last marker and what frame generation reports.
-pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core::HRESULT) {
+pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core::HRESULT) -> FrameGeneration {
     let Some(ref presenting) = presenting else {
-        return;
+        return FrameGeneration::Off;
     };
     let (token, frame) = (presenting.token, presenting.frame);
     let Some(functions) = FUNCTIONS.get() else {
-        return;
+        return FrameGeneration::Off;
     };
     let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state)
     else {
-        return;
+        return FrameGeneration::Off;
     };
     let began = std::time::Instant::now();
     let marker_ok = latency::present_marker(frame, latency::Phase::Presented, marker, token);
     if status != windows::Win32::Foundation::S_OK {
+        calls().fg_count_valid = false;
         if !marker_ok {
             resizing();
         }
-        return;
+        return FrameGeneration::Off;
     }
-    let calls = calls();
+    let mut generation = FrameGeneration::Off;
+    let mut calls = calls();
     if calls.framegen_on {
         FG_ON.fetch_add(1, Relaxed);
         let presents = FG_ON_ALL.fetch_add(1, Relaxed) + 1;
@@ -287,7 +300,13 @@ pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core
         // SAFETY: a structure to fill, no options (no estimate asked).
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
+        // A failed read may leave its count in the next report. Use the
+        // configured multiplier until both ends of the interval are known.
+        generation = FrameGeneration::Unavailable;
         if code == 0 {
+            if calls.fg_count_valid {
+                generation = FrameGeneration::Reported(state.num_frames_actually_presented);
+            }
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             let before = FG_STATUS.swap(state.status, Relaxed);
@@ -305,6 +324,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core
                 "Streamline could not report the number of frames shown"
             );
         }
+        calls.fg_count_valid = code == 0;
     } else {
         FG_OFF.fetch_add(1, Relaxed);
     }
@@ -315,6 +335,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>, status: windows::core
         resizing();
     }
     spent(T_AFTER, began);
+    generation
 }
 
 /// Our swap chain's buffers are about to be made again: frame generation is

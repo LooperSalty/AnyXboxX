@@ -9525,10 +9525,12 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+use crate::frame_rate::{FrameCounts, FrameGeneration};
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
-    frames: u32,
+    frames: FrameCounts,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -9577,7 +9579,7 @@ impl Meter {
         Meter {
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
-            frames: 0,
+            frames: FrameCounts::default(),
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -9593,7 +9595,7 @@ impl Meter {
     }
 
     /// Record a frame once the swap chain has accepted it.
-    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
+    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT, fg: FrameGeneration) -> bool {
         use windows::Win32::Foundation::S_OK;
         if status != S_OK && status != self.last_present {
             tracing::warn!(?status, "swap chain did not present the frame");
@@ -9602,19 +9604,19 @@ impl Meter {
         if status != S_OK {
             return false;
         }
-        self.frame(hwnd);
+        self.frame(hwnd, fg);
         true
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, fg: FrameGeneration) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         // `VICTORY_FRAMETIME_DUMP`: times every present, before the one-second gate below.
         crate::frametime::tick();
-        self.frames += 1;
+        self.frames.record(fg);
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9628,12 +9630,14 @@ impl Meter {
             return;
         }
         let drawn = crate::draw::drawn();
-        let frames = f64::from(self.frames);
-        let fps = frames / elapsed.as_secs_f64();
+        let counts = std::mem::take(&mut self.frames);
+        let frames = f64::from(counts.rendered);
+        let rate = counts.rates(elapsed);
+        let fps = rate.rendered;
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        crate::overlay::set_frame(fps, ms, draws);
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        crate::overlay::set_frame(rate, ms, draws);
+        (self.since, self.drawn) = (now, drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -9935,7 +9939,8 @@ impl Meter {
                 }
         });
         let caption: Vec<u16> = crate::WINDOW_NAME.encode_utf16().collect();
-        let text = format!(" | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let ms_unit = if rate.active { "ms/render" } else { "ms/frame" };
+        let text = format!(" | {} {ms:.1} {ms_unit} {draws:.0} draws/frame", rate.caption());
         let mut text: Vec<u16> = caption.into_iter().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9965,7 +9970,7 @@ impl Meter {
 
 #[cfg(test)]
 mod present_status_tests {
-    use super::{HWND, Meter};
+    use super::{FrameGeneration, HWND, Meter};
     use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
 
     #[test]
@@ -9973,12 +9978,14 @@ mod present_status_tests {
         let mut meter = Meter::new();
         meter.times = Some(super::FrameTimes::default());
         let hwnd = HWND::default();
-        assert!(meter.record_present(hwnd, S_OK));
-        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
-        assert!(!meter.record_present(hwnd, E_FAIL));
-        assert!(!meter.record_present(hwnd, E_FAIL));
-        assert!(meter.record_present(hwnd, S_OK));
-        assert_eq!(meter.frames, 2);
+        let fg = FrameGeneration::Reported(2);
+        assert!(meter.record_present(hwnd, S_OK, fg));
+        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED, fg));
+        assert!(!meter.record_present(hwnd, E_FAIL, fg));
+        assert!(!meter.record_present(hwnd, E_FAIL, fg));
+        assert!(meter.record_present(hwnd, S_OK, FrameGeneration::Off));
+        assert_eq!(meter.frames.rendered, 2);
+        assert_eq!(meter.frames.rates(std::time::Duration::from_secs(1)).shown, 3.0);
         assert_eq!(meter.last_present, S_OK);
         assert_eq!(meter.times.unwrap().intervals.len(), 1);
     }
@@ -10303,13 +10310,13 @@ impl Host {
             let called = crate::streamline::present_called(&presenting);
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             crate::streamline::present_returned(called);
-            crate::streamline::present_ends(presenting, status);
+            let fg = crate::streamline::present_ends(presenting, status);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
-                p.panel.frame(p.meter.line_due());
+                p.panel.frame(p.meter.line_due(), fg);
             }
-            let presented = p.meter.record_present(p.hwnd, status);
+            let presented = p.meter.record_present(p.hwnd, status, fg);
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]

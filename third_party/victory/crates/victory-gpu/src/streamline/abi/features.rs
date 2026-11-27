@@ -115,7 +115,7 @@ impl DlssgOptions {
         DlssgOptions {
             base: BaseStructure::new(DLSSG_OPTIONS, 5),
             mode,
-            num_frames_to_generate: 1,
+            num_frames_to_generate: crate::frame_rate::FG_MULTIPLIER - 1,
             flags: 0,
             dynamic_res_width: 0,
             dynamic_res_height: 0,

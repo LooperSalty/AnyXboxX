@@ -274,9 +274,13 @@ struct Calls {
     /// Last accepted frame generation setting.
     framegen_on: bool,
     framegen_times: u32,
+    /// A successful state read delimits the next displayed-frame count.
+    fg_count_valid: bool,
 }
 
-static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, framegen_times: 0 });
+static CALLS: Mutex<Calls> = Mutex::new(Calls {
+    optimal: Vec::new(), last: None, framegen_on: false, framegen_times: 0, fg_count_valid: false,
+});
 
 fn calls() -> std::sync::MutexGuard<'static, Calls> {
     CALLS.lock().unwrap_or_else(|e| e.into_inner())
