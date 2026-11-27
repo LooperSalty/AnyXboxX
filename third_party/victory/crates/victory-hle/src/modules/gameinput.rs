@@ -3,7 +3,8 @@
 //! sources are explicitly requested. With no pad the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`), and the mouse aims it (`mouse.rs`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! and runs device callbacks on connect and disconnect. `VICTORY_INPUT_LIVE`
+//! (`live`) adds presses read from a file, focus or not.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -25,6 +26,7 @@ use crate::{HleExport, HleModule};
 
 #[cfg(any(windows, test))]
 mod dualsense;
+mod live;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -181,6 +183,27 @@ fn merged(a: PadState, b: PadState) -> PadState {
 /// own slot and a remapper's) from being two players.
 fn one_pad() -> bool {
     std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
+}
+
+/// A stand-in key held by a live press: scan codes as MapVirtualKeyW
+/// (MAPVK_VK_TO_VSC_EX) gives them on a PC keyboard.
+fn live_key(virtual_key: u8) -> KeyState {
+    let scan_code = match virtual_key {
+        0x0D => 0x1C,
+        0x08 => 0x0E,
+        0x1B => 0x01,
+        0x09 => 0x0F,
+        0x26 => 0xE048,
+        0x28 => 0xE050,
+        0x25 => 0xE04B,
+        0x27 => 0xE04D,
+        _ => 0,
+    };
+    KeyState {
+        scan_code,
+        virtual_key,
+        ..Default::default()
+    }
 }
 
 #[repr(C)]
@@ -384,6 +407,8 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// `VICTORY_INPUT_LIVE`, read on the poll thread.
+    live: Mutex<Option<live::Live>>,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -441,6 +466,7 @@ impl Hub {
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
+            live: Mutex::new(None),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -455,6 +481,7 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source, one_pad());
+        *lock(&hub.live) = live::Live::from_env();
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -476,7 +503,14 @@ impl Hub {
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
+        let live = lock(&self.live)
+            .as_mut()
+            .map(|l| {
+                let t = START.elapsed().as_secs_f64();
+                l.poll(Instant::now(), t, victory_gpu::queue::frame_count())
+            })
+            .unwrap_or_default();
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse, &live);
         self.deliver(events);
     }
 
@@ -521,22 +555,39 @@ impl State {
         devices: &[Device; DEVICES],
         one_pad: bool,
         pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
+        mut keys: Vec<KeyState>,
         mouse: Mouse,
+        live: &live::Out,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // Live presses reach every pad the title may listen to (a host pad,
+        // such as a streaming client's virtual one, hides the stand-in) and
+        // the keyboard (A as Enter, B as Backspace, ...).
+        for vk in live.keys.iter().copied() {
+            if !keys.iter().any(|k| k.virtual_key == vk) {
+                keys.push(live_key(vk));
+            }
+        }
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys, mouse), merged);
+            let mut pad = pads.into_iter().flatten().fold(fallback(&keys, mouse), merged);
+            live::apply(&mut pad, live);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
-        for (slot, pad) in pads.into_iter().enumerate() {
+        for (slot, mut pad) in pads.into_iter().enumerate() {
+            if let Some(p) = pad.as_mut() {
+                live::apply(p, live);
+            }
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse)));
+        let fallback = (!any_pad).then(|| {
+            let mut pad = fallback(&keys, mouse);
+            live::apply(&mut pad, live);
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1873,6 +1924,36 @@ mod tests {
         assert_eq!(pad(hub), PadState::default());
         assert_eq!(log.lock().unwrap().len(), 1);
         assert!(!hub.state().slots[2].connected);
+    }
+
+    #[test]
+    fn live_presses_reach_a_host_pad_and_the_keyboard_without_focus() {
+        // A host pad in slot 0 (a streaming client's virtual pad) hides the
+        // stand-in: VICTORY_AUTO_A's Enter then reaches the keyboard only.
+        // Live presses go into that pad too.
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.txt");
+        *lock(&hub.live) = Some(live::Live::new(path.clone(), 30.0, 1800));
+        hub.poll();
+        std::fs::write(&path, "a:5\n").unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let state =
+            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
+        let mut got = [KeyState::default(); 4];
+        assert_eq!(state(r, 4, got.as_mut_ptr()), 1);
+        assert_eq!((got[0].virtual_key, got[0].scan_code), (0x0D, 0x1C));
+        release(r);
     }
 
     #[test]
