@@ -1,8 +1,9 @@
 //! RDNA 2 to HLSL translation. Unsupported instructions are rejected by name.
 
-use anyxboxx_rdna2_ref::decode::{decode, mnemonic};
+use anyxboxx_rdna2_ref::decode::{Instruction, decode};
 
 mod buffer_memory;
+mod control_flow;
 mod flat_atomic;
 mod flat_memory;
 mod lds;
@@ -31,167 +32,109 @@ const PRELUDE: &str = concat!(
     include_str!("prelude4.hlsl"),
 );
 
-/// Translate a straight-line wave32 program, rejecting unsupported instructions.
+/// Translate a wave32 compute program, rejecting unsupported instructions by name.
 pub fn translate(data: &[u8]) -> Result<String, String> {
     if !data.len().is_multiple_of(4) {
         return Err("truncated instruction".into());
     }
-    let instructions = decode(data);
-    let mut lines = String::from(PRELUDE);
-    for (index, instruction) in instructions.iter().enumerate() {
-        let name = mnemonic(instruction.family, instruction.opcode)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{} opcode {}", instruction.family, instruction.opcode));
-        match name.as_str() {
-            "s_nop" => (),
-            "s_endpgm" if index + 1 == instructions.len() => lines.push_str("  return;\n"),
-            _ if instruction.family == "MUBUF" => {
-                let offset = instruction.offset;
-                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
-                    return Err(format!("truncated instruction: {name}"));
-                }
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                for line in buffer_memory::statements(&name, word)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if matches!(instruction.family, "GLOBAL" | "FLAT") => {
-                let offset = instruction.offset;
-                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
-                    return Err(format!("truncated instruction: {name}"));
-                }
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                for line in flat_memory::statements(&name, instruction.family, word)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if instruction.family == "DS" => {
-                let offset = instruction.offset;
-                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
-                    return Err(format!("truncated instruction: {name}"));
-                }
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                for line in lds::statements(&name, word)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if instruction.family == "SMEM" => {
-                let offset = instruction.offset;
-                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
-                    return Err(format!("truncated instruction: {name}"));
-                }
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                for line in scalar_memory::statements(&name, word)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if instruction.family == "VOP3P" => {
-                let offset = instruction.offset;
-                if instruction.size < 2 || offset + instruction.size * 4 > data.len() {
-                    return Err(format!("truncated instruction: {name}"));
-                }
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                let literal = (instruction.size > 2)
-                    .then(|| u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()));
-                lines.push_str("  ");
-                lines.push_str(&vector_dot::statement(&name, word, literal)?);
-                lines.push('\n');
-            }
-            _ if instruction.family == "VOP3" => {
-                let offset = instruction.offset;
-                if offset + instruction.size * 4 > data.len() || instruction.size < 2 {
-                    return Err(format!("truncated instruction: {name}"));
-                }
-                let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                let literal = (instruction.size > 2)
-                    .then(|| u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()));
-                let line = vector_ternary::statement(&name, word, literal)?;
-                lines.push_str("  ");
-                lines.push_str(&line);
-                lines.push('\n');
-            }
-            _ if instruction.family == "VOPC" => {
-                let offset = instruction.offset;
-                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                let literal = (instruction.size > 1)
-                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
-                let line = vector_compare::statement(&name, word, literal)?;
-                lines.push_str("  ");
-                lines.push_str(&line);
-                lines.push('\n');
-            }
-            _ if instruction.family == "VOP2" => {
-                let offset = instruction.offset;
-                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                let literal = (instruction.size > 1)
-                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
-                let line = vector_binary::statement(&name, word, literal)?;
-                lines.push_str("  ");
-                lines.push_str(&line);
-                lines.push('\n');
-            }
-            _ if instruction.family == "VOP1" => {
-                let offset = instruction.offset;
-                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                let literal = (instruction.size > 1)
-                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
-                if let Some(line) = vector_unary::statement(&name, word, literal)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if instruction.family == "SOPK" => {
-                let offset = instruction.offset;
-                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                if let Some(line) = scalar_immediate::statement(&name, word)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if instruction.family == "SOP1" && scalar_movrel::supports(&name) => {
-                let offset = instruction.offset;
-                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                let literal = (instruction.size > 1)
-                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
-                if let Some(line) = scalar_movrel::statement(&name, word, literal)? {
-                    lines.push_str("  ");
-                    lines.push_str(&line);
-                    lines.push('\n');
-                }
-            }
-            _ if matches!(instruction.family, "SOP1" | "SOP2" | "SOPC") => {
-                let offset = instruction.offset;
-                let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                let literal = (instruction.size > 1)
-                    .then(|| u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()));
-                lines.push_str("  ");
-                let statement = if scalar_wide::supports(&name, instruction.family) {
-                    scalar_wide::statement(&name, instruction.family, word)?
-                } else if instruction.family == "SOP1" {
-                    scalar::statement(&name, word, literal)?
-                } else if instruction.family == "SOP2" {
-                    scalar_binary::statement(&name, word, literal)?
-                } else {
-                    scalar_compare::statement(&name, word, literal)?
-                };
-                lines.push_str(&statement);
-                lines.push('\n');
-            }
-            _ => return Err(format!("untranslated instruction: {name}")),
-        }
+    let mut output = String::from(PRELUDE);
+    control_flow::emit(data, &decode(data), &mut output)?;
+    output.push_str("}\n");
+    Ok(output)
+}
+
+fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec<String>, String> {
+    let word = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let second = bytes
+        .get(4..8)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let pair = word as u64 | ((second.unwrap_or(0) as u64) << 32);
+    let literal = bytes
+        .get(8..12)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let family = instruction.family;
+    // Cache operations and scheduling hints leave the oracle's architectural state unchanged.
+    if matches!(
+        name,
+        "s_nop"
+            | "s_waitcnt"
+            | "s_barrier"
+            | "s_sleep"
+            | "s_setprio"
+            | "s_ttracedata"
+            | "s_clause"
+            | "s_inst_prefetch"
+            | "s_icache_inv"
+            | "s_incperflevel"
+            | "s_decperflevel"
+            | "s_ttracedata_imm"
+            | "s_wait_idle"
+            | "s_waitcnt_depctr"
+            | "s_dcache_inv"
+            | "s_gl1_inv"
+            | "s_dcache_wb"
+            | "buffer_gl0_inv"
+            | "buffer_gl1_inv"
+            | "ds_nop"
+            | "s_atc_probe"
+            | "s_atc_probe_buffer"
+    ) {
+        return Ok(vec![]);
     }
-    lines.push_str("}\n");
-    Ok(lines)
+    if name == "s_getpc_b64" {
+        let d = (word >> 16) & 127;
+        if d == 125 {
+            return Ok(vec![]);
+        }
+        if d % 2 != 0 {
+            return Err(format!("{name}: unaligned SGPR pair s{d}"));
+        }
+        let pc = (instruction.offset + bytes.len()) as u64;
+        let high = if d + 1 == 125 {
+            "s_null".into()
+        } else {
+            format!("s[{}]", d + 1)
+        };
+        return Ok(vec![format!(
+            "s[{d}] = 0x{:X}u; {high} = 0x{:X}u;",
+            pc as u32,
+            pc >> 32
+        )]);
+    }
+    let line = match family {
+        "MUBUF" => return buffer_memory::statements(name, pair),
+        "GLOBAL" | "FLAT" => return flat_memory::statements(name, family, pair),
+        "DS" => return lds::statements(name, pair),
+        "SMEM" => return scalar_memory::statements(name, pair),
+        "VOP3P" => vector_dot::statement(name, pair, literal)?,
+        "VOP3" => vector_ternary::statement(name, pair, literal)?,
+        "VOPC" => vector_compare::statement(name, word, second)?,
+        "VOP2" => vector_binary::statement(name, word, second)?,
+        "VOP1" => {
+            return Ok(vector_unary::statement(name, word, second)?
+                .into_iter()
+                .collect());
+        }
+        "SOPK" => {
+            return Ok(scalar_immediate::statement(name, word)?
+                .into_iter()
+                .collect());
+        }
+        "SOP1" if scalar_movrel::supports(name) => {
+            return Ok(scalar_movrel::statement(name, word, second)?
+                .into_iter()
+                .collect());
+        }
+        "SOP1" | "SOP2" | "SOPC" if scalar_wide::supports(name, family) => {
+            scalar_wide::statement(name, family, word)?
+        }
+        "SOP1" => scalar::statement(name, word, second)?,
+        "SOP2" => scalar_binary::statement(name, word, second)?,
+        "SOPC" => scalar_compare::statement(name, word, second)?,
+        "SOPP" if name == "s_endpgm" => "return;".into(),
+        _ => return Err(format!("untranslated instruction: {name}")),
+    };
+    Ok(vec![line])
 }
 
 #[cfg(test)]
