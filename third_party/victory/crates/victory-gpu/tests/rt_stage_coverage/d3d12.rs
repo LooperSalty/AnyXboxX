@@ -343,17 +343,18 @@ impl Fixture {
     }
 }
 
-fn check_adapter(warp: bool) {
-    let (device, name) = match device(warp) {
+fn check_adapter(warp: bool, created: Result<(ID3D12Device, String)>) {
+    let (device, name) = match created {
         Ok(found) => found,
         Err(error) => {
-            if !warp && std::env::var_os("VICTORY_D3D12_ADAPTER").is_some_and(|v| !v.is_empty()) {
-                panic!("requested D3D12 adapter: {error:#}");
+            let hardware_requested =
+                std::env::var_os("VICTORY_D3D12_ADAPTER").is_some_and(|v| !v.is_empty());
+            let required = std::env::var_os("ANYXBOXX_REQUIRE_RUNTIME").is_some_and(|v| v == "1");
+            if warp || required || hardware_requested {
+                let backend = if warp { "WARP" } else { "hardware" };
+                panic!("D3D12 {backend} fixture device unavailable ({error:#})");
             }
-            eprintln!(
-                "SKIP D3D12 {} fixture: {error:#}",
-                if warp { "WARP" } else { "hardware" }
-            );
+            eprintln!("SKIP D3D12 hardware fixture ({error:#})");
             return;
         }
     };
@@ -369,10 +370,16 @@ fn check_adapter(warp: bool) {
 
 #[test]
 fn d3d12_hardware_matches_cpu_phase_oracle() {
-    check_adapter(false);
+    check_adapter(false, device(false));
 }
 
 #[test]
 fn d3d12_warp_matches_cpu_phase_oracle() {
-    check_adapter(true);
+    check_adapter(true, device(true));
+}
+
+#[test]
+#[should_panic(expected = "D3D12 WARP fixture device unavailable (synthetic WARP setup error)")]
+fn missing_warp_device_fails_the_fixture() {
+    check_adapter(true, Err(anyhow::anyhow!("synthetic WARP setup error")));
 }
