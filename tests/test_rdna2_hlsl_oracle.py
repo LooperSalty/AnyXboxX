@@ -29,6 +29,18 @@ def test_runtime_transcendental_requires_exact_implementation(name):
     refused(data, name)
 
 
+def test_vop3_constant_folding_validates_all_reference_operands():
+    name = "v_cos_f32"
+    data = program(*vop3(name, 2, LITERAL, 230), 0x3e800000)
+    with pytest.raises(rdna2_exec.Untranslated):
+        rdna2_exec.run(data)
+    refused(data, name)
+    with pytest.raises(rdna2_hlsl.Untranslatable, match=name):
+        rdna2_hlsl.translate(data, wave_size=64)
+    result = rust(data, "--wave64")
+    assert result.returncode and name.encode() in result.stderr
+
+
 def test_transcendental_constants_match_reference_on_warp():
     ops = []
     for i, name in enumerate(FOLDED):

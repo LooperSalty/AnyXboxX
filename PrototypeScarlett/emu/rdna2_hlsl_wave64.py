@@ -168,6 +168,8 @@ def _vector(name, fields, literal):
 
 def _vop3(name, opcode, fields, literal):
     """VOP3 dépendant de la taille du wave ; None pour les autres."""
+    if name in rdna2_hlsl.FOLDED_UNARY:
+        return None
     if name in COMPAREF16:
         target = EXEC if name.startswith("v_cmpx") else fields.vdst
         condition = rdna2_hlsl_cmpf16.condition(name, *rdna2_hlsl_cmpf16.vop3_sources(name, fields, literal))

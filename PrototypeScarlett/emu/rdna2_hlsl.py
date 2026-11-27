@@ -117,6 +117,12 @@ def _fold_unary(name, code, literal, fields=None):
     if bits is None:
         raise Untranslatable(f"{name} : opérande inconnu à la traduction")
     if fields:
+        # The VOP3 reference decodes all three sources, including unused ones.
+        try:
+            for other in fields.sources[1:]:
+                source(other, literal)
+        except Untranslatable as error:
+            raise Untranslatable(f"{name} : {error}") from error
         if fields.abs & 1:
             bits &= 0x7FFFFFFF
         if fields.neg & 1:

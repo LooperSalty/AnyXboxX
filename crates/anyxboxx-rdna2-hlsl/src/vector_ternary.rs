@@ -55,12 +55,6 @@ pub fn statement(
             _ => format!("if (lane == ({b} & 31u)) v[{}] = {a};", f.vdst),
         });
     }
-    if let Some(value) = crate::unary_constant::fold(name, f.sources[0], literal, Some(&f))? {
-        return Ok(format!(
-            "if (((s[126] >> lane) & 1u) != 0) v[{}] = {value};",
-            f.vdst
-        ));
-    }
     let integer_result = matches!(
         name,
         "v_cvt_i32_f32"
@@ -94,6 +88,12 @@ pub fn statement(
         value
     };
     let (a, b, c) = (modify(a?, 0), modify(b?, 1), modify(c?, 2));
+    if let Some(value) = crate::unary_constant::fold(name, f.sources[0], literal, Some(&f))? {
+        return Ok(format!(
+            "if (((s[126] >> lane) & 1u) != 0) v[{}] = {value};",
+            f.vdst
+        ));
+    }
     let mut expression = match name {
         "v_min3_f32" => format!("asuint(min(min(asfloat({a}), asfloat({b})), asfloat({c})))"),
         "v_max3_f32" => format!("asuint(max(max(asfloat({a}), asfloat({b})), asfloat({c})))"),
