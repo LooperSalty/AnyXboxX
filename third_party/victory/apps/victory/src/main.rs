@@ -164,6 +164,9 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Probe the signed Streamline runtime and GPU support without a title.
+    #[cfg(windows)]
+    UpscalerCheck,
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -247,6 +250,8 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        #[cfg(windows)]
+        Command::UpscalerCheck => victory_gpu::streamline::check().map_err(anyhow::Error::msg),
         Command::Config => show_config(),
     }
 }

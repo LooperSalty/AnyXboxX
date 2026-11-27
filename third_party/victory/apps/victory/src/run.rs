@@ -112,6 +112,7 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    let dlss_mode = execute.then(victory_gpu::streamline::title_mode).flatten();
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
@@ -168,7 +169,8 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -228,7 +230,7 @@ pub fn run(
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_with_fidelityfx(image.base(), size, dlss_mode.map(|m| m.scale())) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
