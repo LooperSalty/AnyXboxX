@@ -112,6 +112,17 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    let dlss_mode = execute.then(victory_gpu::streamline::title_mode).flatten().filter(|mode| {
+        if victory_gpu::streamline::upscaling() { return true; }
+        let output = victory_loader::resolution::asked_output().unwrap_or(match console {
+            Console::SeriesS => (1920, 1080), Console::SeriesX => (3840, 2160),
+        });
+        let scale = victory_loader::resolution::asked_ffx_scale().unwrap_or(mode.scale());
+        let render = [(output.0 as f32 * scale) as u32, (output.1 as f32 * scale) as u32];
+        if output == (1920, 1080) && matches!(render, [1280, 720] | [1920, 1080]) { return true; }
+        tracing::warn!(?output, ?render, "Frame Generation alone requires a supported native FidelityFX size; using the title's renderer. Enable DLSS for this output.");
+        false
+    });
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
@@ -168,7 +179,8 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -228,7 +240,7 @@ pub fn run(
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_with_fidelityfx(image.base(), size, dlss_mode.map(|m| m.scale())) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

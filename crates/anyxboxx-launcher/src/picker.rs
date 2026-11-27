@@ -11,6 +11,7 @@ pub const GAME_EXE: &str = "game_scarlett_master.exe";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pick {
     GameFolder,
+    Streamline,
     XgLibrary,
 }
 
@@ -63,6 +64,9 @@ pub fn open(kind: Pick, start_in: Option<PathBuf>) -> Receiver<(Pick, Option<Pat
             dialog = dialog.set_directory(dir);
         }
         let chosen = match kind {
+            Pick::Streamline => dialog
+                .set_title("Choose the Streamline bin\\x64 folder")
+                .pick_folder(),
             Pick::GameFolder => dialog
                 .set_title("Choose the game folder (it holds game_scarlett_master.exe)")
                 .pick_folder(),

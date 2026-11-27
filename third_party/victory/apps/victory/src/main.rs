@@ -164,6 +164,19 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Probe the signed Streamline runtime and GPU support without a title.
+    #[cfg(windows)]
+    UpscalerCheck {
+        /// Output dimensions for the synthetic textures.
+        #[arg(long, default_value = "2560x1440")]
+        output: String,
+        /// Run DLSS Super Resolution on synthetic textures.
+        #[arg(long)]
+        device: bool,
+        /// Also present 180 synthetic frames through the swap chain.
+        #[arg(long)]
+        present: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -247,6 +260,14 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        #[cfg(windows)]
+        Command::UpscalerCheck { output, device, present } => {
+            let size = output.split_once(['x', 'X'])
+                .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
+                .filter(|s| s.iter().all(|v| (1..=16384).contains(v)))
+                .ok_or_else(|| anyhow::anyhow!("expected --output WIDTHxHEIGHT, 1..16384 per dimension"))?;
+            victory_gpu::streamline::check(size, device, present).map_err(anyhow::Error::msg)
+        }
         Command::Config => show_config(),
     }
 }

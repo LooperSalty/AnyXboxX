@@ -64,6 +64,8 @@ pub struct App {
     pub host: Host,
     pub gpu: GpuVendor,
     pub adapter_name: Option<String>,
+    pub framegen_unavailable: Option<&'static str>,
+    pub streamline_check: Option<(String, Result<(), String>)>,
     adapters: Option<Vec<Adapter>>,
     pub setup: Vec<Item>,
     pub settings: Settings,
@@ -105,6 +107,7 @@ pub struct App {
     pick_rx: Option<Receiver<(Pick, Option<PathBuf>)>>,
     settings_path: Option<PathBuf>,
     last_saved: Stored,
+    title_id_cache: Option<(PathBuf, u32)>,
 }
 
 /// The checklist as the machine is now; `adapters` is what DXGI listed (None when it failed).
@@ -147,6 +150,11 @@ impl App {
             profiles,
             host,
             gpu,
+            framegen_unavailable: crate::framegen::unavailable(
+                gpu, adapter_name.as_deref().unwrap_or_default(),
+                host == Host::Windows && crate::framegen::detect_hags(),
+            ),
+            streamline_check: None,
             adapter_name,
             setup: read_setup(adapters.as_deref()),
             adapters,
@@ -180,6 +188,7 @@ impl App {
             clock: Instant::now(),
             pick_rx: None,
             settings_path,
+            title_id_cache: None,
         };
         app.find_game_folder();
         if app.settings.game_path().is_some() {
@@ -209,11 +218,12 @@ impl App {
         self.open_dialog(Pick::XgLibrary);
     }
 
-    fn open_dialog(&mut self, kind: Pick) {
+    pub(crate) fn open_dialog(&mut self, kind: Pick) {
         if self.pick_rx.is_some() {
             return;
         }
         let start = match kind {
+            Pick::Streamline => Some(PathBuf::from(&self.settings.options.dlss.streamline_dir)),
             Pick::GameFolder => self.settings.game_path(),
             Pick::XgLibrary => PathBuf::from(self.settings.xg_dll.trim())
                 .parent()
@@ -248,6 +258,7 @@ impl App {
             return;
         };
         match kind {
+            Pick::Streamline => self.settings.options.dlss.streamline_dir = path.display().to_string(),
             Pick::GameFolder => self.set_game_folder(&path),
             Pick::XgLibrary => self.settings.xg_dll = path.display().to_string(),
         }
@@ -276,16 +287,26 @@ impl App {
         self.repo.clone().unwrap_or_default()
     }
 
-    /// Where VIctory keeps saves and data: `VICTORY_DATA_DIR`, else `%LOCALAPPDATA%\victory\data`.
-    pub fn data_dir_label(&self) -> String {
-        let data = std::env::var_os("VICTORY_DATA_DIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("LOCALAPPDATA")
-                    .map(|l| PathBuf::from(l).join("victory").join("data"))
-            });
-        data.map_or("unknown".to_string(), |d| d.display().to_string())
+    /// Where VIctory keeps the game's saves (`<data>\<TitleId>\saves`), or the data root when no
+    /// game folder is set yet.
+    pub fn data_dir_label(&mut self) -> String {
+        let Some(data) = cache::current_data_dir() else {
+            return "unknown".to_string();
+        };
+        let Some(game_dir) = self.settings.game_path() else {
+            return data.display().to_string();
+        };
+        let title_id = match &self.title_id_cache {
+            Some((cached, id)) if *cached == game_dir => *id,
+            _ => {
+                let id = cache::read_title_id(&game_dir);
+                self.title_id_cache = Some((game_dir, id));
+                id
+            }
+        };
+        cache::title_saves_dir(&data, title_id)
+            .display()
+            .to_string()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -323,6 +344,7 @@ impl App {
             &repo,
             self.victory_exe.as_deref(),
             &profile,
+            self.framegen_unavailable.is_none(),
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -330,6 +352,10 @@ impl App {
                 return;
             }
         };
+        if let Err(reason) = crate::streamline::check_launch(&plan.env) {
+            self.notice = Some(reason);
+            return;
+        }
         if !precompile_only {
             // NVIDIA Smooth Motion lives in the driver's profile, not in VIctory's environment:
             // written now, so the game starts with the switch as the Play page shows it. A failure

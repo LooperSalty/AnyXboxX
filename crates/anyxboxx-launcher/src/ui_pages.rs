@@ -215,6 +215,8 @@ pub fn play(app: &mut App, ui: &mut egui::Ui) {
     );
     ui_options::cards(app, ui);
     ui.add_space(tokens::M);
+    crate::ui_dlss::card(app, ui);
+    ui.add_space(tokens::M);
     theme::card(ui, |ui| crate::ui_play::controls(app, ui));
 }
 
@@ -277,6 +279,7 @@ pub fn plan_lines(app: &App) -> Option<Vec<String>> {
         &app.repo_or_empty(),
         app.victory_exe.as_deref(),
         &profile,
+        app.framegen_unavailable.is_none(),
     )
     .ok()
     .map(|plan| crate::env::describe(&plan.env))
