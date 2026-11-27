@@ -10,15 +10,43 @@
 //! Recordings transferring an upload have distinct identities even if their
 //! allocator reuses a box address. Translation time sums the recording
 //! worker's active intervals, including parallel preparation and its join.
+//!
+//! For a newly submitted recording, estimate the translation work at stake
+//! if a matching stream in that window had been reusable. A candidate must
+//! already have finished when the title began this recording. Count later
+//! finishes separately. Resubmitting a recording incurs no translation.
+//! The estimate assumes the full stream can be recognized for free.
+//! Worker intervals across lists can overlap in wall time.
+//!
+//! At bind time, draw::root_view can copy current title memory into list
+//! scratch, and table lookup reads live heap slots. Neither input has a
+//! complete content version in this stream. At submission, list::detach
+//! transfers the host list, uploads and draw state to that flight. Temporary
+//! descriptor slots are returned after it runs (draw::State::tables_done).
 
 use super::{BARRIER, COPY_TEXTURE, CopyLocation, Recording, UPLOAD};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 const HISTORY: usize = 4096;
 type Key = [u8; 16];
-pub(super) type Ticket = Arc<OnceLock<Sample>>;
+pub(super) type Ticket = Arc<Observation>;
+
+pub(super) struct Observation {
+    began: Instant,
+    sample: OnceLock<Sample>,
+}
+
+impl Default for Observation {
+    fn default() -> Self {
+        Self {
+            began: Instant::now(),
+            sample: OnceLock::new(),
+        }
+    }
+}
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -51,10 +79,12 @@ impl Timing {
     }
 }
 
-pub(super) struct Sample {
+struct Sample {
     words: usize,
     key: Key,
     timing: Timing,
+    finished: Instant,
+    submitted: AtomicBool,
 }
 
 // Hash the active members of the two FFI unions. Their inactive bytes and
@@ -107,6 +137,7 @@ fn hash_chunk(hash: &mut blake3::Hasher, words: &[u64]) -> bool {
 }
 
 pub(super) fn complete(ticket: &Ticket, kind: u32, chunks: &[Vec<u64>], timing: Timing) {
+    let finished = Instant::now();
     let mut hash = blake3::Hasher::new();
     hash.update(&kind.to_le_bytes());
     let mut upload = false;
@@ -120,7 +151,13 @@ pub(super) fn complete(ticket: &Ticket, kind: u32, chunks: &[Vec<u64>], timing: 
     }
     let key = hash.finalize().as_bytes()[..16].try_into().unwrap();
     let words = chunks.iter().map(Vec::len).sum();
-    let _ = ticket.set(Sample { words, key, timing });
+    let _ = ticket.sample.set(Sample {
+        words,
+        key,
+        timing,
+        finished,
+        submitted: AtomicBool::new(false),
+    });
 }
 
 #[derive(Default)]
@@ -128,23 +165,27 @@ struct Frames {
     current: Vec<Ticket>,
     pending: VecDeque<(u64, Vec<Ticket>)>,
     recent: VecDeque<Key>,
-    counts: HashMap<Key, usize>,
+    // Completion times per fingerprint, in submission order (workers may
+    // finish out of order). The two queues expire the same occurrence.
+    finishes: HashMap<Key, VecDeque<Instant>>,
 }
 
 impl Frames {
-    fn repeated(&mut self, key: Key) -> bool {
-        let repeated = self.counts.contains_key(&key);
+    fn remember(&mut self, key: Key, began: Instant, finished: Instant) -> (bool, bool) {
+        let times = self.finishes.entry(key).or_default();
+        let repeated = !times.is_empty();
+        let ready = times.iter().any(|&end| end <= began);
+        times.push_back(finished);
         self.recent.push_back(key);
-        *self.counts.entry(key).or_default() += 1;
         if self.recent.len() > HISTORY {
             let old = self.recent.pop_front().unwrap();
-            let count = self.counts.get_mut(&old).unwrap();
-            *count -= 1;
-            if *count == 0 {
-                self.counts.remove(&old);
+            let times = self.finishes.get_mut(&old).unwrap();
+            times.pop_front();
+            if times.is_empty() {
+                self.finishes.remove(&old);
             }
         }
-        repeated
+        (repeated, ready)
     }
 
     fn take_ready(&mut self) -> Vec<Report> {
@@ -152,7 +193,7 @@ impl Frames {
         while self
             .pending
             .front()
-            .is_some_and(|(_, lists)| lists.iter().all(|t| t.get().is_some()))
+            .is_some_and(|(_, lists)| lists.iter().all(|t| t.sample.get().is_some()))
         {
             let (frame, tickets) = self.pending.pop_front().unwrap();
             let mut row = Report {
@@ -160,9 +201,22 @@ impl Frames {
                 ..Report::default()
             };
             for t in tickets {
-                let s = t.get().unwrap();
+                let s = t.sample.get().unwrap();
                 row.lists.push((s.words, s.timing.elapsed.as_micros()));
-                row.repeated += usize::from(self.repeated(s.key));
+                let (repeated, ready) = self.remember(s.key, t.began, s.finished);
+                row.repeated += usize::from(repeated);
+                if s.submitted.swap(true, Ordering::Relaxed) {
+                    row.resubmitted_lists += 1;
+                } else {
+                    row.translation += s.timing.elapsed;
+                    if ready {
+                        row.reuse_candidate_lists += 1;
+                        row.reuse_candidate_work += s.timing.elapsed;
+                    } else if repeated {
+                        row.prior_unready_lists += 1;
+                        row.prior_unready_work += s.timing.elapsed;
+                    }
+                }
                 row.split_chunks += s.timing.pieces;
                 row.root_bindings += s.timing.bindings;
             }
@@ -177,6 +231,12 @@ struct Report {
     frame: u64,
     lists: Vec<(usize, u128)>,
     repeated: usize,
+    translation: Duration,
+    reuse_candidate_lists: usize,
+    reuse_candidate_work: Duration,
+    prior_unready_lists: usize,
+    prior_unready_work: Duration,
+    resubmitted_lists: usize,
     split_chunks: usize,
     root_bindings: usize,
 }
@@ -197,6 +257,12 @@ impl Report {
         let n = self.lists.len();
         tracing::info!(frame = self.frame, lists = n, max_words, median_words,
             repeated = self.repeated, repeat_pct = 100.0 * self.repeated as f64 / n.max(1) as f64,
+            translation_worker_ms = self.translation.as_secs_f64() * 1e3,
+            reuse_candidate_lists = self.reuse_candidate_lists,
+            reuse_candidate_worker_ms = self.reuse_candidate_work.as_secs_f64() * 1e3,
+            prior_unready_lists = self.prior_unready_lists,
+            prior_unready_worker_ms = self.prior_unready_work.as_secs_f64() * 1e3,
+            resubmitted_lists = self.resubmitted_lists,
             split_chunks = self.split_chunks, root_bindings = self.root_bindings,
             words_and_translation_us = ?self.lists, "THIN submitted frame (VICTORY_THIN_STATS)");
     }
@@ -271,107 +337,4 @@ pub(crate) fn present(frame: u64) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::list::thin::{CLOSE, Plain, RESET};
-
-    fn ticket_for(kind: u32, chunks: &[Vec<u64>]) -> Ticket {
-        let t = Ticket::default();
-        complete(&t, kind, chunks, Timing::default());
-        t
-    }
-
-    #[test]
-    fn stream_identity_includes_named_objects_and_ignores_chunk_boundaries() {
-        let chunks = [
-            vec![RESET | 1 << 16, 0],
-            vec![Plain::COPY_RESOURCE as u64 | 2 << 16, 123, 456, CLOSE],
-        ];
-        let key = |kind, chunks: &[Vec<u64>]| ticket_for(kind, chunks).get().unwrap().key;
-        let first = key(0, &chunks);
-        assert_eq!(key(0, &[chunks.concat()]), first);
-        assert_ne!(key(1, &chunks), first);
-        let mut renamed = chunks.clone();
-        renamed[1][2] += 1;
-        assert_ne!(key(0, &renamed), first);
-        let with_upload = [vec![UPLOAD | 1 << 16, 123, CLOSE]];
-        assert_ne!(key(0, &with_upload), key(0, &with_upload));
-    }
-
-    #[test]
-    fn frame_statistics_wait_for_tickets_and_count_prior_frames() {
-        let mut frames = Frames::default();
-        let late = Ticket::default();
-        let first = ticket_for(0, &[vec![CLOSE]]);
-        frames
-            .pending
-            .push_back((1, vec![late.clone(), first.clone()]));
-        frames.pending.push_back((2, vec![first]));
-        frames.pending.push_back((3, vec![]));
-        assert!(frames.take_ready().is_empty());
-        let mut timing = Timing::default();
-        timing.add(Duration::from_micros(42), Some(3));
-        complete(&late, 0, &[vec![RESET | 1 << 16, 0, CLOSE]], timing);
-        let rows = frames.take_ready();
-        assert_eq!(rows[0].lists, [(3, 42), (1, 0)]);
-        assert_eq!(rows[0].sizes(), (3, 2.0));
-        assert_eq!(
-            (
-                rows[0].repeated,
-                rows[0].split_chunks,
-                rows[0].root_bindings
-            ),
-            (0, 1, 3)
-        );
-        assert_eq!((rows[1].frame, rows[1].repeated), (2, 1));
-        assert_eq!(rows[2].sizes(), (0, 0.0));
-        assert!(frames.pending.is_empty());
-    }
-
-    #[test]
-    fn fingerprints_cover_copied_views_and_active_ffi_fields() {
-        use crate::list::thin::{RECORD, TARGETS};
-        let key = |words: &[u64]| ticket_for(0, &[words.to_vec()]).get().unwrap().key;
-        let mut words = vec![BARRIER | (5 << 16), 1, 0, 42, 3 << 32, 8];
-        let first = key(&words);
-        words[5] |= 123 << 32; // transition padding
-        assert_eq!(key(&words), first);
-        words[3] += 1;
-        assert_ne!(key(&words), first);
-
-        let step = size_of::<CopyLocation>() / 8;
-        let mut copy = vec![0; 3 + 2 * step];
-        copy[0] = COPY_TEXTURE | ((copy.len() - 1) as u64) << 16;
-        let first = key(&copy);
-        copy[4] = 17 << 32; // padding after kind
-        copy[6] = 888; // inactive footprint in a subresource location
-        assert_eq!(key(&copy), first);
-        copy[5] = 9; // subresource index
-        assert_ne!(key(&copy), first);
-
-        let mut view = vec![0; 4 + 2 * RECORD];
-        view[0] = TARGETS | ((view.len() - 1) as u64) << 16;
-        view[1] = 1;
-        view[2] = 1;
-        let first = key(&view);
-        view[5] = 42; // named resource in the recorded RTV
-        assert_ne!(key(&view), first);
-        let first = key(&view);
-        view[6] = 1; // changed descriptor on the same resource
-        assert_ne!(key(&view), first);
-    }
-
-    #[test]
-    fn history_expires_after_the_last_occurrence_leaves_the_window() {
-        let mut frames = Frames::default();
-        let key = [1; 16];
-        assert!(!frames.repeated(key));
-        assert!(frames.repeated(key));
-        for _ in 0..HISTORY - 1 {
-            frames.repeated([2; 16]);
-        }
-        assert!(frames.counts.contains_key(&key));
-        frames.repeated([2; 16]);
-        assert!(!frames.repeated(key));
-    }
-}
+mod tests;
