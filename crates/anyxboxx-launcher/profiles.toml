@@ -57,6 +57,21 @@ VICTORY_THIN = "1"
 VICTORY_JOIN_PARTS = "8"
 VICTORY_UPLOAD_AHEAD = "1"
 VICTORY_INDIRECT_BATCH = "2"
+# Local play build of 2026-11-27 (branch test/integ-28, not for main): the 30 fps cap lifted, the
+# measured VICTORY_WIDE_COPY (+12 %), every opt-in of PRs #510-#521, and the stability report.
+VICTORY_FRAME_INTERVAL_MS = "16.667"
+VICTORY_WIDE_COPY = "1"
+VICTORY_HELPER_PRIORITY = "1"
+VICTORY_PAR_REFRESH = "1"
+VICTORY_SETTLE_ROOM = "1"
+VICTORY_THIN_SPLIT = "1"
+VICTORY_EARLY_HEAPS = "1"
+VICTORY_LEAVE_OPEN = "1"
+VICTORY_LET_GO_BESIDE = "1"
+VICTORY_SCRATCH_KEEP = "1"
+VICTORY_COPIED_AT_ONCE = "1"
+VICTORY_FRAME_TIMES = "1"
+VICTORY_FRAME_BOOK = "50"
 
 # ---------------------------------------------------------------------------------------------
 # Linux (Proton) + AMD: the settings of PR #199's measured Linux run (Exorion1er, Fedora 44,
