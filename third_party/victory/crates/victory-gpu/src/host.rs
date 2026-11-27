@@ -2090,21 +2090,16 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
+    let freed = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        std::mem::replace(&mut *spare, Spare::new())
     };
-    let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
-    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
-    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
-    drop(freed);
+    ALIVE[3].fetch_sub(freed.kept.len() as u64, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(freed.bytes, Ordering::Relaxed);
+    scratch_release::release(freed);
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3973,6 +3968,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod scratch_release;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
