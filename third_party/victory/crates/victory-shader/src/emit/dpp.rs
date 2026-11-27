@@ -1,6 +1,6 @@
 //! DPP16 and DPP8 lane selection and destination write masks.
 
-use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, pred};
+use super::{Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, pred};
 use crate::gfx10::Dpp;
 
 impl Lower<'_> {
@@ -121,26 +121,10 @@ impl Lower<'_> {
                 self.s.m.cmp(c, pred::NE, picked, z)
             })
         } else {
-            let mine = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let i32t = self.s.t.i32;
-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-            let ballot = self
-                .s
-                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[mine]);
-            let lo = self.s.m.extract(c, ballot, 0);
-            let word = if self.s.wave_size == Some(32) {
-                lo
-            } else {
-                let hi = self.s.m.extract(c, ballot, 1);
-                let k32 = k(self, 32);
-                let upper = self.s.m.cmp(c, pred::IUGE, safe_src, k32);
-                self.s.m.select(c, upper, hi, lo)
-            };
-            let (k31, one, z) = (k(self, 31), k(self, 1), k(self, 0));
-            let bit = self.s.m.bin(c, Bin::And, safe_src, k31);
-            let shifted = self.s.m.bin(c, Bin::LShr, word, bit);
-            let on = self.s.m.bin(c, Bin::And, shifted, one);
-            Some(self.s.m.cmp(c, pred::NE, on, z))
+            let active = self
+                .active_guard(guard)
+                .unwrap_or_else(|| self.s.m.bool(true));
+            Some(self.lane_active(active, safe_src))
         };
         let valid = match (inside, src_active) {
             (Some(a), Some(b)) => Some(self.s.m.bin(c, Bin::And, a, b)),
