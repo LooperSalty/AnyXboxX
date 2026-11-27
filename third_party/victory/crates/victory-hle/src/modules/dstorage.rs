@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -150,11 +150,27 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            files,
+            key: AtomicUsize::new(0),
+        },
+    );
+    let key = file as usize;
+    // SAFETY: `Instance::create` just allocated `Instance<File>`.
+    unsafe { &*file.cast::<Instance<File>>() }
+        .state
+        .key
+        .store(key, Ordering::Relaxed);
     if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+        stream_log::line(format_args!("F\t{:x}\t{kept}", key));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    {
+        let mut files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        files.retain(|(k, _)| *k != key);
+        files.push((key, kept));
+    }
     put(out, file)
 }
 
@@ -278,6 +294,20 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// Address of the owning `Instance<File>` registered in [`WALLS_FILES`].
+    key: AtomicUsize,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        let key = self.key.load(Ordering::Relaxed);
+        if key != 0 {
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(k, _)| *k != key);
+        }
+    }
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -964,16 +994,20 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Upper bound on the temporary buffers a request may hold while it runs.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    let options = request.options;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let source = u64::from(request.source_size);
+    let mut bytes = if compressed && options & MEMORY_SOURCE == 0 { source } else { 0 };
+    if options & ZLIB != 0 && options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
     }
+    // A destination spread across physical allocations may require a scatter buffer.
+    if options & PAGE_DESTINATION != 0 {
+        bytes += if compressed { u64::from(request.destination_size) } else { source };
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -2277,6 +2311,35 @@ mod tests {
     }
 
     #[test]
+    fn staging_limits_scatter_buffers_for_memory_sources() {
+        let mut lanes = lanes(100);
+        lanes.lanes.insert(0, Lane::new(0, 64));
+        let options = MEMORY_SOURCE | PAGE_DESTINATION;
+        read(&mut lanes, 0, options, 60);
+        read(&mut lanes, 0, options, 60);
+        lanes.submit(0, false);
+        let first = lanes.start().unwrap();
+        assert_eq!(first.staging, 60);
+        assert!(lanes.start().is_none(), "another scatter buffer would exceed 100 bytes");
+        lanes.finish(&first, Ok(()));
+        let second = lanes.start().unwrap();
+        assert_eq!(second.staging, 60);
+        lanes.finish(&second, Ok(()));
+        assert_eq!(lanes.staged, 0);
+    }
+
+    #[test]
+    fn staging_counts_compressed_input_intermediate_and_scatter_storage() {
+        let mut r = request(ZLIB | 2 | PAGE_DESTINATION, std::ptr::null_mut(), 80, std::ptr::null(), 0, 30);
+        r.intermediate_size = 50;
+        assert_eq!(staging_bytes(&r), 30 + 50 + 80);
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&r), 50 + 80);
+        r.options = 0;
+        assert_eq!(staging_bytes(&r), 0);
+    }
+
+    #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
@@ -2551,5 +2614,29 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn releasing_a_file_removes_it_from_walls_files() {
+        let (_dir, file) = file_with(&pattern(32));
+        let key = file as usize;
+        assert!(
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(k, _)| *k == key),
+            "opened file should be registered in WALLS_FILES"
+        );
+        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release_fn(file), 0);
+        assert!(
+            !WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(k, _)| *k == key),
+            "released file should be removed from WALLS_FILES"
+        );
     }
 }

@@ -119,6 +119,9 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    if super::window_identity::is_title_window(parent.is_null(), style) {
+        super::window_identity::apply(hwnd);
+    }
     hwnd
 }
 
@@ -146,6 +149,9 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    if super::window_identity::is_title_window(parent.is_null(), style) {
+        super::window_identity::apply(hwnd);
+    }
     hwnd
 }
 
