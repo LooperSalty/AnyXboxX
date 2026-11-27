@@ -162,23 +162,37 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
+/// `room_percent` is the share up to which the texture queue makes new
+/// copies (`crate::resource::room`, `VICTORY_TEXTURE_ROOM_PERCENT`). Under
+/// 88 the letting go starts there, and comes down to 3 below it: from 85
+/// to 88 % the 8 GB preset's 85 refused every new texture while idle ones
+/// were kept for ten minutes (#449). The 95 % line stays.
+///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
-pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+pub(crate) fn vram_keep(budget: u64, used: u64, room_percent: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
+    /// Where letting go starts when the queue's share is above it.
+    const START: u64 = 88;
+    /// How far under the start the letting go comes down to.
+    const BELOW: u64 = 3;
+    /// From here idle copies go after [`SHORT_MS`].
+    const SHORT_FROM: u64 = 95;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    let start = room_percent.min(START);
+    let target = start.saturating_sub(BELOW);
+    if used < share(start) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(SHORT_FROM) {
+        (IDLE_MS, used - share(target))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(target))
     }
 }
 
@@ -8882,6 +8896,37 @@ impl Batch {
     }
 }
 
+/// Copies of at least this many bytes are cut into pieces for the kept
+/// threads of [`crate::shadow::wide_run`] (`VICTORY_WIDE_COPY=1`; off by
+/// default, an A/B switch). Pieces are [`WIDE_COPY_PIECE`] bytes each.
+const WIDE_COPY_MIN: usize = 8 << 20;
+const WIDE_COPY_PIECE: usize = 2 << 20;
+
+fn wide_copy_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_COPY").is_some_and(|v| v == "1"))
+}
+
+/// The `[from, to)` pieces that cover `len` bytes, `piece` bytes each (the
+/// last one may be shorter).
+fn piece_bounds(len: usize, piece: usize) -> Vec<(usize, usize)> {
+    (0..len.div_ceil(piece)).map(|i| (i * piece, ((i + 1) * piece).min(len))).collect()
+}
+
+/// [`copy_mapped`] of a big copy, piece by piece on several threads. Each
+/// piece is shorter than [`WIDE_COPY_MIN`], so it does not come back here.
+fn copy_pieces(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let (d, s) = (dst as usize, src as usize);
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = piece_bounds(len, WIDE_COPY_PIECE)
+        .into_iter()
+        .map(|(a, b)| {
+            Box::new(move || copy_mapped((d + a) as *mut u8, (s + a) as *const u8, b - a, title_dst))
+                as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -8903,6 +8948,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         _ => {}
     }
     if len == 0 {
+        return;
+    }
+    if len >= WIDE_COPY_MIN && wide_copy_on() {
+        copy_pieces(dst, src, len, title_dst);
         return;
     }
     // A title destination that is not all mapped is left alone. Asking
@@ -9354,8 +9403,6 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
-    caption: Option<Vec<u16>>,
 }
 
 impl Meter {
@@ -9369,7 +9416,6 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            caption: None,
         }
     }
 
@@ -9711,17 +9757,9 @@ impl Meter {
                     }
                 }
         });
-        if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
-        }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let caption: Vec<u16> = crate::WINDOW_NAME.encode_utf16().collect();
+        let text = format!(" | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text: Vec<u16> = caption.into_iter().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -11591,12 +11629,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn textures_are_kept_while_the_card_has_room() {
         use super::vram_keep;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        // The queue's default share (90) and any above 88: as before.
+        for room in [88, 90, 97] {
+            assert_eq!(vram_keep(100 * gib, 87 * gib, room).0, 600_000);
+            // Past it: the longest idle ones, enough to come down to 85 %.
+            let (ms, bytes) = vram_keep(100 * gib, 90 * gib, room);
+            assert_eq!((ms, bytes), (5_000, 5 * gib));
+            assert_eq!(vram_keep(100 * gib, 120 * gib, room), (1_500, 35 * gib));
+            assert_eq!(vram_keep(0, 7, room).0, 5_000);
+        }
+    }
+
+    /// #449: under 88 the letting go starts at the queue's share and comes
+    /// down to 3 below it; 95 % stays the line for the short time.
+    #[test]
+    fn textures_go_from_where_the_queue_is_refused() {
+        use super::vram_keep;
+        let gib = 1 << 30;
+        assert_eq!(vram_keep(100 * gib, 84 * gib, 85).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 85 * gib, 85), (5_000, 3 * gib));
+        assert_eq!(vram_keep(100 * gib, 87 * gib, 85), (5_000, 5 * gib));
+        assert_eq!(vram_keep(100 * gib, 94 * gib, 85), (5_000, 12 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib, 85), (1_500, 13 * gib));
+        // The lowest share the queue takes (50).
+        assert_eq!(vram_keep(100 * gib, 49 * gib, 50).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 50 * gib, 50), (5_000, 3 * gib));
     }
 
     #[test]
@@ -11629,5 +11686,34 @@ mod window_mode_tests {
         assert!(super::is_borderless(" Borderless "));
         assert!(!super::is_borderless("windowed"));
         assert!(!super::is_borderless(""));
+    }
+}
+
+#[cfg(test)]
+mod piece_copy_tests {
+    use super::{copy_pieces, piece_bounds};
+
+    /// The pieces cover the copy exactly once, the last one shorter.
+    #[test]
+    fn pieces_cover_the_copy_once() {
+        assert_eq!(piece_bounds(0, 4), vec![]);
+        assert_eq!(piece_bounds(4, 4), vec![(0, 4)]);
+        assert_eq!(piece_bounds(10, 4), vec![(0, 4), (4, 8), (8, 10)]);
+        let len = 9 << 20;
+        let cut = piece_bounds(len, 2 << 20);
+        assert_eq!(cut.len(), 5);
+        assert_eq!(cut.iter().map(|(a, b)| b - a).sum::<usize>(), len);
+        assert!(cut.windows(2).all(|w| w[0].1 == w[1].0));
+    }
+
+    /// A big copy made on several threads copies every byte, the last
+    /// partial piece included.
+    #[test]
+    fn a_big_copy_in_pieces_copies_every_byte() {
+        let len = (9 << 20) + 4097;
+        let src: Vec<u8> = (0..len).map(|i| (i * 131 + i / 4099) as u8).collect();
+        let mut dst = vec![0u8; len];
+        copy_pieces(dst.as_mut_ptr(), src.as_ptr(), len, false);
+        assert!(dst == src, "the pieces did not copy the same bytes");
     }
 }
