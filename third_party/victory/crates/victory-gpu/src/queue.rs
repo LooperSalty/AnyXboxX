@@ -886,6 +886,12 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Frames presented so far (also in release builds; `VICTORY_INPUT_LIVE`
+/// counts held frames with it).
+pub fn frame_count() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
