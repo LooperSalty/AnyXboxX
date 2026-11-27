@@ -11,6 +11,9 @@ use std::process::ExitCode;
 
 use anyxboxx::{banc, carte, jour_j, rapport, run, traduction};
 use clap::{Parser, Subcommand};
+mod natif;
+mod perf;
+mod rdna2;
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +28,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run a trusted executable natively on Windows, without isolation.
+    Natif(natif::Args),
+    /// Capture native frame times and check the 60 fps target.
+    BancPerf(perf::Args),
+    /// Inspect a RDNA 2 shader or execute a wave32 in the reference interpreter.
+    Rdna2(rdna2::Args),
     /// Build VIctory and launch it on your own game folder (replaces the former tools/lancer_victory.ps1).
     Run(run::RunArgs),
     /// Compatibility report of an executable or package folder (replaces scarlett.py --rapport).
@@ -41,6 +50,22 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
+        Command::Natif(args) => match natif::run(&args) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("Erreur : {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::BancPerf(args) => match perf::run(&args) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => 2.into(),
+            Err(error) => {
+                eprintln!("Erreur : {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Rdna2(args) => rdna2::command(args),
         Command::Run(args) => launch(&args),
         Command::Rapport(args) => match rapport::rapport(&args) {
             Ok(text) => {

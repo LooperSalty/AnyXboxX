@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-BINARY = REPO / "target" / "release" / ("anyxboxx.exe" if os.name == "nt" else "anyxboxx")
+BINARY = REPO / os.environ.get("CARGO_TARGET_DIR", "target") / "release" / ("anyxboxx.exe" if os.name == "nt" else "anyxboxx")
 SCARLETT = REPO / "PrototypeScarlett" / "scarlett.py"
 GPU_TABLE = REPO / "crates" / "anyxboxx-report" / "data" / "rdna2-coverage.txt"
 GPU_HEADER = (

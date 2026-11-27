@@ -8,8 +8,9 @@ use crate::{
     memory::{Allocation, MemoryError},
     registration, resolver,
 };
+use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn resolution_error(error: resolver::ResolveError) -> String {
     match error {
@@ -46,6 +47,39 @@ pub unsafe fn launch(
     runtime: [Module; 6],
     measuring: bool,
 ) -> Result<i32, String> {
+    // SAFETY: the caller accepts native execution and exclusive process initialization.
+    unsafe {
+        launch_with(
+            bytes,
+            path,
+            tombox_folder,
+            runtime,
+            measuring,
+            LaunchOptions {
+                local_dll: &|name| Some(game_folder.join(name)).filter(|p| p.exists()),
+                before_entry: &|_, _| {},
+            },
+        )
+    }
+}
+
+pub struct LaunchOptions<'a> {
+    pub local_dll: &'a dyn Fn(&OsStr) -> Option<PathBuf>,
+    pub before_entry: &'a dyn Fn(usize, bool),
+}
+
+/// Launch with the caller's DLL search order and entry-point log.
+///
+/// # Safety
+/// The safety requirements of [`launch`] also apply to the DLLs selected by `local_dll`.
+pub unsafe fn launch_with(
+    bytes: &[u8],
+    path: &Path,
+    tombox_folder: &Path,
+    runtime: [Module; 6],
+    measuring: bool,
+    options: LaunchOptions<'_>,
+) -> Result<i32, String> {
     let mut image = Image::parse(bytes).map_err(|error| format!("{error} (erreur 0)"))?;
     let allocation = Allocation::map(&mut image).map_err(|error| match error {
         MemoryError::Allocation(error) => format!(
@@ -63,8 +97,14 @@ pub unsafe fn launch(
         measuring,
     };
     hooks::install(context).map_err(|_| "interceptions déjà installées".to_owned())?;
-    resolver::bind(&mut image, &runtime, game_folder, tombox_folder, measuring)
-        .map_err(resolution_error)?;
+    resolver::bind_with(
+        &mut image,
+        &runtime,
+        options.local_dll,
+        tombox_folder,
+        measuring,
+    )
+    .map_err(resolution_error)?;
     allocation.sync(&image).map_err(|error| error.to_string())?;
     allocation
         .protect(&image)
@@ -78,7 +118,8 @@ pub unsafe fn launch(
     unsafe { registration::register(&image, allocation, runtime[4]) }
         .map_err(|error| format!("{error} (erreur 0)"))?;
     // SAFETY: caller ensures no other thread reads the process command-line buffers.
-    unsafe { command_line::adopt(path) };
+    let adopted = unsafe { command_line::adopt(path) };
+    (options.before_entry)(allocation.base() as usize, adopted);
     // SAFETY: caller accepts execution of the trusted, initialized image.
     unsafe { allocation.call_entry(&image) }.map_err(|error| error.to_string())
 }
