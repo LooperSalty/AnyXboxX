@@ -12,6 +12,10 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod rounds;
+#[cfg(windows)]
+pub(crate) use rounds::{begin_sync_heaps, begin_sync_heaps_after, list_closed, round_after_now, round_mark};
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -170,193 +174,12 @@ fn sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
 }
 
-/// Whether a submission's [`sync_heaps`] is done by a thread of its own
-/// beside the rest of the preparing (`VICTORY_HEAP_SYNC_ASIDE=0`: in front of
-/// it, as before).
-///
-/// It took 13 ms a frame of the submitting thread (session play-1125-0203:
-/// 230 changed heap pages and 470,000 slots in 30 submissions). What it makes
-/// are the host heap's descriptors, which the card reads: it has to be done
-/// before the lists go to the queue, and nothing of the preparing looks at
-/// them (what a draw reads through a table it made itself, when recorded).
-#[cfg(windows)]
-fn sync_aside() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
-}
-
-/// How long that thread waits for a submission before it makes a round of its
-/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 4 if not given; `0`: none). The title
-/// copies its records while it records, and the first submission of a frame
-/// found all of them: 8 ms waited for (run cpu-2). A round made meanwhile
-/// leaves it those written since.
-#[cfg(windows)]
-fn sync_early() -> Option<std::time::Duration> {
-    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
-    })
-}
-
-/// The thread's work: rounds asked for, rounds done.
-#[cfg(windows)]
-static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
-
-/// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
-/// when this returns.
-#[cfg(windows)]
-pub(crate) struct SyncedHeaps(Option<u64>);
-
-#[cfg(windows)]
-pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
-    if !sync_aside() {
-        sync_heaps();
-        return SyncedHeaps(None);
-    }
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    STARTED.call_once(|| {
-        let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
-            crate::cores::keep_on_fast_cores("victory-heap-sync");
-            let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-            /// A round is over, however it ends.
-            struct Over;
-            impl Drop for Over {
-                fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
-                    SYNC_ROUNDS.1.notify_all();
-                }
-            }
-            // Between the rounds asked for, while submissions come.
-            let mut last = std::time::Instant::now();
-            loop {
-                let mut r = rounds();
-                let mut asked = r.0 != r.1;
-                while !asked {
-                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
-                        r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
-                        asked = r.0 != r.1;
-                        continue;
-                    };
-                    let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
-                    r = back;
-                    asked = r.0 != r.1;
-                    if over.timed_out() {
-                        break;
-                    }
-                }
-                drop(r);
-                let _over = asked.then(|| {
-                    last = std::time::Instant::now();
-                    Over
-                });
-                let _round =
-                    crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
-                let _ = std::panic::catch_unwind(sync_heaps);
-            }
-        });
-        THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
-    });
-    if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
-        sync_heaps();
-        return SyncedHeaps(None);
-    }
-    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
-    drop(rounds);
-    SYNC_ROUNDS.1.notify_all();
-    SyncedHeaps(Some(mine))
-}
-
-/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
-/// submission that needs round `mark` (one that began after what it waits
-/// for was written, `crate::port_journal::round_after`): asked for if it has not
-/// been. 0: as [`begin_sync_heaps`].
-#[cfg(windows)]
-pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
-    if mark == 0 || !sync_aside() {
-        return begin_sync_heaps();
-    }
-    // (The thread is started by the first `begin_sync_heaps`.)
-    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
-        drop(rounds);
-        return begin_sync_heaps();
-    }
-    let asked = rounds.0 < mark;
-    rounds.0 = rounds.0.max(mark);
-    drop(rounds);
-    if asked {
-        SYNC_ROUNDS.1.notify_all();
-        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    SyncedHeaps(Some(mark))
-}
-
-/// Renderer port #7: the number of a round of the heaps' records that
-/// begins after this call, asked for if none is waiting to begin (at the
-/// title's submit: the round runs while the submission waits in the line).
-/// 0 if the records are not synced by a thread of their own (or it has not
-/// started yet).
-#[cfg(windows)]
-pub(crate) fn round_after_now() -> u64 {
-    if !sync_aside() {
-        return 0;
-    }
-    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
-        return 0;
-    }
-    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
-    if ask {
-        rounds.0 = round;
-        drop(rounds);
-        SYNC_ROUNDS.1.notify_all();
-        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    round
-}
-
-/// Renderer port #7: the number of the first round that begins after this
-/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
-#[cfg(windows)]
-pub(crate) fn round_mark() -> u64 {
-    if !sync_aside() {
-        return 0;
-    }
-    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
-        return 0;
-    }
-    rounds.0 + 1
-}
-
 /// Whether `[at, at + len)` touches the title memory of a placed
 /// shader-visible heap of descriptors.
 #[cfg(windows)]
 pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
     let (from, to) = (at as u64, at as u64 + len as u64);
     SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
-}
-
-#[cfg(windows)]
-impl Drop for SyncedHeaps {
-    fn drop(&mut self) {
-        let Some(mine) = self.0 else {
-            return;
-        };
-        let began = std::time::Instant::now();
-        let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-        while rounds.1 < mine {
-            rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
-        }
-        drop(rounds);
-        SYNCED[6].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
@@ -370,6 +193,13 @@ impl Drop for SyncedHeaps {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    scan_heaps(true);
+}
+
+/// A Close pass may take marked slots, but leaves renderer port #2's
+/// per-frame fallback budget for the usual scans (more writes can follow Close).
+#[cfg(windows)]
+fn scan_heaps(include_fallback: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
@@ -433,16 +263,18 @@ pub(crate) fn sync_heaps() {
                 parts.push((from, from + n as usize * step as usize, false));
             }
             phase.end();
-            if crate::port_descriptors::ask_due(frame) {
-                let began = std::time::Instant::now();
-                let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
-                let taken = written.take(start as usize, end as usize);
-                phase.end();
-                spent[0] += since(began);
-                crate::port_descriptors::asked(&taken);
-            }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+            if include_fallback {
+                if crate::port_descriptors::ask_due(frame) {
+                    let began = std::time::Instant::now();
+                    let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
+                    let taken = written.take(start as usize, end as usize);
+                    phase.end();
+                    spent[0] += since(began);
+                    crate::port_descriptors::asked(&taken);
+                }
+                for page in crate::port_descriptors::to_check(frame) {
+                    parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                }
             }
         } else {
             let began = std::time::Instant::now();
@@ -736,7 +568,7 @@ const SYNC_AT_A_TIME: usize = 256;
 /// not the one last seen and was mirrored, the microseconds it took; then
 /// new records left to the draws that read them through a table, and new
 /// records that waited for one ([`host::HostHeap::copied_wait`]); and the
-/// microseconds submissions waited for it ([`sync_aside`]).
+/// microseconds submissions waited for the heap worker.
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
@@ -1541,6 +1373,7 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
+    let _span = crate::timeline::span("the heaps' records: slots waiting for a texture");
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING
@@ -1975,7 +1808,7 @@ mod tests {
     #[repr(C)]
     struct Extended(HeapDesc, Placement);
 
-    fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
+    pub(super) fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
