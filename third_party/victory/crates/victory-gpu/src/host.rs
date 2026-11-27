@@ -1326,6 +1326,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// A fresh replacement held by a logically closed title list. Only its
+    /// next reset may reuse this open recording without resetting D3D12.
+    left_open: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4442,6 +4445,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                left_open: false.into(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5847,6 +5851,14 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // A replacement can be submitted again without a title reset, even
+        // on a synchronous queue that never detaches it. Close it once,
+        // before any submission preparation, including for repeated entries.
+        for list in runs {
+            if list.left_open() {
+                list.close();
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6670,8 +6682,24 @@ impl HostList {
         times
     }
 
+    /// Only called on a newly created or just-reset list from the idle pool,
+    /// before handing it to the title as its logically closed replacement.
+    pub(crate) fn prepare_replacement(&mut self) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_LEAVE_OPEN").is_none_or(|v| v != "0")) {
+            *self.left_open.get_mut() = true;
+        } else {
+            self.close();
+        }
+    }
+
+    pub(crate) fn left_open(&self) -> bool {
+        self.left_open.load(Ordering::Acquire)
+    }
+
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.left_open.store(false, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6745,6 +6773,11 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        // The title-side bookkeeping above still applies. D3D12 is already
+        // in its initial recording state if this replacement never ran.
+        if self.left_open.swap(false, Ordering::AcqRel) {
+            return;
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
