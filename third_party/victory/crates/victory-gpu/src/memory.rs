@@ -184,8 +184,8 @@ struct Memory {
     /// Places of pages that are free: `(copy, byte_offset)`.
     free: Vec<(usize, usize)>,
     /// Reclaimed arena pages waiting for in-flight GPU submissions to finish
-    /// before returning to `free`: `(target_submission, copy, byte_offset)`.
-    retiring: VecDeque<(u64, usize, usize)>,
+    /// before returning to `free`: `(retire_gate, copy, byte_offset)`.
+    retiring: VecDeque<(crate::host::BvhRetire, usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
@@ -319,11 +319,11 @@ impl Memory {
     /// Moves reclaimed arena pages whose GPU submissions have completed back
     /// into `free`.
     fn reclaim_retired(&mut self) {
-        while let Some(&(target, copy, offset)) = self.retiring.front() {
-            if !crate::host::bvh_retire_ready(target) {
+        while let Some(front) = self.retiring.front_mut() {
+            if !crate::host::bvh_retire_ready(&mut front.0) {
                 break;
             }
-            self.retiring.pop_front();
+            let (_, copy, offset) = self.retiring.pop_front().unwrap();
             self.free.push((copy, offset));
         }
     }
@@ -489,8 +489,8 @@ impl Memory {
     /// invalidated in the directory immediately and fence-retired before reuse.
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
-        let target = crate::host::bvh_retire_target();
-        let ready_now = crate::host::bvh_retire_ready(target);
+        let mut target = crate::host::bvh_retire_target();
+        let ready_now = crate::host::bvh_retire_ready(&mut target);
         let mut cleared: Option<(u64, u64)> = None;
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
             let Some(held) = self.pages.get_mut(&page) else { continue };
