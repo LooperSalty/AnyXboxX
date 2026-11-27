@@ -36,7 +36,7 @@ struct Fence {
     value: AtomicU64,
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    waiters: Mutex<Vec<(u64, usize, Option<std::time::Instant>)>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -179,7 +179,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    #[cfg(windows)]
+    let asked = crate::framebook::on().then(std::time::Instant::now);
+    #[cfg(not(windows))]
+    let asked = None;
+    waiters.push((value, event as usize, asked));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -189,10 +193,14 @@ pub(crate) fn set(this: This, value: u64) {
     crate::timeline::told("a fence set", this as usize, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, _asked)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            #[cfg(windows)]
+            if let Some(asked) = _asked {
+                crate::framebook::title_event_waited(asked.elapsed().as_micros() as u64);
+            }
         }
         !reached
     });

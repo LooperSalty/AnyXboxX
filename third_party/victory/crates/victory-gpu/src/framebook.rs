@@ -63,6 +63,34 @@ static COUNTS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 /// (microseconds), and how many were translated after their submission.
 static LATE_LISTS: Mutex<[u64; 2]> = Mutex::new([0; 2]);
 
+/// Fence registrations completed in the interval. Snapshot all three fields
+/// together even when several queues signal on different threads.
+#[derive(Default)]
+struct EventWaits {
+    longest_us: u64,
+    total_us: u64,
+    count: u64,
+}
+
+impl EventWaits {
+    fn record(&mut self, us: u64) {
+        self.longest_us = self.longest_us.max(us);
+        self.total_us += us;
+        self.count += 1;
+    }
+
+    fn columns(self) -> [f32; 3] {
+        [self.longest_us as f32 / 1e3, self.total_us as f32 / 1e3, self.count as f32]
+    }
+}
+
+static EVENTS: Mutex<EventWaits> = Mutex::new(EventWaits { longest_us: 0, total_us: 0, count: 0 });
+
+/// Called only for a registration armed while the book was enabled.
+pub(crate) fn title_event_waited(us: u64) {
+    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).record(us);
+}
+
 /// Microseconds since the book's clock began.
 pub(crate) fn now_us() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -80,7 +108,7 @@ pub(crate) fn translated_after(us: u64) {
 }
 
 /// The columns of a row, in milliseconds but for those [`COUNTED`].
-const COLUMNS: [&str; 38] = [
+const COLUMNS: [&str; 41] = [
     "frame",
     "title_gap",
     "lag",
@@ -119,8 +147,11 @@ const COLUMNS: [&str; 38] = [
     "lists_late",
     "chunks_made",
     "uploads_made",
+    "events_most",
+    "events_all",
+    "events",
 ];
-const COUNTED: [usize; 5] = [13, 33, 35, 36, 37];
+const COUNTED: [usize; 6] = [13, 33, 35, 36, 37, 40];
 
 type Row = [f32; COLUMNS.len()];
 
@@ -222,6 +253,7 @@ pub(crate) fn presented(called: Instant, waited: Option<std::sync::mpsc::Receive
     let now = Instant::now();
     let counters = counters();
     let [late_most, late] = std::mem::take(&mut *LATE_LISTS.lock().unwrap_or_else(|e| e.into_inner()));
+    let events = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()));
     let made = [
         crate::host::CHUNKS_MADE.load(Relaxed),
         crate::host::MADE[0].load(Relaxed),
@@ -259,6 +291,7 @@ pub(crate) fn presented(called: Instant, waited: Option<std::sync::mpsc::Receive
     row[35] = late as f32;
     row[36] = made[0].wrapping_sub(was.made[0]) as f32;
     row[37] = made[1].wrapping_sub(was.made[1]) as f32;
+    row[38..41].copy_from_slice(&events.columns());
     if let Some(writer) = writer()
         && writer.send((now, row, waited)).is_err()
     {
@@ -373,6 +406,18 @@ fn slow_line(row: &Row, before: &std::collections::VecDeque<Row>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fence_events_report_max_total_and_count_in_the_completion_interval() {
+        let mut waits = EventWaits::default();
+        for us in [1500, 5000, 0] {
+            waits.record(us);
+        }
+        assert_eq!(std::mem::take(&mut waits).columns(), [5.0, 6.5, 3.0]);
+        assert_eq!(waits.columns(), [0.0; 3]);
+        assert_eq!(&COLUMNS[38..], ["events_most", "events_all", "events"]);
+        assert!(COUNTED.contains(&40));
+    }
 
     #[test]
     fn the_switch_reads_a_threshold() {
