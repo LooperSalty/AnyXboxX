@@ -838,7 +838,8 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
-    let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    static LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+    let [idle, behind, stood] = crate::framebook::for_line(&CARD_CLOCK_US, &LAST).map(|n| n as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -2027,6 +2028,8 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+pub(crate) static CHUNKS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -2039,6 +2042,9 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
+    if crate::framebook::on() {
+        CHUNKS_MADE.fetch_add(1, Ordering::Relaxed);
+    }
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
@@ -5839,6 +5845,7 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Submission<'a> {
+        let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5849,17 +5856,13 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
-        #[cfg(feature = "diagnostics")]
-        let ahead = Split::begin();
-        #[cfg(feature = "diagnostics")]
-        SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ahead.part(11);
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
         let own = if late { self.card_steps(runs) } else { None };
-        #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
         if !late {
@@ -5877,7 +5880,6 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
-        #[cfg(feature = "diagnostics")]
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
@@ -5927,7 +5929,6 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
         ahead.part(14);
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -5941,7 +5942,6 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let mut marks: Vec<(usize, crate::copystat::Timed)> = Vec::with_capacity(2 * runs.len() + 3);
         let mut batch = Batch::default();
-        #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
@@ -5968,7 +5968,6 @@ impl Host {
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
             crate::watch::ask_once(&ranges);
-            #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
             // Behind flights: the title wrote memory that a flight's shaders
@@ -5992,22 +5991,30 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
-        #[cfg(feature = "diagnostics")]
         split.part(1);
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        let front_time = crate::framebook::on().then(std::time::Instant::now);
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+        }
+        if let Some(start) = front_time {
+            SPLIT[16].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         stage.next("submit: the lists' steps");
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for (_run, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let began = crate::framebook::on().then(std::time::Instant::now);
+            let prelude = list.prelude();
+            if let Some(start) = began {
+                SPLIT[17].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if let Some(prelude) = prelude {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -6026,7 +6033,6 @@ impl Host {
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
-        #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
         // The snapshots of the ranges shaders may write, if they were left
@@ -6039,7 +6045,6 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
-        #[cfg(feature = "diagnostics")]
         split.part(3);
         stage.next("submit: copies in the card's memory");
         // Copies in the card's memory: what changed on their CPU side goes
@@ -6069,7 +6074,6 @@ impl Host {
             marks.push((lists.len(), crate::copystat::Timed::Compare));
             lists.push(Some(check));
         }
-        #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
         let heaps_began = std::time::Instant::now();
@@ -6078,7 +6082,6 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
-        #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
@@ -6122,7 +6125,6 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
-            #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
@@ -7853,6 +7855,8 @@ impl HostList {
             add(C::CopyBytes, bytes);
             add(C::Refreshes, refreshes);
             add(C::RefreshBytes, refreshed);
+        }
+        if Split::enabled() {
             SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
         }
     }
@@ -7905,40 +7909,49 @@ impl std::hash::Hasher for AddressHash {
 /// the submission lock, the steps done on the card planned ([`card_steps`]),
 /// the flights waited for, the heaps' records and what is swept; and, at the
 /// end, the wait for the heaps' records.
-#[cfg(feature = "diagnostics")]
-static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static SPLIT: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+pub(crate) fn book_counters() -> ([u64; 18], [u64; 3], u64) {
+    (SPLIT.each_ref().map(|n| n.load(Ordering::Relaxed)),
+     CARD_CLOCK_US.each_ref().map(|n| n.load(Ordering::Relaxed)),
+     COPY_BACK[0].load(Ordering::Relaxed))
+}
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Counts into [`SPLIT`].
-#[cfg(feature = "diagnostics")]
-struct Split(std::cell::Cell<std::time::Instant>);
+/// Counts preparation stages in diagnostics or when the frame book is open.
+struct Split(Option<std::cell::Cell<std::time::Instant>>);
 
-#[cfg(feature = "diagnostics")]
 impl Split {
-    fn begin() -> Split {
-        Split(std::cell::Cell::new(std::time::Instant::now()))
+    fn enabled() -> bool {
+        cfg!(feature = "diagnostics") || crate::framebook::on()
     }
 
-    /// Nanoseconds since the last part.
+    fn begin() -> Self {
+        Self(Split::enabled().then(|| std::cell::Cell::new(std::time::Instant::now())))
+    }
+
+    #[cfg(feature = "diagnostics")]
     fn so_far(&self) -> u64 {
-        self.0.get().elapsed().as_nanos() as u64
+        self.0.as_ref().unwrap().get().elapsed().as_nanos() as u64
     }
 
-    /// What came since the last part was part `i`.
     fn part(&self, i: usize) {
-        let now = std::time::Instant::now();
-        SPLIT[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+        if let Some(last) = &self.0 {
+            let now = std::time::Instant::now();
+            SPLIT[i].fetch_add((now - last.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 }
 
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
-    let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    static LAST: Mutex<[u64; 18]> = Mutex::new([0; 18]);
+    let ms = crate::framebook::for_line(&SPLIT, &LAST).map(|n| n as f64 / 1e6 / frames);
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
@@ -8512,13 +8525,11 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
+        let started = Split::enabled().then(std::time::Instant::now);
         if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
             Self::update(&shadow, from, to);
         }
-        #[cfg(feature = "diagnostics")]
-        {
+        if let Some(started) = started {
             let ns = started.elapsed().as_nanos() as u64;
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
@@ -8691,13 +8702,14 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
         // The time counted is the time it took, not the threads' sum.
-        let took = started.elapsed().as_micros() as u64;
+        let took = started.elapsed();
         let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
         PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
-        PREPARING[0].fetch_add(took, Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        if Split::enabled() {
+            SPLIT[6].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
@@ -8727,8 +8739,6 @@ impl Batch {
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
-        #[cfg(feature = "diagnostics")]
-        let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
         crate::shadow::wide_each(due.len(), move |i| {
@@ -8740,9 +8750,8 @@ impl Batch {
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        {
-            let ns = began.elapsed().as_nanos() as u64;
+        if Split::enabled() {
+            let ns = started.elapsed().as_nanos() as u64;
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
         }
@@ -8771,8 +8780,9 @@ impl Batch {
         }
         let took = started.elapsed();
         PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        if Split::enabled() {
+            SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// The textures due are brought up to date.
@@ -8798,12 +8808,15 @@ impl Batch {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        let (began, all) = (std::time::Instant::now(), self.refreshes.len());
+        let all = self.refreshes.len();
+        let began = Split::enabled().then(std::time::Instant::now);
         let _flush = crate::timeline::span("refreshes of copies");
         self.flush_all();
+        if let Some(began) = began {
+            SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         {
-            SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
             FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
         }
@@ -9254,8 +9267,6 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        MADE[0].fetch_add(1, Ordering::Relaxed);
-        MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -9299,7 +9310,12 @@ impl Host {
             crate::book::made(b, || "an upload buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                MADE[0].fetch_add(1, Ordering::Relaxed);
+                MADE[1].fetch_add(size, Ordering::Relaxed);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
@@ -9514,9 +9530,9 @@ impl Meter {
                 let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
                 PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
             });
-            let [back_ms, back_mb] = [0, 1].map(|i| {
-                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-            });
+            static BACK_LAST: Mutex<[u64; 2]> = Mutex::new([0; 2]);
+            let [us, bytes] = crate::framebook::for_line(&COPY_BACK, &BACK_LAST);
+            let (back_ms, back_mb) = (us as f64 / 1e3 / frames, bytes as f64 / 1e6 / frames);
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9584,8 +9600,9 @@ impl Meter {
             }
             // Passes over the heap's buffer views for shaders that pick them by index.
             let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
-            let picked_ms =
-                crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            static HEAP_LAST: Mutex<[u64; 1]> = Mutex::new([0]);
+            let picked_ms = crate::framebook::for_line(std::array::from_ref(&crate::draw::HEAP_BUFFER_MICROS), &HEAP_LAST)[0]
+                as f64 / 1e3 / frames;
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =
                 [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

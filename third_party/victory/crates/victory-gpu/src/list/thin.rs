@@ -187,6 +187,7 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    submitted_at: AtomicU64,
 }
 
 #[derive(Default)]
@@ -210,6 +211,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            submitted_at: AtomicU64::new(0),
         }
     }
 
@@ -253,6 +255,12 @@ impl Recording {
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
+                if crate::framebook::on() {
+                    let at = self.submitted_at.load(Acquire);
+                    if at != 0 {
+                        crate::framebook::translated_after(crate::framebook::now_us().saturating_sub(at));
+                    }
+                }
                 self.done.store(true, Release);
                 self.moved.notify_all();
                 drop(inner);
@@ -340,11 +348,19 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .filter_map(|&l| {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+            if crate::framebook::on() && let Some(recording) = &front.recording {
+                // Keep the first submission if the title submits a list again.
+                let _ = recording.submitted_at.compare_exchange(0, crate::framebook::now_us().max(1), Release, Relaxed);
+            }
             front.close();
             front.submitted = true;
             front.recording.clone()
         })
         .collect()
+}
+
+pub(crate) fn translated_us() -> u64 {
+    STATS[1].load(Relaxed)
 }
 
 /// For the frame-rate line.
@@ -353,7 +369,8 @@ pub(crate) fn line(frames: f64) {
         crate::overlay::set_pool_off(crate::overlay::Pool::Thin);
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let s = crate::framebook::for_line(&STATS, &LAST).map(|n| n as f64 / frames);
     // The overlay: the work of all threads over the frame's time.
     crate::overlay::set_pool(crate::overlay::Pool::Thin, s[1] / 1000.0, crate::overlay::frame_ms(), THREADS.load(Relaxed));
     tracing::info!(
