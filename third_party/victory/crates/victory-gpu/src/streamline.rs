@@ -272,10 +272,14 @@ struct Calls {
     last: Option<(u32, [u32; 2], [u32; 2])>,
     /// Frame generation: on, and the frame whose simulation began.
     framegen_on: bool,
+    /// The previous state query succeeded, so its interval has already been drained.
+    fg_count_valid: bool,
     simulating: Option<u32>,
 }
 
-static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, simulating: None });
+static CALLS: Mutex<Calls> = Mutex::new(Calls {
+    optimal: Vec::new(), last: None, framegen_on: false, fg_count_valid: false, simulating: None,
+});
 
 fn calls() -> std::sync::MutexGuard<'static, Calls> {
     CALLS.lock().unwrap_or_else(|e| e.into_inner())

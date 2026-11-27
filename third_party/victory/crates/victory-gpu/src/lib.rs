@@ -48,6 +48,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod frame_rate;
 pub mod frametime;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;

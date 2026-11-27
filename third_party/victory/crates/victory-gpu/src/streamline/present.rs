@@ -1,4 +1,5 @@
 use super::*;
+use crate::frame_rate::FrameGeneration;
 
 /// The planes a present shows (Series S: the scene and the interface over
 /// it), the host states they are in, and the back buffer's size.
@@ -140,6 +141,15 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         tracing::info!(frame, on, code, result = abi::result_name(code), "DLSS Frame Generation switched");
         if code == 0 {
             calls.framegen_on = on;
+            if on {
+                // GetState counts since its previous read. Drain the unqueried
+                // (FG off) period before Present so it cannot be counted twice.
+                calls.fg_count_valid = functions.dlssg_get_state.is_some_and(|get_state| {
+                    let mut state = abi::DlssgState::default();
+                    // SAFETY: a live viewport and writable state, no estimate requested.
+                    unsafe { get_state(&viewport, &mut state, std::ptr::null()) == 0 }
+                });
+            }
         }
     }
     if calls.framegen_on {
@@ -174,10 +184,10 @@ unsafe extern "C" fn present_error(error: *const i32) {
 
 /// After our swap chain's Present: the frame's last marker, the next
 /// frame's first, and what frame generation reports.
-pub(crate) fn present_ends(presenting: Option<Presenting>) {
-    let Some(Presenting { token, frame }) = presenting else { return };
-    let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return };
-    let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state) else { return };
+pub(crate) fn present_ends(presenting: Option<Presenting>) -> FrameGeneration {
+    let Some(Presenting { token, frame }) = presenting else { return FrameGeneration::Off };
+    let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return FrameGeneration::Off };
+    let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state) else { return FrameGeneration::Off };
     let began = std::time::Instant::now();
     // SAFETY: a marker for this frame's token.
     unsafe { marker(abi::PRESENT_END, token) };
@@ -188,6 +198,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         calls.simulating = Some(frame.wrapping_add(1));
     }
     spent(T_MARKERS, began);
+    let mut generation = FrameGeneration::Off;
     if calls.framegen_on {
         let mut state = abi::DlssgState::default();
         let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
@@ -195,7 +206,13 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         // SAFETY: a structure to fill, no options (no estimate asked).
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
+        // A failed read may leave its count in the next report. Use the
+        // configured multiplier until both ends of the interval are known.
+        generation = FrameGeneration::Unavailable;
         if code == 0 {
+            if calls.fg_count_valid {
+                generation = FrameGeneration::Reported(state.num_frames_actually_presented);
+            }
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             let before = FG_STATUS.swap(state.status, Relaxed);
@@ -206,8 +223,10 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
                 );
             }
         }
+        calls.fg_count_valid = code == 0;
     }
     spent(T_AFTER, began);
+    generation
 }
 
 /// Our swap chain's buffers are about to be made again: frame generation is
