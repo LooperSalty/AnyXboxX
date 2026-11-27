@@ -21,9 +21,22 @@ const LONGEST: Duration = Duration::from_secs(180);
 /// As the runs count one that takes long.
 const SLOW_MS: f64 = 1000.0;
 
+fn pipelines_folder(cfg: &victory_core::Config) -> Result<PathBuf> {
+    cfg.cache_subdir("shaders")?;
+    cfg.cache_subdir("pipelines")
+}
+
 fn folder() -> Result<PathBuf> {
     let cfg = victory_core::Config::load()?;
-    Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
+    pipelines_folder(&cfg)
+}
+
+fn open_journal(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
@@ -31,12 +44,16 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     if let Some(these) = these {
         return make(&dir, &these);
     }
+    run_in(&dir, jobs, limit, again, used)
+}
+
+fn run_in(dir: &Path, jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool) -> Result<()> {
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(&dir);
+    let keys = known::keys(dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
@@ -69,10 +86,10 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         all.len()
     );
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
-    let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
+    let done_out = Mutex::new(open_journal(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
-    let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
-    let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
+    let slow_out = Mutex::new(open_journal(&dir.join("slow-pipelines.txt"))?);
+    let bad_out = Mutex::new(open_journal(&bad_file)?);
     run_batches(
         &all,
         jobs,
@@ -515,5 +532,24 @@ mod tests {
             |_, _| panic!("journal error must not blacklist a pipeline"),
         ).unwrap_err();
         assert_eq!(error.to_string(), "journal unavailable");
+    }
+
+    #[test]
+    fn clean_first_run_creates_both_shaders_and_pipelines_cache_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = victory_core::Config {
+            game_dir: None,
+            cache_dir: temp.path().join("cache"),
+            data_dir: temp.path().join("data"),
+            test_titles: Vec::new(),
+            source: None,
+        };
+        let dir = pipelines_folder(&cfg).unwrap();
+        assert!(cfg.cache_dir.join("shaders").is_dir());
+        assert!(dir.is_dir());
+        run_in(&dir, Some(1), None, false, false).unwrap();
+        assert!(dir.join("warm-done.txt").is_file());
+        assert!(dir.join("slow-pipelines.txt").is_file());
+        assert!(dir.join("warm-bad.txt").is_file());
     }
 }

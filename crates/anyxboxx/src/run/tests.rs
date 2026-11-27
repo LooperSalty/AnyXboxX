@@ -60,13 +60,14 @@ fn the_tuned_set_is_vice_tay_s_4070_set() {
 
 #[test]
 fn quality_is_applied_after_the_tuned_set_and_before_overrides() {
-    let env = settings::base(&parse(&[
+    let env = environment(&parse(&[
         "--game-dir",
         "G",
         "--quality",
         "--override",
         "VICTORY_RELAY=0",
-    ]));
+    ]))
+    .unwrap();
     assert_eq!(
         value(&env, "VICTORY_CARD_WINDOWS_MB"),
         Some(OsString::from("0"))
@@ -190,6 +191,44 @@ fn powershell_names_are_accepted() {
     assert_eq!(args.game_dir, PathBuf::from("G"));
     assert_eq!(args.xg_mode, XgMode::Compare);
     assert!(args.precompile && args.warm && args.quality && args.auto_a);
+}
+
+#[test]
+fn the_title_runs_as_a_series_x_unless_series_s_is_asked() {
+    let victory = Victory::prebuilt(&std::env::current_exe().unwrap()).unwrap();
+    let args_of = |command: Command| -> Vec<OsString> {
+        command.get_args().map(|a| a.to_os_string()).collect()
+    };
+    let game = PathBuf::from("G");
+    let expected_head = [
+        OsString::from("run"),
+        game.join(GAME_EXE).into_os_string(),
+        OsString::from("--execute"),
+    ];
+    // The default asks nothing more of VIctory: the command is the one the launcher has always run.
+    let default = parse(&["--game-dir", "G"]);
+    assert_eq!(default.console, Console::SeriesX);
+    let command = victory.game_command_as(&game, &Env::new(), default.console);
+    assert_eq!(args_of(command), expected_head);
+    assert_eq!(
+        args_of(victory.game_command(&game, &Env::new())),
+        expected_head
+    );
+    // Series S passes VIctory's own flag after --execute; the PowerShell-style name is accepted too.
+    for flag in ["--console", "--Console"] {
+        let series_s = parse(&["--game-dir", "G", flag, "series-s"]);
+        assert_eq!(series_s.console, Console::SeriesS);
+        let mut expected = expected_head.to_vec();
+        expected.extend(["--console", "series-s"].map(OsString::from));
+        assert_eq!(
+            args_of(victory.game_command_as(&game, &Env::new(), series_s.console)),
+            expected
+        );
+    }
+    assert_eq!(
+        parse(&["--game-dir", "G", "--console", "series-x"]).console,
+        Console::SeriesX
+    );
 }
 
 #[test]
@@ -382,17 +421,17 @@ fn big_pools_come_after_the_tuned_set_and_before_quality_and_overrides() {
     assert_eq!(thin, Some(OsString::from("12")));
     let under = value(&env, "VICTORY_UNDER_THREADS");
     assert_eq!(under, Some(OsString::from("8")));
-    // The user's override is the last entry of the key: it wins over 6 and over the tuned 4.
-    let land = value(&env, "VICTORY_LAND_THREADS");
-    assert_eq!(land, Some(OsString::from("5")));
+    // 24+ CPUs land on 8 threads (#469); the user's override is applied later, at launch.
+    assert_eq!(value(&env, "VICTORY_LAND_THREADS"), Some(OsString::from("8")));
     let positions = |name: &str| -> Vec<usize> {
         (0..env.len()).filter(|i| env[*i].0 == name).collect()
     };
     let land = positions("VICTORY_LAND_THREADS");
     let quality = positions("VICTORY_CARD_WINDOWS_MB");
-    // tuned 4, big 6, user 5; quality's value sits between the big pools and the override.
-    assert_eq!(land.len(), 3);
-    assert!(land[1] < *quality.last().unwrap() && *quality.last().unwrap() < land[2]);
+    assert_eq!(land.len(), 2);
+    assert!(land[1] < *quality.last().unwrap());
+    let launch_env = environment(&args).unwrap();
+    assert_eq!(value(&launch_env, "VICTORY_LAND_THREADS"), Some(OsString::from("5")));
     // Small machines, `--no-tuned-settings` and other profiles keep what they had.
     let small = settings::base_with_cpus(&parse(&["--game-dir", "G"]), 8);
     assert_eq!(
