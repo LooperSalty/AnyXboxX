@@ -99,6 +99,7 @@ pub fn make_plan(
             &env,
             &game_dir,
             settings.always_rewarm,
+            settings.options.warm_first,
             marker,
         )
     });

@@ -31,7 +31,7 @@ const HEAD: [&str; 2] = ["VICTORY_GAME_DIR", "VICTORY_DISCORD"];
 
 #[test]
 fn tuned_settings_are_set_by_default_and_can_be_turned_off() {
-    let env = settings::base(&parse(&["--game-dir", "G"]));
+    let env = settings::base_with_cpus(&parse(&["--game-dir", "G"]), 8);
     assert_eq!(
         env[0],
         ("VICTORY_GAME_DIR".to_string(), OsString::from("G"))
@@ -339,4 +339,61 @@ fn defaults_profile_and_no_tuned_settings_leave_only_base_variables() {
         "--no-tuned-settings",
     ]));
     assert_eq!(names(&disabled), HEAD);
+}
+
+#[test]
+fn pool_sizes_are_the_16_core_set_from_16_logical_cpus() {
+    let big = Some(
+        &[
+            ("VICTORY_THIN_THREADS", "12"),
+            ("VICTORY_UNDER_THREADS", "8"),
+            ("VICTORY_LAND_THREADS", "6"),
+        ][..],
+    );
+    for cpus in [7, 8, 15] {
+        assert_eq!(settings::pool_sizes(cpus), None, "{cpus}");
+    }
+    for cpus in [16, 24, 32] {
+        assert_eq!(settings::pool_sizes(cpus), big, "{cpus}");
+    }
+}
+
+#[test]
+fn big_pools_come_after_the_tuned_set_and_before_quality_and_overrides() {
+    let args = parse(&[
+        "--game-dir",
+        "G",
+        "--quality",
+        "--override",
+        "VICTORY_LAND_THREADS=5",
+    ]);
+    let env = settings::base_with_cpus(&args, 24);
+    let thin = value(&env, "VICTORY_THIN_THREADS");
+    assert_eq!(thin, Some(OsString::from("12")));
+    let under = value(&env, "VICTORY_UNDER_THREADS");
+    assert_eq!(under, Some(OsString::from("8")));
+    // The user's override is the last entry of the key: it wins over 6 and over the tuned 4.
+    let land = value(&env, "VICTORY_LAND_THREADS");
+    assert_eq!(land, Some(OsString::from("5")));
+    let positions = |name: &str| -> Vec<usize> {
+        (0..env.len()).filter(|i| env[*i].0 == name).collect()
+    };
+    let land = positions("VICTORY_LAND_THREADS");
+    let quality = positions("VICTORY_CARD_WINDOWS_MB");
+    // tuned 4, big 6, user 5; quality's value sits between the big pools and the override.
+    assert_eq!(land.len(), 3);
+    assert!(land[1] < *quality.last().unwrap() && *quality.last().unwrap() < land[2]);
+    // Small machines, `--no-tuned-settings` and other profiles keep what they had.
+    let small = settings::base_with_cpus(&parse(&["--game-dir", "G"]), 8);
+    assert_eq!(
+        value(&small, "VICTORY_LAND_THREADS"),
+        Some(OsString::from("4"))
+    );
+    let off = settings::base_with_cpus(&parse(&["--game-dir", "G", "--no-tuned-settings"]), 24);
+    assert_eq!(names(&off), HEAD);
+    let amd = settings::base_with_cpus(
+        &parse(&["--game-dir", "G", "--profile", "linux-amd"]),
+        24,
+    );
+    assert_eq!(value(&amd, "VICTORY_LAND_THREADS"), None);
 }

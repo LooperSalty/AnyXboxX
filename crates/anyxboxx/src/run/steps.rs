@@ -72,16 +72,20 @@ impl Victory {
         Some(command)
     }
 
-    /// `victory warm <archives>` with the game's environment (the cache key depends on it).
+    /// `victory warm` with the game's environment (the cache key depends on it). On the Vice-Tay
+    /// base `warm` takes no archives: it makes the host pipelines of every pipeline earlier runs
+    /// noted, so the driver's cache has them before the game asks. `archives` only enter the warm
+    /// fingerprint (`warm_state`), never the command line, which Vice-Tay refuses.
     pub fn warm_command(&self, archives: &[PathBuf], env: &Env) -> Command {
+        let _ = archives;
         let mut command = Command::new(&self.exe);
-        command.arg("warm").args(archives);
+        command.arg("warm");
         command.envs(pairs(env));
         command
     }
 
-    /// `victory warm` on shaders.rpf, the game and its two DLLs (`--precompile`), with the game's
-    /// environment. Only these files of the game folder are read, never the folder around them.
+    /// The warm before a first launch (`--precompile`): checks that shaders.rpf, the game and its
+    /// two DLLs are there, then runs `victory warm` with the game's environment.
     pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
         let shaders = game_dir.join(SHADERS);
         let dlls: Vec<PathBuf> = PRECOMPILED_DLLS.iter().map(|d| game_dir.join(d)).collect();
@@ -90,12 +94,10 @@ impl Victory {
                 return Err(RunError::PrecompileInput(needed.display().to_string()));
             }
         }
+        // Vice-Tay's `warm` reads no files: the inputs are checked so a broken game folder still
+        // fails here, as before, and the command is the plain warm.
         let mut command = Command::new(&self.exe);
-        command
-            .arg("warm")
-            .arg(&shaders)
-            .arg(game_dir.join(GAME_EXE))
-            .args(&dlls);
+        command.arg("warm");
         command.envs(pairs(env));
         Ok(command)
     }

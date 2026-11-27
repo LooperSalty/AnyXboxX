@@ -11,7 +11,7 @@ use std::process::Command;
 
 use clap::{Args, ValueEnum};
 
-pub use settings::{ALWAYS, LINUX_AMD, QUALITY, TUNED};
+pub use settings::{ALWAYS, LINUX_AMD, QUALITY, TUNED, logical_cpus, pool_sizes};
 pub use steps::{
     Env, GAME_EXE, PRECOMPILED_DLLS, SHADERS, Victory, environment, game_exe, status, warm_archives,
 };

@@ -28,9 +28,9 @@ BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics "
 GAME = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_DIAG = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_ARCHIVES = r"<root>\game\A.rpf <root>\game\b.rpf"
-WARM_ARCHIVES = (r"victory warm <root>\game\A.rpf <root>\game\b.rpf | ")
-WARM_PRECOMPILE = (r"victory warm <root>\game\shaders.rpf <root>\game\game_scarlett_master.exe "
-                   r"<root>\game\XboxBvhBuilder.dll <root>\game\amd_fidelityfx_upscaler_xbox.dll | ")
+# Vice-Tay's `warm` takes no files: it remakes the pipelines earlier runs noted.
+WARM_ARCHIVES = r"victory warm | "
+WARM_PRECOMPILE = r"victory warm | "
 
 
 # ---- the golden script and the Rust settings ------------------------------------------------
@@ -130,7 +130,7 @@ def binary():
 
 
 def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=True, precompile_inputs=False,
-           archives=("A.rpf", "b.rpf")):
+           archives=("A.rpf", "b.rpf"), logical_cpus=8):
     """Runs `anyxboxx run` in a fake repository; returns (process, calls with <root> for tmp_path)."""
     manifest = tmp_path / "depot" / "third_party" / "victory" / "Cargo.toml"
     manifest.parent.mkdir(parents=True)
@@ -154,6 +154,8 @@ def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=Tr
     shutil.copy(fake_tool, tmp_path / "prebuilt" / "prebuilt.exe")
     log = tmp_path / "calls.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("VICTORY_")}
+    # The golden set is the 8-core one: pin the CPU count so the result does not depend on this machine.
+    env["ANYXBOXX_LOGICAL_CPUS"] = str(logical_cpus)
     env.update({"PATH": f"{tmp_path / 'tools'}{os.pathsep}{os.environ['PATH']}",
                 "CARGO_TARGET_DIR": str(tmp_path / "target"), "FAKE_TOOL_LOG": str(log),
                 "FAKE_TOOL_EXIT_CARGO": str(cargo_exit), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT),
@@ -180,6 +182,17 @@ def test_the_default_environment_equals_the_scripts_default(tmp_path, fake_tool,
     logged = calls[1].split(" | ", 1)[1].split(";")
     expected = ["VICTORY_GAME_DIR=<root>\\game"] + [f"{k}={v}" for k, v in golden_always() + golden_tuned()]
     assert sorted(logged) == sorted(expected), done.stderr
+
+
+def test_sixteen_or_more_logical_cpus_get_the_bigger_worker_pools(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, logical_cpus=24)
+    logged = calls[1].split(" | ", 1)[1].split(";")
+    for pair in ("VICTORY_THIN_THREADS=12", "VICTORY_UNDER_THREADS=8", "VICTORY_LAND_THREADS=6"):
+        assert pair in logged, (pair, done.stderr)
+    user = tmp_path / "user"
+    user.mkdir()
+    done, calls = launch(user, fake_tool, binary, ["--override", "VICTORY_LAND_THREADS=5"], logical_cpus=24)
+    assert "VICTORY_LAND_THREADS=5" in calls[1].split(" | ", 1)[1].split(";"), done.stderr
 
 
 def test_quality_applies_the_golden_quality_set_after_the_tuned_set(tmp_path, fake_tool, binary):
