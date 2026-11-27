@@ -84,18 +84,16 @@ pub fn init(asked: &Asked) -> Available {
 }
 
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
-    let path = std::path::absolute(asked.dir.join(INTERPOSER)).map_err(|e| e.to_string())?;
-    if !path.is_file() {
-        return Err(format!("no {INTERPOSER} in that folder (VICTORY_STREAMLINE_DIR)"));
-    }
-    let sl = load(&path)?;
+    let dir = trust::runtime_dir(&asked.dir)?;
+    let path = dir.join(INTERPOSER);
+    let framegen_asked = asked.framegen && (!require_line || line_asked());
+    let sl = load(&dir, asked.dlss, framegen_asked)?;
     let sl = SL.get_or_init(|| sl);
-    let dir_wide: Vec<u16> = wide(path.parent().expect("interposer has a parent"));
+    let dir_wide = wide(&dir);
     let paths = [dir_wide.as_ptr()];
     let log_wide = asked.log_dir.as_deref().map(wide);
     // Frame generation presents from the line's thread, in order with the
     // submissions: without the line it is not loaded at all.
-    let framegen_asked = asked.framegen && (!require_line || line_asked());
     if asked.framegen && !framegen_asked {
         tracing::warn!(
             "DLSS Frame Generation needs the line of submissions (VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1): frame generation stays off"

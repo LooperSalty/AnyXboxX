@@ -1,6 +1,5 @@
-//! VIctory verifies the NVIDIA Authenticode signature of `sl.interposer.dll` only.
-//! Streamline loads and verifies the other NVIDIA DLLs from the same directory.
-//! Other users must not have write access to that directory.
+//! Every DLL of the Streamline folder is verified (NVIDIA Authenticode) before the
+//! interposer is loaded, and kept open read-only so none can be replaced meanwhile.
 
 use super::*;
 
@@ -21,6 +20,7 @@ unsafe impl Sync for Library {}
 /// The library's exported functions.
 pub(super) struct Sl {
     _library: Library,
+    _verified: Vec<std::fs::File>,
     pub(super) init: abi::SlInit,
     pub(super) is_feature_supported: abi::SlIsFeatureSupported,
     pub(super) evaluate_feature: abi::SlEvaluateFeature,
@@ -37,15 +37,12 @@ pub(super) struct Sl {
     pub(super) shutdown: abi::SlShutdown,
 }
 
-pub(super) fn load(path: &Path) -> Result<Sl, String> {
-    use std::os::windows::fs::OpenOptionsExt;
+pub(super) fn load(dir: &Path, dlss: bool, framegen: bool) -> Result<Sl, String> {
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     };
-    // Deny writes and replacement between verification and loading.
-    let locked = std::fs::OpenOptions::new().read(true).share_mode(1).open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
-    super::trust::verify_signature(path, &locked)?;
-    let file = wide(path);
+    let verified = super::trust::verify_runtime(dir, dlss, framegen)?;
+    let file = wide(&dir.join(INTERPOSER));
     // Its own folder and System32 only, never the current folder.
     // SAFETY: a NUL-terminated full path.
     let module =
@@ -82,5 +79,6 @@ pub(super) fn load(path: &Path) -> Result<Sl, String> {
         set_d3d_device: get!(c"slSetD3DDevice", abi::SlSetD3DDevice),
         shutdown: get!(c"slShutdown", abi::SlShutdown),
         _library: library,
+        _verified: verified,
     })
 }
