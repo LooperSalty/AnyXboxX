@@ -4,6 +4,7 @@ use anyxboxx_rdna2_ref::decode::{Instruction, decode};
 
 mod buffer_memory;
 mod control_flow;
+mod division;
 mod extensions;
 mod flat_atomic;
 mod flat_memory;
@@ -34,6 +35,8 @@ mod vector_movrel;
 mod vector_ternary;
 mod vector_unary;
 mod wave64;
+mod wide;
+mod wide_templates;
 
 const PRELUDE: &str = concat!(
     include_str!("prelude0.hlsl"),
@@ -151,6 +154,10 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
         .map(|line| vec![line]);
     }
     let line = match family {
+        "VOP3" if division::supports(name) => division::statement(name, pair, literal)?,
+        "VOP1" | "VOP3" if wide_templates::template(name).is_some() => {
+            wide::statement(name, family, pair)?
+        }
         "VOP1" | "VOP2" | "VOPC" if matches!(word & 511, 0xe9 | 0xea | 0xf9 | 0xfa) => {
             extensions::statement(
                 name,

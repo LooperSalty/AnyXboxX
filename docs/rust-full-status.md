@@ -122,6 +122,8 @@ Packed f16 now covers all five packed operators, the VOP2 and VOP3 accumulating 
 
 Wave32 SDWA and DPP reuse the Rust VOP1/VOP2 expressions. WARP checks SDWA subword selection, sign extension, destination preservation, float output modifiers and comparisons, plus DPP8 and eight DPP16 control groups with partial EXEC.
 
+The Rust emitter handles the 14 operations in the Python wide HLSL module, plus the four supported division instructions. WARP tests cover f64 arithmetic and conversions, two-word shifts, NaN payloads on f32 widening, division fixups and VCC.
+
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.
