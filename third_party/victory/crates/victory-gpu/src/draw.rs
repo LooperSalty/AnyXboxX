@@ -3276,9 +3276,9 @@ impl State {
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air => image.clone(),
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let (Some((target, of, image)), Some((_, seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
@@ -3292,6 +3292,7 @@ impl State {
         crate::ambient::after(list, role, &Views {
             image,
             depth,
+            target: Some(target),
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
         })
@@ -3299,15 +3300,16 @@ impl State {
 
     /// The view a shader of the bound pipeline reads through a table, at
     /// (root parameter, dwords into the table): its texture's or buffer's
-    /// description and its place in the bound view heap. Tables made afresh
-    /// for the draw are found where they were made (`ambient_tables`).
+    /// host resource, description and place in the bound view heap. Tables
+    /// made afresh for the draw are found where they were made
+    /// (`ambient_tables`).
     fn table_view(
         &self,
         t: &crate::pipeline::Translated,
         compute: bool,
         kind: ResourceType,
         (slot, offset): (u8, u32),
-    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+    ) -> Option<(ID3D12Resource, D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()?;
         t.used.iter().find(|u| {
             u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
@@ -3326,7 +3328,7 @@ impl State {
         let host = crate::resource::host_resource(resource as This)?;
         // SAFETY: a live resource.
         let desc = unsafe { host.GetDesc() };
-        Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        Some((host.clone(), desc, heap.gpu_handle((start + offset * 4) / 32)))
     }
 
     /// The place in the bound view heap of the view a shader of the bound
