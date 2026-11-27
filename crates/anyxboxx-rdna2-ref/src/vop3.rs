@@ -351,6 +351,10 @@ pub fn execute(
         crate::pkf16::execute_fmac_vop3(wave, word, literal)?;
         return Ok(true);
     }
+    if crate::f16::supports(name) {
+        crate::f16::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::wide::execute(
         wave,
         name,
@@ -381,6 +385,10 @@ pub fn execute(
         )));
     }
     if crate::vector::is_no_operation(name) {
+        return Ok(true);
+    }
+    if crate::cmpf16::supports(name) {
+        crate::cmpf16::execute_vop3(wave, name, word, literal)?;
         return Ok(true);
     }
     if crate::vop3_forms::lane(wave, name, &fields, literal)?
