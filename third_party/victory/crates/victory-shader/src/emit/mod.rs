@@ -1,6 +1,7 @@
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
-//! Compute shaders keep the console's thread-group size; one that depends
+//! Paired compute waves use half the console thread count. Other compute
+//! shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
 //!
@@ -482,9 +483,31 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let fallbacks = WaveFallbacks {
+        loose_lds: std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0"),
+        paired: std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"),
+    };
+    emit_forms(c, native, p, st, io, res, fallbacks)
+}
+
+struct WaveFallbacks {
+    loose_lds: bool,
+    paired: bool,
+}
+
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    fallbacks: WaveFallbacks,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    let mut retry_failure = None;
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -493,6 +516,7 @@ pub fn emit(
     let stuck = match &original {
         Ok((_, wave)) => *wave == Some(64),
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
+        Err(ShaderError::Wave64Lowering(_)) => true,
         Err(_) => false,
     };
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
@@ -500,7 +524,10 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-        let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+        let mut report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+            if let Err(e) = r && !matches!(e, ShaderError::Wave64Lowering(_)) {
+                retry_failure = Some(format!("{what}: {e}"));
+            }
             if why {
                 match r {
                     Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
@@ -690,8 +717,7 @@ pub fn emit(
         // one lane-branch region, ordered between the two host waves only where the region
         // is entered and left (`loose_lds::with`, approximate). A 32-lane host refuses
         // the 64-lane form outright, which drops every dispatch of the program.
-        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
-        if loose_on && !strict {
+        if fallbacks.loose_lds && !strict {
             let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
             for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
                 if let Some((p, st, io, res)) = f {
@@ -727,37 +753,42 @@ pub fn emit(
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
-                Ok(_) => again,
+                Ok(_) | Err(ShaderError::Wave64Lowering(_)) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
         other => other,
     };
-    let supported = |(shader, wave): (HostShader, Option<u32>)| {
-        if wave == Some(64) && lower::host_max_wave() == 32 {
-            Err(ShaderError::Unsupported {
-                offset: 0,
-                what: "no wave32 lowering for this wave64 program",
-            })
-        } else {
-            Ok(shader)
-        }
-    };
-    let original = original.and_then(supported);
+    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
-    if !matches!(original, Err(ShaderError::Unsupported { .. })) {
+    if !matches!(original, Err(ShaderError::Unsupported { .. } | ShaderError::Wave64Lowering(_))) {
         return original;
     }
     let edges = threading::constant_edges(p, st);
-    if edges.is_empty() {
-        return original;
+    let result = if edges.is_empty() {
+        original
+    } else {
+        let threaded = ir::thread_edges(p, &edges)?;
+        let st = structure::structure(&threaded)?;
+        let io = io::raise(&threaded, native)?;
+        let res = resource::track(&threaded, &native.layout, native.stage, Some(&st))?;
+        emit_program(c, native, &threaded, &st, &io, &res).map(|(shader, _)| shader)
+    };
+    // Keep every successful translation. Only a compute program still requiring
+    // 64 host lanes can opt into two console lanes per host thread.
+    if let Err(ShaderError::Wave64Lowering(mut reason)) = result {
+        if let Some(retry) = retry_failure {
+            reason.push_str(&format!("; {retry}"));
+        }
+        if native.stage == HwStage::Cs && native.wave64 && fallbacks.paired {
+            return paired(c, native, p, io, res)
+                .map(|(shader, _)| shader)
+                .map_err(|e| ShaderError::Wave64Lowering(format!("{reason}; paired lanes: {e}")));
+        }
+        return Err(ShaderError::Wave64Lowering(reason));
     }
-    let p = ir::thread_edges(p, &edges)?;
-    let st = structure::structure(&p)?;
-    let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+    result
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -802,7 +833,7 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || matches!(&r, Err(ShaderError::Wave64Lowering(_))) && !needs.is_empty();
         if !stuck {
             if why {
                 let order = ir::reverse_postorder(&p.blocks);
@@ -861,6 +892,60 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form
+/// ([`lower::with_paired_lanes`]): each console wave run by one host wave of 32 lanes, each
+/// thread two of its lanes, with every per-lane branch taken by the whole wave as the console
+/// takes it ([`structure::structure_wide`]), so that a host wave's threads go the same way and
+/// EXEC stays each lane's guard. The program's barriers are reached by whole host waves where
+/// the console's waves reach them; the only barriers added are on entry, before the program,
+/// where a group of several console waves numbers its waves (`Lower::wave_base`). A thread
+/// group whose console waves are not full would need the lanes past its end kept out of every
+/// effect: refused.
+/// Descriptors and addresses stay those traced on the lanes' own paths (`res`, as for every
+/// other form): the per-lane form rests on a lane that reads a scalar after a join having
+/// come the way the wave did, and knowing less of a lane's way the wave-wide form would miss
+/// some of them (a sampler set in a skip that only a wave with no lane left for it skips).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    if cs.lds_bytes() > 32 * 1024 {
+        return Err(ShaderError::Unsupported { offset: 0, what: "paired lanes with more than 32 KiB of LDS" });
+    }
+    if cs.threads.contains(&0) || !cs.threads.iter().product::<u32>().is_multiple_of(64) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -946,6 +1031,12 @@ fn emit_program(
         prims,
         mesh_stride,
     })?;
+    if l.wave_size == Some(64) && lower::host_max_wave() == 32 {
+        let reason = l.wave64_refusal.unwrap_or_else(|| format!(
+            "{:?} requires WaveSize(64) on a host limited to 32 lanes", native.stage
+        ));
+        return Err(ShaderError::Wave64Lowering(reason));
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

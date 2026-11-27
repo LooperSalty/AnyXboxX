@@ -17,6 +17,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 mod wave_regression_helpers;
 use wave_regression_helpers::*;
 
+#[path = "paired_tests.rs"]
+mod paired_tests;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
