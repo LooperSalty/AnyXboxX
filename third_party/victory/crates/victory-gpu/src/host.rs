@@ -588,6 +588,17 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
+/// Submission number that must complete before a retired BVH arena page may be
+/// reused (covers all in-flight and queued submissions).
+pub(crate) fn bvh_retire_target() -> u64 {
+    STARTED.load(Ordering::Acquire) + crate::queue::queued()
+}
+
+/// Whether every submission up to `target` has completed on the GPU.
+pub(crate) fn bvh_retire_ready(target: u64) -> bool {
+    FINISHED.load(Ordering::Acquire) >= target
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -5613,6 +5624,34 @@ impl Host {
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all. The second value is the queue
     /// fence covering the list in either case.
+    #[cfg(test)]
+    pub(crate) fn run_test_list_sync(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_test_list_async(&self, list: &HostList) -> (u64, u64) {
+        self.execute_own(list)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_test_fence(&self, fence: u64) {
+        // SAFETY: live fence and event owned by Host; wait until GPU reaches `fence`.
+        unsafe {
+            if self.fence.GetCompletedValue() < fence {
+                let _ = self.fence.SetEventOnCompletion(fence, self.event);
+                WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+        if late() {
+            settle_now(WHY_SYNC);
+        } else {
+            let started = STARTED.load(Ordering::Acquire);
+            FINISHED.store(started, Ordering::Release);
+            bury(started);
+        }
+    }
+
     fn execute_own(&self, list: &HostList) -> (u64, u64) {
         late_threads();
         let Submission { fence, ahead: flight } = self.submit(&[list], &[], true);
@@ -6682,6 +6721,15 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_refresh_count(&self) -> usize {
+        self.deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::Refresh(..)))
+            .count()
     }
 
     pub(crate) fn close(&self) {
