@@ -194,11 +194,9 @@ pub type SlInit = unsafe extern "C" fn(*const Preferences, u64) -> i32;
 pub type SlShutdown = unsafe extern "C" fn() -> i32;
 pub type SlIsFeatureSupported = unsafe extern "C" fn(u32, *const AdapterInfo) -> i32;
 pub type SlSetFeatureLoaded = unsafe extern "C" fn(u32, bool) -> i32;
-pub type SlEvaluateFeature =
-    unsafe extern "C" fn(u32, *const FrameToken, *const *const BaseStructure, u32, *mut c_void) -> i32;
+pub type SlEvaluateFeature = unsafe extern "C" fn(u32, *const FrameToken, *const *const BaseStructure, u32, *mut c_void) -> i32;
 pub type SlFreeResources = unsafe extern "C" fn(u32, *const ViewportHandle) -> i32;
-pub type SlSetTagForFrame =
-    unsafe extern "C" fn(*const FrameToken, *const ViewportHandle, *const ResourceTag, u32, *mut c_void) -> i32;
+pub type SlSetTagForFrame = unsafe extern "C" fn(*const FrameToken, *const ViewportHandle, *const ResourceTag, u32, *mut c_void) -> i32;
 pub type SlGetFeatureRequirements = unsafe extern "C" fn(u32, *mut FeatureRequirements) -> i32;
 pub type SlGetFeatureVersion = unsafe extern "C" fn(u32, *mut FeatureVersion) -> i32;
 pub type SlUpgradeInterface = unsafe extern "C" fn(*mut *mut c_void) -> i32;

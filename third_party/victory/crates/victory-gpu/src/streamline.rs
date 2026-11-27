@@ -6,23 +6,46 @@ pub mod plan;
 mod trust;
 
 pub use config::{Asked, Available};
-pub use plan::Mode;
 use library::*;
+pub use plan::Mode;
 
+use crate::object::Object;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
-use windows::core::Interface;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
+use std::sync::{Arc, Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
-use crate::object::Object;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::core::Interface;
 
+macro_rules! once {
+    ($level:ident, $($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::$level!($($arg)*));
+    }};
+}
+
+mod check;
 mod device;
+mod frames;
+mod hudless;
+mod present;
+mod stats;
+pub use check::check;
+use device::{COPY_DEST, texture};
+pub(crate) use frames::submitted;
+use frames::*;
+use hudless::*;
+pub(crate) use hudless::{before_target_draw, hudless_submitted, hudless_wanted};
+pub(crate) use present::{Planes, present_begins, present_ends, resizing};
+use stats::*;
+pub(crate) use stats::{line, present_called, present_returned};
+
 mod upscale;
-pub(crate) use device::device_made;
+pub(crate) use device::{device_made, present_hooked, swap_chain_factory, swap_chain_made};
 pub use upscale::*;
 
+const VIEWPORT_FG: u32 = 0;
 const VIEWPORT_DLSS: u32 = 1;
 const INTERPOSER: &str = "sl.interposer.dll";
 /// The project id NGX is given (engine "custom", no NVIDIA application id).
@@ -221,31 +244,24 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
     }
 }
 
-
-/// Probe the driver without creating a title process.
-pub fn check() -> Result<(), String> {
-    let mut asked = Asked::from_env()?;
-    asked.dlss = true;
-    asked.framegen = true;
-    let available = load_and_init(&asked, false)
-        .map_err(|why| format!("Streamline at {}: {why}", asked.dir.display()))?;
-    println!("DLSS Super Resolution: {}. Frame Generation with Reflex: {}.",
-        available.dlss, available.framegen);
-    // SAFETY: this command owns the only session; no device or frame exists.
-    let code = unsafe { (SL.get().unwrap().shutdown)() };
-    if code != 0 { return Err(format!("slShutdown: {} ({code})", abi::result_name(code))); }
-    if !available.dlss && !available.framegen { return Err("no requested feature is supported".into()); }
-    Ok(())
-}
 /// The per-feature functions, once the device is set.
 #[derive(Default)]
 struct Functions {
     dlss_optimal: Option<abi::SlDlssGetOptimalSettings>,
     dlss_set_options: Option<abi::SlDlssSetOptions>,
+    dlssg_set_options: Option<abi::SlDlssgSetOptions>,
+    dlssg_get_state: Option<abi::SlDlssgGetState>,
+    reflex_set_options: Option<abi::SlReflexSetOptions>,
+    pcl_set_marker: Option<abi::SlPclSetMarker>,
 }
 
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static DLSS_READY: AtomicBool = AtomicBool::new(false);
+static FG_READY: AtomicBool = AtomicBool::new(false);
+static SWAP_CHAIN_PROXIED: AtomicBool = AtomicBool::new(false);
+/// Our swap chain is Streamline's proxy of it ([`present_hooked`]).
+static PRESENT_HOOKED: AtomicBool = AtomicBool::new(false);
+
 /// Library calls that are not thread safe, and what the upscaling keeps
 /// between frames, one caller at a time.
 #[derive(Default)]
@@ -254,19 +270,19 @@ struct Calls {
     optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
     /// The mode, sizes and preset the last options named.
     last: Option<(u32, [u32; 2], [u32; 2])>,
+    /// Frame generation: on, and the frame whose simulation began.
+    framegen_on: bool,
+    simulating: Option<u32>,
 }
-static CALLS: Mutex<Calls> = Mutex::new(Calls {
-    optimal: Vec::new(),
-    last: None,
-});
+
+static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, simulating: None });
+
 fn calls() -> std::sync::MutexGuard<'static, Calls> {
     CALLS.lock().unwrap_or_else(|e| e.into_inner())
 }
-static EVALUATED: AtomicU64 = AtomicU64::new(0);
-static FAILED: AtomicU64 = AtomicU64::new(0);
-static FORWARDED: AtomicU64 = AtomicU64::new(0);
-static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+/// [`check`] presents from its one thread, with nothing else submitting.
+static CHECKING: AtomicBool = AtomicBool::new(false);
 fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
     let mut token = std::ptr::null_mut();
     // SAFETY: an out pointer and an index.
@@ -274,22 +290,27 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
     (code == 0 && !token.is_null()).then_some(token)
 }
 
-
-pub(crate) fn line(frames: f64) {
-    if !serving() { return; }
-    let [done, failed, forwarded] = [&EVALUATED, &FAILED, &FORWARDED].map(|n| n.swap(0, Relaxed) as f64 / frames);
-    tracing::info!("DLSS per frame: {done:.2} recorded, {failed:.2} failed, {forwarded:.2} left to FidelityFX");
-}
-
 /// Select the title's FidelityFX path only after the host device is ready.
 pub fn title_mode() -> Option<Mode> {
-    if !std::env::var_os("VICTORY_DLSS").is_some_and(|v| v == "1") { return None; }
-    let mut asked = Asked::from_env().map_err(|why| tracing::warn!("Streamline: {why}; using the title's upscaler")).ok()?;
-    asked.framegen = false;
-    if !init(&asked).dlss { return None; }
+    if !["VICTORY_DLSS", "VICTORY_FRAMEGEN"].iter().any(|key| std::env::var_os(key).is_some_and(|v| v == "1")) {
+        return None;
+    }
+    let asked = Asked::from_env().map_err(|why| tracing::warn!("Streamline: {why}; using the title's upscaler")).ok()?;
+    let available = init(&asked);
+    if !available.dlss && !available.framegen {
+        return None;
+    }
     if crate::host::host().is_none() || !serving() {
         tracing::warn!("Streamline device unavailable; using the title's upscaler");
         return None;
     }
     Some(asked.mode)
+}
+
+pub(crate) fn tracking_frames() -> bool {
+    FG_READY.load(Acquire)
+}
+
+pub(crate) fn checking() -> bool {
+    CHECKING.load(Relaxed)
 }

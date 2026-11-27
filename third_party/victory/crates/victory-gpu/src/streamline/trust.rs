@@ -4,7 +4,6 @@ use windows_sys::Win32::Security::{Cryptography::*, WinTrust::*};
 /// The Authenticode signature of `path` (NVIDIA signs its DLLs), checked
 /// without going online.
 pub(super) fn verify_signature(path: &Path, locked: &std::fs::File) -> Result<(), String> {
-    use windows_sys::Win32::Security::WinTrust::*;
     let file = wide(path);
     let mut info = WINTRUST_FILE_INFO {
         cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
@@ -25,11 +24,8 @@ pub(super) fn verify_signature(path: &Path, locked: &std::fs::File) -> Result<()
     let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     // SAFETY: filled structures that live through both calls.
     let code = unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, (&raw mut data).cast()) };
-    let result = if code == 0 {
-        signer_is_nvidia(&data)
-    } else {
-        Err(format!("{} is not validly signed ({:#x})", path.display(), code as u32))
-    };
+    let result =
+        if code == 0 { signer_is_nvidia(&data) } else { Err(format!("{} is not validly signed ({:#x})", path.display(), code as u32)) };
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     // SAFETY: as above; closes the state the first call opened.
     unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, (&raw mut data).cast()) };
@@ -42,24 +38,43 @@ fn signer_is_nvidia(data: &WINTRUST_DATA) -> Result<(), String> {
     let organization = unsafe {
         let provider = WTHelperProvDataFromStateData(data.hWVTStateData);
         let signer = provider.as_mut().and_then(|p| WTHelperGetProvSignerFromChain(p, 0, 0, 0).as_mut());
-        let cert = signer.and_then(|s| WTHelperGetProvCertFromChain(s, 0).as_ref())
-            .ok_or("Authenticode signer certificate unavailable")?;
+        let cert = signer.and_then(|s| WTHelperGetProvCertFromChain(s, 0).as_ref()).ok_or("Authenticode signer certificate unavailable")?;
         let mut name = [0u16; 256];
-        let count = CertGetNameStringW(cert.pCert, CERT_NAME_ATTR_TYPE, 0, szOID_ORGANIZATION_NAME.cast(),
-            name.as_mut_ptr(), name.len() as u32);
+        let count =
+            CertGetNameStringW(cert.pCert, CERT_NAME_ATTR_TYPE, 0, szOID_ORGANIZATION_NAME.cast(), name.as_mut_ptr(), name.len() as u32);
         String::from_utf16_lossy(&name[..count.saturating_sub(1) as usize])
     };
-    if organization == "NVIDIA Corporation" { Ok(()) }
-    else { Err(format!("expected Authenticode signer NVIDIA Corporation, got {organization:?}")) }
+    require_nvidia(&organization)
+}
+
+fn require_nvidia(organization: &str) -> Result<(), String> {
+    if organization == "NVIDIA Corporation" {
+        Ok(())
+    } else {
+        Err(format!("expected Authenticode signer NVIDIA Corporation, got {organization:?}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn requires_the_exact_publisher() {
+        assert!(super::require_nvidia("NVIDIA Corporation").is_ok());
+        assert!(super::require_nvidia("NVIDIA Corporation Test").is_err());
+        assert!(super::require_nvidia("Microsoft Corporation").is_err());
+    }
+
+    #[test]
     fn rejects_unsigned_dll_before_loading() {
         let dir = tempfile::tempdir().unwrap();
         let dll = dir.path().join("sl.interposer.dll");
-        std::fs::write(&dll, b"unsigned test input").unwrap();
+        // This test executable is a PE built from our sources. Give the copy
+        // the DLL characteristic; no third-party binary is a test fixture.
+        let mut pe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let nt = u32::from_le_bytes(pe[0x3c..0x40].try_into().unwrap()) as usize;
+        assert_eq!(&pe[nt..nt + 4], b"PE\0\0");
+        pe[nt + 23] |= 0x20; // IMAGE_FILE_DLL (0x2000)
+        std::fs::write(&dll, pe).unwrap();
         assert!(super::super::load(&dll).err().unwrap().contains("not validly signed"));
     }
 }

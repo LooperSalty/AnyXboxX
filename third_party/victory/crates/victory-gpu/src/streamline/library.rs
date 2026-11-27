@@ -34,13 +34,12 @@ pub(super) struct Sl {
 }
 
 pub(super) fn load(path: &Path) -> Result<Sl, String> {
+    use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     };
-    use std::os::windows::fs::OpenOptionsExt;
     // Deny writes and replacement between verification and loading.
-    let locked = std::fs::OpenOptions::new().read(true).share_mode(1).open(path)
-        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    let locked = std::fs::OpenOptions::new().read(true).share_mode(1).open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
     super::trust::verify_signature(path, &locked)?;
     let file = wide(path);
     // Its own folder and System32 only, never the current folder.
@@ -81,4 +80,3 @@ pub(super) fn load(path: &Path) -> Result<Sl, String> {
         _library: library,
     })
 }
-

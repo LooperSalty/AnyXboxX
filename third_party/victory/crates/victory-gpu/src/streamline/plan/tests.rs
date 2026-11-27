@@ -121,8 +121,7 @@ fn projections_place_near_and_far() {
     assert!(depth(&infinite, 1e7) < 1e-6);
     assert_eq!(projection(0.0, 100.0, 1.2, 1.0, false), IDENTITY);
     let inverse = invert(&standard).unwrap();
-    let product: abi::Float4x4 =
-        std::array::from_fn(|r| std::array::from_fn(|c| (0..4).map(|k| standard[r][k] * inverse[k][c]).sum()));
+    let product: abi::Float4x4 = std::array::from_fn(|r| std::array::from_fn(|c| (0..4).map(|k| standard[r][k] * inverse[k][c]).sum()));
     for r in 0..4 {
         for c in 0..4 {
             let want = if r == c { 1.0 } else { 0.0 };
