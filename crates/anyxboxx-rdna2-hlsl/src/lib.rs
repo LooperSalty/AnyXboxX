@@ -117,6 +117,9 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
             | "buffer_gl0_inv"
             | "buffer_gl1_inv"
             | "ds_nop"
+            | "v_nop"
+            | "v_pipeflush"
+            | "v_clrexcp"
             | "s_atc_probe"
             | "s_atc_probe_buffer"
     ) {

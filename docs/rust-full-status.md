@@ -126,6 +126,8 @@ The Rust emitter handles the 14 operations in the Python wide HLSL module, plus 
 
 VOP3 now shares all translated VOPC integer and floating comparisons. Batched WARP programs check every supported VOP3 comparison mask, plus a wave64 ballot crossing lane 31.
 
+VOP3 also uses the existing expression emitters for VOP1/VOP2 aliases. WARP checks the aliases, cube faces and coordinates, byte interpolation and the native SAD instructions.
+
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.

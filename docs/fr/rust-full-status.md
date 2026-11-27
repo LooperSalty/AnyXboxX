@@ -126,6 +126,8 @@ Le générateur Rust traduit les 14 opérations du module HLSL Python sur paires
 
 VOP3 reprend toutes les comparaisons entières et flottantes VOPC traduites. Des programmes WARP vérifient chaque masque de comparaison VOP3 et un vote wave64 qui franchit la ligne 31.
 
+VOP3 utilise aussi les expressions VOP1/VOP2 pour leurs encodages longs. WARP vérifie ces variantes, les faces et coordonnées de cube, l’interpolation d’octets et les instructions SAD natives.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 La CLI Rust affiche le HLSL des instructions portées avec `anyxboxx rdna2 FICHIER --hlsl`. Les deux CLI signalent le retrait de `--spirv` avec le code de sortie 2.
