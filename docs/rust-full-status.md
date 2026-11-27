@@ -132,6 +132,8 @@ LDS ADDTID reads and writes use M0, the immediate offset and the lane ID in wave
 
 MIMG covers all 57 image operations translated by Python, including the 32-bit atomics and all gather variants. Each encoding has a text and WARP memory comparison.
 
+Two measured oracle disagreements prevent unconditional byte-for-byte parity. With M0 = 250, `v_movrels_b32 v1, v10` reads v260. Both HLSL emitters produce the same shader, which writes zero to all 32 lanes under WARP. The Python interpreter raises `Untranslated` before it can produce any bytes. For the valid input `v_cos_f32(0x3E800000)` (one quarter turn), WARP executing the Python shader returns `0xB33BBD2E` and the Python reference returns `0x248D3132`. Rust currently rejects this opcode by name. Both measurements used synthetic programs, DXC and WARP on Windows.
+
 The Rust CLI prints HLSL for the supported subset with `anyxboxx rdna2 FILE --hlsl`. Both CLIs report the removal of `--spirv` with exit code 2.
 
 **Still Python:**
