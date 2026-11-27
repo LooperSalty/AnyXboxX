@@ -5484,6 +5484,95 @@ void lighting_consume(uint3 id : SV_DispatchThreadID) {
         list.reset();
     }
 
+    /// Confirms that `pipeline::stores` (which populates `translated().stores`)
+    /// returns `true` for compute shaders whose only memory write is a buffer,
+    /// global, flat, or scalar atomic add (and `false` for texture-only or
+    /// read-only shaders), and that dispatching an atomic-only compute shader
+    /// clears both the open indirect clamp batch and window.
+    #[test]
+    fn atomic_only_compute_shader_marks_stores_and_clears_batch() {
+        use victory_shader::gfx10::decode;
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        let program = |words: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+
+        let atomic_cases: &[(&str, [u32; 3])] = &[
+            // Encoding::Mubuf (0x38), opcode 0x032 = buffer_atomic_add
+            ("buffer_atomic_add", [(0x38 << 26) | (0x32 << 18), 0, S_ENDPGM]),
+            // Encoding::Global (0x37, seg 2), opcode 0x032 = global_atomic_add
+            ("global_atomic_add", [(0x37 << 26) | (0x32 << 18) | (2 << 14), 0, S_ENDPGM]),
+            // Encoding::Flat (0x37, seg 0), opcode 0x032 = flat_atomic_add
+            ("flat_atomic_add", [(0x37 << 26) | (0x32 << 18), 0, S_ENDPGM]),
+            // Encoding::Smem (0x3D), opcode 0x042 = s_buffer_atomic_add
+            ("s_buffer_atomic_add", [(0x3D << 26) | (0x42 << 18), 0, S_ENDPGM]),
+            // Encoding::Smem (0x3D), opcode 0x082 = s_atomic_add
+            ("s_atomic_add", [(0x3D << 26) | (0x82 << 18), 0, S_ENDPGM]),
+        ];
+        for &(expected_name, words) in atomic_cases {
+            let prog = program(&words);
+            let decoded = decode(&prog.code).expect("valid GFX10 instruction");
+            assert_eq!(decoded[0].name(), Some(expected_name));
+            assert!(
+                crate::pipeline::stores(&prog),
+                "{expected_name} must mark translated().stores = true"
+            );
+        }
+
+        // Texture-only MIMG store (image_store, opcode 0x008) and read-only CS
+        // cannot modify indirect argument buffers, so `stores` stays false.
+        let tex_only = program(&[(0x3C << 26) | (0x08 << 18), 0, S_ENDPGM]);
+        assert_eq!(decode(&tex_only.code).unwrap()[0].name(), Some("image_store"));
+        assert!(!crate::pipeline::stores(&tex_only), "texture-only image_store must not mark buffer stores");
+        let read_only = program(&[S_ENDPGM]);
+        assert!(!crate::pipeline::stores(&read_only), "read-only compute must not mark buffer stores");
+
+        // End-to-end state transition: an atomic-only compute dispatch clears
+        // the open clamp batch and window just like a plain buffer store.
+        let Some(host) = host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src, _)) = host.shared_buffer(4096) else {
+            return;
+        };
+        for &(expected_name, words) in atomic_cases {
+            let prog = program(&words);
+            let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[]).unwrap();
+            let mut state = State::default();
+            state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+            state.window = Some(Window {
+                copy: 1,
+                kind: 2,
+                stride: 12,
+                step: 32,
+                base: 0,
+                records: 16,
+                scratch,
+            });
+            state.after_compute_dispatch(crate::pipeline::stores(&prog));
+            assert!(state.window.is_none(), "{expected_name} must clear open indirect window");
+            if batches() == 2 {
+                assert!(state.batch.as_ref().is_some_and(|b| b.wrote));
+                state.synced();
+            }
+            assert!(state.batch.is_none(), "{expected_name} must clear open indirect batch");
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
     struct RtFrameResult {
         adapter: String,
         batches_per_frame: u32,
