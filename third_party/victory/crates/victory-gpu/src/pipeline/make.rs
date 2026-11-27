@@ -173,26 +173,61 @@ impl Pending {
     }
 }
 
+/// Classifies stage combinations rejected before translation or driver creation.
+fn unsupported_stages<'a>(stages: impl Iterator<Item = &'a str>, has_graphics: bool) -> Option<&'static str> {
+    let stages: Vec<_> = stages.collect();
+    if stages.as_slice() == ["compute"] {
+        return None;
+    }
+    if stages.iter().any(|stage| !matches!(*stage, "vertex" | "pixel" | "mesh")) {
+        return Some("unsupported shader stage");
+    }
+    if !stages.iter().any(|stage| matches!(*stage, "vertex" | "mesh")) {
+        return Some("no vertex or mesh shader");
+    }
+    if !has_graphics {
+        return Some("graphics state not kept (plain description)");
+    }
+    None
+}
+
 /// Reports why a host pipeline was left out, is pending, or failed to build.
 /// Returns `None` when the host pipeline is ready.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(reason) = p.left_out {
+        return Some(format!("intentionally omitted: {reason}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some(p.left_out.unwrap_or("being made").into()),
         Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
-                .iter()
+            let rejected = unsupported_stages(p.shaders.iter().map(|s| s.stage), p.graphics.is_some());
+            if let Some(reason) = rejected.filter(|reason| *reason != "graphics state not kept (plain description)") {
+                return Some(reason.into());
+            }
+            let failed: Vec<String> = p.shaders.iter()
                 .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
+                .map(|s| format!("{} {}", s.stage, s.hash)).collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                rejected.unwrap_or("pipeline creation failed (see creation log for device, root signature or driver error)").into()
             } else {
-                failed.join(" + ")
+                format!("shader translation failed: {}", failed.join(" + "))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::unsupported_stages;
+    #[test]
+    fn distinguishes_unsupported_stages_and_missing_state() {
+        assert_eq!(unsupported_stages(["vertex", "hull"].into_iter(), true), Some("unsupported shader stage"));
+        assert_eq!(unsupported_stages(["amplification", "mesh"].into_iter(), true), Some("unsupported shader stage"));
+        assert_eq!(unsupported_stages(["pixel"].into_iter(), true), Some("no vertex or mesh shader"));
+        assert_eq!(unsupported_stages(["vertex", "pixel"].into_iter(), false), Some("graphics state not kept (plain description)"));
+        assert_eq!(unsupported_stages(["compute"].into_iter(), false), None);
+        assert_eq!(unsupported_stages(["mesh", "pixel"].into_iter(), true), None);
     }
 }
 

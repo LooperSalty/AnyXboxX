@@ -104,6 +104,30 @@ fallback when it is missing. `VICTORY_DLSS_NO_UPDATE=1` uses the installed
 selection without an NGX update. [AMD FSR SDK](https://gpuopen.com/amd-fsr-sdk/) ·
 [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS)
 
+**NVIDIA Streamline (an RTX card).** A second way to DLSS Super Resolution,
+with DLSS Frame Generation (2×) and Reflex, wraps the title's own FidelityFX
+loader instead of replacing it. Set `VICTORY_DLSS=1` for the upscaling and
+`VICTORY_FRAMEGEN=1` for frame generation, `VICTORY_UPSCALER=7` to have the
+title call FidelityFX, `VICTORY_STREAMLINE_DIR` to the folder holding
+`sl.interposer.dll` and the plug-ins, and optionally `VICTORY_DLSS_MODE`,
+`VICTORY_DLSS_PRESET` and `VICTORY_FRAMEGEN_HUDLESS`. The panel then shows the
+frames shown and the frames rendered. Streamline and the options above are
+never on together: when its library loads, it takes precedence, and the log
+says once which of `VICTORY_FSR_4K`, `VICTORY_DLSS_4K`, `VICTORY_DLSS=<quality>`
+and `VICTORY_FSR` it ignored (`VICTORY_FRAMEGEN=1` then means Streamline's
+frame generation, not AMD's). If its library does not load, they run as
+before. `VICTORY_DLSS=1` is Streamline's switch; the Series S quality names
+(`quality`, `balanced`, `performance`) keep selecting DLSS through NGX.
+
+With Streamline's DLSS on, VIctory forces upscaler 7 so the title calls
+FidelityFX and DLSS can handle the upscale. If you set `VICTORY_UPSCALER=6`,
+VIctory logs the override once. An explicit `VICTORY_FFX_SCALE` still takes
+precedence over the DLSS mode's render scale. The shipping FSR4 context sizes
+(1920×1080 output, 1280×720 render) are assumed (measured by VIctory-NVIDIA on
+26/11), to confirm in game. When a requested context falls outside the
+supported sizes, VIctory uses these sizes for the title's FSR4 context and
+passes the requested dimensions to DLSS.
+
 For 2× Series S frame generation, pass `-FrameGen`. Point
 `VICTORY_FFX_FG_DIR` or `[paths].ffx_fg_dir` at the SDK 2.4.0
 `Kits/FidelityFX/signedbin` folder with `amd_fidelityfx_loader_dx12.dll`

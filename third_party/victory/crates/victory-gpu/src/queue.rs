@@ -596,6 +596,12 @@ fn execute_with_token(this: This, count: u32, lists: *const This, token: Option<
             crate::framegen::bind_submission(lists, token);
         }
         if behind::on() && !this.is_null() {
+            if !lists.is_empty() {
+                crate::streamline::latency::mark(
+                    || token.filter(|&t| t != 0).unwrap_or_else(crate::frame::current),
+                    crate::streamline::latency::Phase::RenderSubmit,
+                );
+            }
             behind::submit(this, lists);
             return;
         }
@@ -1003,17 +1009,12 @@ extern "system" fn present(
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let base_res = if planes > 0
-            // SAFETY: the title passes `planes` plane descriptions.
-            && let Some(plane) = unsafe { plane_parameters.as_ref() }
-            && plane.count > 0
-            && !plane.resources.is_null()
-        {
+        // SAFETY: the title passes a first plane when the count is nonzero.
+        let base = (planes > 0).then(|| unsafe { plane_parameters.as_ref() }).flatten();
+        let base_res = base.filter(|plane| plane.count > 0 && !plane.resources.is_null()).map(|plane| {
             // SAFETY: the plane lists `count` resources.
-            Some(unsafe { *plane.resources })
-        } else {
-            None
-        };
+            unsafe { *plane.resources }
+        });
         let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
@@ -1117,6 +1118,8 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    /// Frame-origin token supplied by PresentX. The capture ordinal above
+    /// may differ after a skipped origin or an extra present.
     token: Option<u64>,
 }
 

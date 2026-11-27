@@ -654,6 +654,9 @@ mod tests {
             cache_dir: temp.path().join("cache"),
             data_dir: temp.path().join("data"),
             test_titles: Vec::new(),
+            fidelityfx_dir: None,
+            ffx_fg_dir: None,
+            dlss_dir: None,
             source: None,
         };
         let dir = pipelines_folder(&cfg).unwrap();

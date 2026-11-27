@@ -16,6 +16,11 @@
 //!
 //! With `VICTORY_DLSS_4K` the same calls are served by NVIDIA DLSS instead
 //! (`dlss`), on an RTX card.
+//!
+//! NVIDIA Streamline (`VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`, `interpose`) is
+//! the other way to DLSS and frame generation: it wraps the title's own
+//! FidelityFX DLL instead of replacing it. When Streamline is on, none of
+//! the above is set up.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -257,6 +262,8 @@ macro_rules! once {
 }
 
 mod dlss;
+mod interpose;
+pub use interpose::Interpose;
 pub mod native_framegen;
 mod resource_states;
 

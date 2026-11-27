@@ -216,9 +216,13 @@ struct Api {
     dispatch: Call,
 }
 
+/// Whether AMD's frame generation is on (`VICTORY_FRAMEGEN=1`). Off when
+/// NVIDIA Streamline has taken over (`crate::streamline::take_over`): it
+/// has its own frame generation on the same switch.
 pub fn requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     !STOPPED.load(Ordering::Acquire)
+        && !crate::streamline::taken_over()
         && *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1"))
 }
 

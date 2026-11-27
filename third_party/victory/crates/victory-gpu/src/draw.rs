@@ -3344,6 +3344,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::report_drop(self.pipeline as This, "dispatch", "ray tracing builder disabled");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3357,6 +3358,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::report_drop(self.pipeline as This, "dispatch", "pipeline unavailable");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3365,11 +3367,13 @@ impl State {
             return;
         };
         if !p.compute {
+            crate::pipeline::report_drop(self.pipeline as This, "dispatch", "graphics pipeline bound");
             once!("a dispatch with a graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::report_drop(self.pipeline as This, "dispatch", "binding failed");
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3914,6 +3918,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::report_drop(self.pipeline as This, "draw/mesh", "pipeline ready; preparation or geometry failed");
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4387,6 +4392,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        if crate::streamline::hudless_wanted() {
+            self.before_shown_target(list, vertices == 3 && instances == 1);
+        }
         let ready = self.prepare_direct(list, false, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4416,9 +4424,33 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::report_drop(self.pipeline as This, "draw/mesh", "pipeline ready; preparation or geometry failed");
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// With frame generation (`crate::streamline`), before a draw into one
+    /// colour target without depth: if the target is one the title presents,
+    /// the draw is told there, where the colour without the interface is
+    /// copied in front of the title's interface composite. `triangle`: one
+    /// triangle, one instance (the composite's shape). Only copies and
+    /// barriers are recorded; the target is moved back to a render target by
+    /// the draw's own preparation.
+    fn before_shown_target(&self, list: &HostList, triangle: bool) {
+        if self.depth != 0 {
+            return;
+        }
+        let &[target] = self.targets.as_slice() else {
+            return;
+        };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        if p.compute || p.mesh {
+            return;
+        }
+        crate::streamline::before_target_draw(list, target as This, p, triangle);
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -4501,6 +4533,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        if crate::streamline::hudless_wanted() {
+            self.before_shown_target(list, false);
+        }
         // Indexed rectangles are drawn by the rectangle geometry stage
         // alone (nothing expands them on the CPU).
         let lost = self.topology == RECTANGLES && !self.completes_rects();
@@ -4526,6 +4561,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::report_drop(self.pipeline as This, "draw/mesh", "pipeline ready; preparation or geometry failed");
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4621,6 +4657,14 @@ impl State {
         Some((scratch, at))
     }
 
+    pub(crate) fn report_indirect_layout(&self) {
+        crate::pipeline::report_drop(self.pipeline as This, "indirect", "unsupported signature or unmapped argument/count buffer");
+    }
+
+    pub(crate) fn report_unsupported_mesh_indirect(&self) {
+        crate::pipeline::report_drop(self.pipeline as This, "DispatchMeshX indirect", "unsupported");
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -4647,13 +4691,18 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let pipeline = self.pipeline;
+        let why = |what: &str| {
+            if crate::drop_report::enabled() {
+                crate::pipeline::report_drop(pipeline as This, &format!("indirect kind {kind}"), what);
+            }
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::report_drop(pipeline as This, "indirect", "pipeline unavailable");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(pipeline as This);
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256

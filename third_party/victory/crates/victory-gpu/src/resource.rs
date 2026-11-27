@@ -3819,7 +3819,7 @@ mod tests {
 
         let desc = texture(512, 512, 28, 10);
         assert!(texture_layout(&desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor()));
-        let copy = host_texture_as(&desc, 0, std::ptr::null(), true).expect("reserved texture");
+        let copy = host_texture_as(&desc, 0, std::ptr::null(), true, true).expect("reserved texture");
         assert!(
             crate::tiles::Tiled::make(&host.device, &copy, u32::from(desc.mip_levels)).is_some(),
             "the requested texture must be backed by tiles chosen at upload time",
@@ -5407,7 +5407,7 @@ float4 lit() : SV_Target { return 1.0; }
     /// 86 % of its budget (as `card_use` counts it; nothing else changes),
     /// the queue is refused and a copy idle for over five seconds and four
     /// frames, held by its texture alone and never submitted (its fence is
-    /// done), is let go. At 84 % it stays (ten minutes); 88 % is the
+    /// done), is let go. At 82 % it stays (ten minutes); 88 % is the
     /// control, where it went before this change too.
     #[cfg(windows)]
     #[test]
@@ -5447,7 +5447,8 @@ float4 lit() : SV_Target { return 1.0; }
             let kept = resource(texture).host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some();
             (under_share(budget, used, ROOM), kept)
         };
-        assert_eq!(look(84, first), (true, true), "84 %: room, kept");
+        // (Letting go starts 2 below the room share, 83 % here: `host::vram_keep_for`.)
+        assert_eq!(look(82, first), (true, true), "82 %: room, kept");
         assert_eq!(look(86, first), (false, false), "86 %: refused, and the idle copy must go");
         assert_eq!(look(88, control), (false, false), "88 %: refused, let go");
     }

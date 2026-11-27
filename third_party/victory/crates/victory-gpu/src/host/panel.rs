@@ -18,6 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindow
 
 use super::{Host, HostList, transition};
 use crate::cpucores::CpuMeter;
+use crate::frame_rate::{FrameCounts, FrameGeneration, FrameRate};
 
 mod gpu_load;
 
@@ -135,6 +136,9 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         b':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
         b' ' => [0; 7],
+        b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        b')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        b',' => [0, 0, 0, 0, 0, 0b00100, 0b01000],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
 }
@@ -405,7 +409,7 @@ impl Counters {
 
 /// Snapshot of data rendered onto the HUD canvas.
 struct Snapshot {
-    fps: f64,
+    rate: FrameRate,
     frame_rates: Option<(f32, f32)>,
     frame_ms: f64,
     gpu_ms: f64,
@@ -528,9 +532,14 @@ fn paint_hud(s: &Snapshot, framegen: bool) -> Canvas {
     }
     panel_frame(&mut c);
 
-    let rates = s.frame_rates.filter(|_| framegen);
+    // AMD's frame generation reports rendered and output frames from its own
+    // counters; NVIDIA Streamline's (never both on) from the meter's.
+    let rates = s.frame_rates.filter(|_| framegen).or_else(|| {
+        s.rate.active.then_some((s.rate.rendered as f32, s.rate.shown as f32))
+    });
+    let framegen = framegen || rates.is_some();
     output_card(&mut c, rates.is_some());
-    let fps = rates.map_or(s.fps, |(rendered, _)| f64::from(rendered));
+    let fps = rates.map_or(s.rate.rendered, |(rendered, _)| f64::from(rendered));
     c.heading(14, 8, WHITE, "RENDER FPS");
     if rates.is_some() {
         c.heading(198, 8, WHITE, "FG OUTPUT FPS");
@@ -698,7 +707,7 @@ pub(super) struct PanelCopy {
 /// The panel of a presenter.
 pub(super) struct Panel {
     since: Instant,
-    frames: u32,
+    frames: FrameCounts,
     last: Instant,
     worst: f64,
     /// What this took since the last text.
@@ -719,7 +728,7 @@ impl Panel {
         let now = Instant::now();
         Panel {
             since: now,
-            frames: 0,
+            frames: FrameCounts::default(),
             last: now,
             worst: 0.0,
             cost: Duration::ZERO,
@@ -737,19 +746,18 @@ impl Panel {
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
-    pub(super) fn frame(&mut self, line: bool) {
+    pub(super) fn frame(&mut self, line: bool, fg: FrameGeneration) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
         if !shown().load(Ordering::Relaxed) {
-            self.frames = 0;
+            self.frames = FrameCounts::default();
             return;
         }
         let now = Instant::now();
         let dt_ms = (now - self.last).as_secs_f64() * 1e3;
-        if self.frames == 0 && now - self.last > 2 * EVERY {
+        if self.frames.rendered == 0 && now - self.last > 2 * EVERY {
             (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
-            self.frames = 0;
             self.cpu.sample();
         } else {
             if self.history.len() == HISTORY {
@@ -759,20 +767,21 @@ impl Panel {
             self.worst = self.worst.max(dt_ms);
             self.last = now;
         }
-        self.frames += 1;
+        self.frames.record(fg);
         let elapsed = now - self.since;
         if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
         }
         let Some(host) = super::host() else { return };
         self.cpu.sample();
-        let frames = f64::from(self.frames);
+        let counts = std::mem::take(&mut self.frames);
+        let frames = f64::from(counts.rendered);
+        let rate = counts.rates(elapsed);
         let counters = Counters::now();
         let c = counters.since(self.before, frames);
         self.before = counters;
 
         let ms = elapsed.as_secs_f64() * 1e3 / frames;
-        let fps = 1e3 / ms.max(0.001);
         let idle = (c[1] / 1e3).min(ms);
         let gpu_ms = (ms - idle).max(0.0);
         let measured = gpu_load::latest(&host.device);
@@ -786,7 +795,7 @@ impl Panel {
             let idx = (sorted.len() * 99 / 100).min(sorted.len() - 1);
             1e3 / f64::from(sorted[idx]).max(0.001)
         } else {
-            fps
+            rate.rendered
         };
 
         let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
@@ -804,7 +813,7 @@ impl Panel {
         let (gpu_name, _) = gpu_info(host);
 
         self.snap = Some(Snapshot {
-            fps,
+            rate,
             frame_rates: crate::framegen::frame_rates(),
             frame_ms: ms,
             gpu_ms,
@@ -836,7 +845,7 @@ impl Panel {
             history_ms: self.history.iter().copied().collect(),
         });
         self.changed = true;
-        (self.since, self.frames, self.worst) = (now, 0, 0.0);
+        (self.since, self.worst) = (now, 0.0);
         self.cost = now.elapsed();
     }
 
@@ -1012,7 +1021,7 @@ mod tests {
     /// Every character the HUD uses has its own picture, and no two look alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./-|%: ").collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./-|%: (),").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
@@ -1025,7 +1034,11 @@ mod tests {
     #[test]
     fn a_box_is_painted() {
         let mut snap = Snapshot {
-            fps: 32.0,
+            rate: {
+                let mut frames = FrameCounts::default();
+                (0..32).for_each(|_| frames.record(FrameGeneration::Off));
+                frames.rates(Duration::from_secs(1))
+            },
             frame_rates: None,
             frame_ms: 31.2,
             gpu_ms: 28.7,
@@ -1073,6 +1086,17 @@ mod tests {
             p != FG_MINT || ((198..372).contains(&(i % generated.w)) && (33..68).contains(&(i / generated.w)))
         }));
         assert_eq!(paint_hud(&snap, false).rgb, canvas.rgb);
+        // NVIDIA Streamline's frame generation reports through the meter's
+        // rate, not AMD's counters: the same output card, without `framegen`.
+        snap.frame_rates = None;
+        snap.rate = {
+            let mut frames = FrameCounts::default();
+            (0..32).for_each(|_| frames.record(FrameGeneration::Reported(2)));
+            frames.rates(Duration::from_secs(1))
+        };
+        let streamline = paint_hud(&snap, false);
+        assert!(header_has(&streamline, 198, FG_MINT));
+        assert_eq!(streamline.rgb[17 * streamline.w + 352], MUTED);
         for scale in [1u32, 2] {
             let (width, height) = size(scale);
             let pitch = (width * 4).next_multiple_of(256) as usize;

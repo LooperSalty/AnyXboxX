@@ -160,6 +160,51 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     crate::copystat::recorded(started);
 }
 
+/// Work of ours at a place in a title list (DLSS in place of the title's
+/// FidelityFX upscaling, `crate::streamline`): it is given the host list
+/// there and says whether it recorded into it; if it did, what the title set
+/// is set again before the title's next draw or dispatch.
+#[cfg(windows)]
+pub(crate) type External = Box<dyn FnOnce(&crate::host::HostList) -> bool + Send>;
+
+/// Runs `work` at this place of title list `this`: now, or, with
+/// `VICTORY_THIN=1`, when the list's calls are translated (in their order).
+/// False if the list records nowhere.
+#[cfg(windows)]
+pub(crate) fn external(this: This, work: External) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // FidelityFX needs the actual recording result on the title thread.
+    // Flush just this prefix of the thin stream; subsequent calls (including
+    // the title's fallback) still record on the same underlying list.
+    let (reply, result) = std::sync::mpsc::channel();
+    let checked: External = Box::new(move |host| {
+        let recorded = work(host);
+        let _ = reply.send(recorded);
+        recorded
+    });
+    let work = match thin::put_external(this, checked) {
+        Ok(()) => return result.recv().unwrap_or(false),
+        Err(work) => work,
+    };
+    if host_list(this).is_none() {
+        return false;
+    }
+    run_external(this, work);
+    result.recv().unwrap_or(false)
+}
+
+/// [`external`]'s work on the list that records `this`'s calls.
+#[cfg(windows)]
+fn run_external(this: This, work: External) {
+    with_state(this, |host, state| {
+        work(host);
+        // Even a failed evaluation may have touched the command list.
+        state.replay(host);
+    });
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -1916,6 +1961,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if crate::drop_report::enabled() {
+                with_state(this, |_, s| s.report_unsupported_mesh_indirect());
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -2008,6 +2056,10 @@ extern "system" fn execute_indirect(
     count_draw();
     TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        if crate::drop_report::enabled() {
+            crate::drop_report::record("indirect: unknown signature; shaders=unknown".to_owned());
+        }
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -2024,6 +2076,9 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        if crate::drop_report::enabled() {
+            with_state(this, |_, s| s.report_indirect_layout());
+        }
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",

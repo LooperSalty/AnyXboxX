@@ -78,7 +78,8 @@ impl std::fmt::Debug for Shader {
 }
 
 /// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+type ShaderKey = ([u8; 32], Option<&'static str>);
+static SHADERS: Mutex<Option<HashMap<ShaderKey, Arc<Shader>>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
@@ -105,11 +106,17 @@ pub(crate) fn kept() -> [u64; 7] {
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+    static BY_STAGE: OnceLock<bool> = OnceLock::new();
+    let by_stage = *BY_STAGE.get_or_init(|| std::env::var_os("VICTORY_SHADER_STAGE_CACHE").is_some_and(|v| v == "1"));
+    shader_with_stage_key(stage, bytes, by_stage)
+}
+
+fn shader_with_stage_key(stage: &'static str, bytes: &[u8], by_stage: bool) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry((*full.as_bytes(), by_stage.then_some(stage)))
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -126,6 +133,23 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+#[cfg(test)]
+mod shader_stage_cache_tests {
+    use super::*;
+    #[test]
+    fn identical_containers_keep_their_own_stage_when_enabled() {
+        let bytes = b"synthetic stage cache regression";
+        let vertex = shader_with_stage_key("vertex", bytes, true);
+        let pixel = shader_with_stage_key("pixel", bytes, true);
+        let vertex_again = shader_with_stage_key("vertex", bytes, true);
+        assert_eq!(vertex.stage, "vertex");
+        assert_eq!(pixel.stage, "pixel");
+        assert_eq!(vertex.hash, pixel.hash);
+        assert!(!Arc::ptr_eq(&vertex, &pixel));
+        assert!(Arc::ptr_eq(&vertex, &vertex_again));
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -465,6 +489,19 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// Records a failed operation with its pipeline status and shader identities.
+#[cfg(windows)]
+pub(crate) fn report_drop(this: This, operation: &str, reason: &str) {
+    if !crate::drop_report::enabled() { return; }
+    let (status, hashes) = if this.is_null() {
+        ("no pipeline bound".to_owned(), "none".to_owned())
+    } else {
+        let p = pipeline(this);
+        (make::missing(&p.host).unwrap_or_else(|| "ready".to_owned()), make::hashes(&p.host))
+    };
+    crate::drop_report::record(crate::drop_report::key(operation, reason, &status, &hashes));
 }
 
 /// Host pipelines queued and not made yet.

@@ -29,6 +29,15 @@ impl FsrPreset {
         }
     }
 
+    /// [`Self::requested`], except that `1` is not a profile: some switches
+    /// (`VICTORY_DLSS`) also name NVIDIA Streamline's on-switch.
+    pub(super) fn requested_unless_switch(switch: &str) -> Result<Option<Self>> {
+        if std::env::var(switch).is_ok_and(|value| value.trim() == "1") {
+            return Ok(None);
+        }
+        Self::requested(switch)
+    }
+
     pub(super) fn from_name(name: &str) -> Option<Self> {
         match name {
             "quality" => Some(Self::Quality),
@@ -195,6 +204,24 @@ mod tests {
             assert_eq!(preset.dlss_quality(), dlss);
         }
         assert_eq!(FsrPreset::from_name("ultra"), None);
+    }
+
+    #[test]
+    fn a_streamline_switch_is_not_a_profile_name() {
+        const SWITCH: &str = "VICTORY_TEST_PROFILE_OR_STREAMLINE_SWITCH";
+        // SAFETY: a variable only this test reads or writes.
+        unsafe { std::env::set_var(SWITCH, "1") };
+        assert_eq!(FsrPreset::requested_unless_switch(SWITCH).unwrap(), None);
+        assert!(FsrPreset::requested(SWITCH).is_err());
+        // SAFETY: as above.
+        unsafe { std::env::set_var(SWITCH, "balanced") };
+        assert_eq!(FsrPreset::requested_unless_switch(SWITCH).unwrap(), Some(FsrPreset::Balanced));
+        // SAFETY: as above.
+        unsafe { std::env::set_var(SWITCH, "ultra") };
+        assert!(FsrPreset::requested_unless_switch(SWITCH).is_err());
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(SWITCH) };
+        assert_eq!(FsrPreset::requested_unless_switch(SWITCH).unwrap(), None);
     }
 
     #[test]

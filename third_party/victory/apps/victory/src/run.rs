@@ -154,10 +154,34 @@ pub fn run(
     if let Some(dir) = cfg.ffx_fg_dir.as_deref() {
         fidelityfx::set_framegen_dir(dir);
     }
-    let fsr = fsr_4k::FsrPreset::requested("VICTORY_FSR_4K")?;
-    let dlss = fsr_4k::FsrPreset::requested("VICTORY_DLSS_4K")?;
-    let series_s_dlss = fsr_4k::FsrPreset::requested("VICTORY_DLSS")?;
-    let series_s_fsr = fsr_4k::FsrPreset::requested("VICTORY_FSR")?;
+    // NVIDIA Streamline (VICTORY_DLSS=1, VICTORY_FRAMEGEN=1) and this tree's
+    // FidelityFX PC, NGX DLSS and native frame generation never run together:
+    // when Streamline loads it wins, and what it displaces is left unset.
+    let streamline = execute && victory_gpu::streamline::take_over();
+    let (mut fsr, mut dlss, mut series_s_dlss, mut series_s_fsr) = (
+        fsr_4k::FsrPreset::requested("VICTORY_FSR_4K")?,
+        fsr_4k::FsrPreset::requested("VICTORY_DLSS_4K")?,
+        // `VICTORY_DLSS=1` is Streamline's switch, not a quality name.
+        fsr_4k::FsrPreset::requested_unless_switch("VICTORY_DLSS")?,
+        fsr_4k::FsrPreset::requested("VICTORY_FSR")?,
+    );
+    if streamline {
+        let displaced: Vec<&str> = [
+            (fsr.take().is_some(), "VICTORY_FSR_4K"),
+            (dlss.take().is_some(), "VICTORY_DLSS_4K"),
+            (series_s_dlss.take().is_some(), "VICTORY_DLSS=<quality>"),
+            (series_s_fsr.take().is_some(), "VICTORY_FSR"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect();
+        if !displaced.is_empty() {
+            tracing::warn!(
+                ignored = displaced.join(", "),
+                "NVIDIA Streamline DLSS / Frame Generation is on and takes precedence: FidelityFX PC, NGX DLSS and AMD frame generation stay off"
+            );
+        }
+    }
     let framegen = fidelityfx::framegen_requested();
     anyhow::ensure!(
         !framegen || matches!(console, Console::SeriesS),
@@ -273,6 +297,17 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    let dlss_mode = execute.then(victory_gpu::streamline::title_mode).flatten().filter(|mode| {
+        if victory_gpu::streamline::upscaling() { return true; }
+        let output = victory_loader::resolution::asked_output().unwrap_or(match console {
+            Console::SeriesS => (1920, 1080), Console::SeriesX => (3840, 2160),
+        });
+        let scale = victory_loader::resolution::asked_ffx_scale().unwrap_or(mode.scale());
+        let render = [(output.0 as f32 * scale) as u32, (output.1 as f32 * scale) as u32];
+        if output == (1920, 1080) && matches!(render, [1280, 720] | [1920, 1080]) { return true; }
+        tracing::warn!(?output, ?render, "Frame Generation alone requires a supported native FidelityFX size; using the title's renderer. Enable DLSS for this output.");
+        false
+    });
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     if native_framegen {
         let (_, loader) = dlls
@@ -352,7 +387,10 @@ pub fn run(
         show(name, dll.bind_imports(title_imports, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(title_imports, policy)?);
+    // NVIDIA Streamline's wrapper of the title's FidelityFX imports; it binds
+    // as `title_imports` does unless Streamline is on.
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: title_imports };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -418,7 +456,7 @@ pub fn run(
     if execute && profile.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_with_fidelityfx(image.base(), size, dlss_mode.map(|m| m.scale())) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

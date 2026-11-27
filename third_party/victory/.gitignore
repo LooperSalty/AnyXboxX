@@ -45,6 +45,8 @@
 
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
+# The BCPack format tables: a registered exception (docs/asset-policy.md).
+!/crates/victory-formats/src/bcpack-tables.bin
 *.dat
 *.pak
 *.rpf
