@@ -256,6 +256,7 @@ pub(crate) struct Shader {
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// `dx.op.barrier` calls emitted in this shader.
+    #[cfg(test)]
     pub barriers: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
@@ -313,6 +314,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
             barriers: 0,
             threads: None,
             wave_size: None,
@@ -352,6 +354,7 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        #[cfg(test)]
         if opcode == 80 && name == "barrier" {
             self.barriers += 1;
         }

@@ -145,7 +145,7 @@ fn pairs(
         .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
 }
 
-/// Variables set before the XG library is checked, in the script's order.
+/// Profile settings and switches. Explicit overrides are applied after XG validation.
 pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
     base_with_cpus(args, logical_cpus())
 }
@@ -166,9 +166,6 @@ pub fn base_with_cpus(args: &RunArgs, logical_cpus: usize) -> Vec<(String, OsStr
     }
     if args.quality {
         env.extend(pairs(QUALITY));
-    }
-    for (name, value) in &args.overrides {
-        env.push((name.clone(), OsString::from(value)));
     }
     if args.auto_a {
         env.push((AUTO_A.to_string(), OsString::from("150")));

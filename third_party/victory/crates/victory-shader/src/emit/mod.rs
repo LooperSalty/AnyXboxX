@@ -159,6 +159,22 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LANE_PRIVATE_LDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether to enable experimental lane-private LDS lowering on wave32 hosts.
+/// The shader cache uses the same switch when choosing its translation key.
+pub fn lane_private_lds_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_LANE_PRIVATE_LDS.get() {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_LDS_PRIVATE").is_some_and(|value| value == "1"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never

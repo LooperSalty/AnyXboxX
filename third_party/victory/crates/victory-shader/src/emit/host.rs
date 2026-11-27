@@ -742,6 +742,15 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root SRV over a default-heap (VRAM) buffer of these dwords
+    /// ([`Host::dispatch`] only).
+    DeviceSrv(Vec<u32>),
+    /// A zeroed raw root UAV of this many dwords, returned after heap UAVs
+    /// ([`Host::dispatch`] only).
+    Uav(u32),
+    /// A zeroed raw root UAV in host-visible L0 system RAM (matching
+    /// `victory-gpu`'s `SLOT_FAULTS` `shared_buffer`), returned after heap UAVs.
+    SharedUav(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -979,7 +988,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::DeviceSrv(_) | Root::Uav(_) | Root::SharedUav(_) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1110,6 +1121,12 @@ pub enum View<'a> {
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV in VRAM pre-filled with `data` (not read back).
+    RawUavData(&'a [u32]),
+    /// A raw buffer SRV in VRAM pre-filled with `data`.
+    DeviceRawSrv(&'a [u32]),
+    /// A null raw buffer UAV descriptor (reads zeros, drops writes).
+    NullRawUav,
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1126,8 +1143,6 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
-    /// A raw buffer SRV in VRAM pre-filled with `data`.
-    DeviceRawSrv(&'a [u32]),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1156,7 +1171,7 @@ pub struct Dispatch<'a> {
 #[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
-    /// order (texels as float bits, row by row).
+    /// order (texels as float bits, row by row), followed by any root UAVs.
     pub fn dispatch(
         &self,
         root: &ID3D12RootSignature,
@@ -1424,6 +1439,82 @@ impl Host {
                         )?;
                         uavs.push((b, None, n, rb));
                     }
+                    View::RawUavData(data) => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: n,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        keep.push(b);
+                    }
+                    View::DeviceRawSrv(data) => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    FirstElement: 0,
+                                    NumElements: n,
+                                    StructureByteStride: 0,
+                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        keep.push(b);
+                    }
+                    View::NullRawUav => {
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: 0,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(None, None, Some(&desc), at);
+                    }
                     View::TypedUav {
                         data,
                         format,
@@ -1554,38 +1645,6 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
-                    View::DeviceRawSrv(data) => {
-                        let n = data.len() as u32;
-                        let bytes = u64::from(n) * 4;
-                        let b = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        let up = upload(data)?;
-                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
-                        list.ResourceBarrier(&[transition(
-                            &b,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        )]);
-                        keep.push(up);
-                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32_TYPELESS,
-                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_SRV {
-                                    FirstElement: 0,
-                                    NumElements: n,
-                                    StructureByteStride: 0,
-                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                                },
-                            },
-                        };
-                        dev.CreateShaderResourceView(&b, Some(&desc), at);
-                        keep.push(b);
-                    }
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -1622,6 +1681,78 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::DeviceSrv(data) => {
+                        let bytes = (data.len() * 4).max(4) as u64;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        list.SetComputeRootShaderResourceView(*param, b.GetGPUVirtualAddress());
+                        keep.push(up);
+                        keep.push(b);
+                    }
+                    Root::Uav(n) => {
+                        let bytes = u64::from(*n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let zeros = vec![0u32; *n as usize];
+                        let up = upload(&zeros)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        keep.push(up);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, *n, rb));
+                    }
+                    Root::SharedUav(n) => {
+                        let bytes = u64::from(*n) * 4;
+                        let mut b: Option<ID3D12Resource> = None;
+                        dev.CreateCommittedResource(
+                            &D3D12_HEAP_PROPERTIES {
+                                Type: D3D12_HEAP_TYPE_CUSTOM,
+                                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                                ..Default::default()
+                            },
+                            D3D12_HEAP_FLAG_NONE,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut b,
+                        )
+                        .map_err(err)?;
+                        let b = b.ok_or_else(|| "no shared uav".to_string())?;
+                        let mut p = std::ptr::null_mut();
+                        b.Map(0, None, Some(&mut p)).map_err(err)?;
+                        std::ptr::write_bytes(p.cast::<u8>(), 0, bytes as usize);
+                        b.Unmap(0, None);
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, *n, rb));
                     }
                 }
             }
