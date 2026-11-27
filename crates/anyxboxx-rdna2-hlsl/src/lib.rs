@@ -6,6 +6,7 @@ mod buffer_memory;
 mod control_flow;
 mod flat_atomic;
 mod flat_memory;
+pub mod graphics;
 mod half;
 mod half_templates;
 mod image;
@@ -62,7 +63,18 @@ pub fn translate_wave(data: &[u8], lanes: usize) -> Result<String, String> {
         return Err("truncated instruction".into());
     }
     let mut output = [header, PRELUDE, init].concat();
-    control_flow::emit(data, &decode(data), lanes, &mut output)?;
+    control_flow::emit(
+        data,
+        &decode(data),
+        lanes,
+        "return;",
+        &mut output,
+        if lanes == 64 {
+            wave64::statements
+        } else {
+            statements
+        },
+    )?;
     output.push_str("}\n");
     Ok(output)
 }

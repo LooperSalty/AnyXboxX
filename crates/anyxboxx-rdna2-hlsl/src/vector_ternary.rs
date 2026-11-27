@@ -72,6 +72,8 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
                 | "v_mad_u32_u24"
                 | "v_mad_i32_i24"
                 | "v_bcnt_u32_b32"
+                | "v_mbcnt_lo_u32_b32"
+                | "v_mbcnt_hi_u32_b32"
         ) || f.clamp)
     {
         return Err(format!("untranslated instruction: {name}"));
@@ -134,6 +136,8 @@ pub fn statement(name: &str, word: u64, literal: Option<u32>) -> Result<String, 
             format!("asuint(((asint({a}) << 8) >> 8) * ((asint({b}) << 8) >> 8) + asint({c}))")
         }
         "v_bcnt_u32_b32" => format!("(countbits({a}) + {b})"),
+        "v_mbcnt_lo_u32_b32" => format!("(countbits({a} & ((1u << lane) - 1u)) + {b})"),
+        "v_mbcnt_hi_u32_b32" => b,
         _ => unreachable!(),
     };
     if is_float && (f.clamp || f.omod != 0) {

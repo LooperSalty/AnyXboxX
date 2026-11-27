@@ -116,6 +116,8 @@ En wave32, le générateur Rust couvre aussi les 40 encodages entiers 16 bits VO
 
 Le calcul wave64 réutilise les fonctions ALU du wave32 et produit un groupe de 64 threads. WARP vérifie les votes, les masques de retenue, les lectures de ligne, les branches sur les deux mots EXEC, le comptage des lignes et la permutation arrière DS. D’autres formes propres au wave64 restent à porter.
 
+Le générateur graphique Rust traduit les étages de sommets et de pixels, EXP et les trois opérations VINTRP. Les tests de dessin comparent sous WARP les exports de sommets et de pixels, l’interpolation, les masques de canaux et les cibles de rendu multiples à l’interpréteur.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 La CLI Rust affiche le HLSL des instructions portées avec `anyxboxx rdna2 FICHIER --hlsl`. Les deux CLI signalent le retrait de `--spirv` avec le code de sortie 2.

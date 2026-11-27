@@ -25,7 +25,9 @@ pub fn emit(
     data: &[u8],
     instructions: &[Instruction],
     lanes: usize,
+    finish: &str,
     output: &mut String,
+    statements: impl Fn(&str, &Instruction, &[u8]) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     let mut leaders = BTreeSet::from([0]);
     let mut blocks = Vec::with_capacity(instructions.len());
@@ -79,10 +81,10 @@ pub fn emit(
             )
             .unwrap();
         } else {
-            let lines = if lanes == 64 {
-                super::wave64::statements(name, inst, bytes)?
+            let lines = if name == "s_endpgm" {
+                vec![finish.to_owned()]
             } else {
-                super::statements(name, inst, bytes)?
+                statements(name, inst, bytes)?
             };
             for line in lines {
                 writeln!(output, "{indent}{line}").unwrap();
@@ -94,7 +96,7 @@ pub fn emit(
         }
     }
     if has_flow {
-        output.push_str("    }\n    return;\n  }\n");
+        writeln!(output, "    }}\n    {finish}\n  }}").unwrap();
     }
     Ok(())
 }
