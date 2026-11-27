@@ -1819,7 +1819,7 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        match crate::list::thin::timing::Part::Heap.measure(|| self.heap_buffers(list)) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -3968,7 +3968,7 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = crate::list::thin::timing::Part::Table.measure(|| host.make_listed(recording, words, index))
                 {
                     let kind = group
                         .entry(k)
@@ -4829,6 +4829,10 @@ impl RecordHash {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    crate::list::thin::timing::Part::Readable.measure(|| readable_untimed(list, kind, view));
+}
+
+fn readable_untimed(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);

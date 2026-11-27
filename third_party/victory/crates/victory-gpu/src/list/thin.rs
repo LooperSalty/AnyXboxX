@@ -40,6 +40,8 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
 
+pub(crate) mod timing;
+
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
 pub(crate) fn on() -> bool {
@@ -371,6 +373,7 @@ pub(crate) fn line(frames: f64) {
     }
     static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
     let s = crate::framebook::for_line(&STATS, &LAST).map(|n| n as f64 / frames);
+    timing::line(frames);
     // The overlay: the work of all threads over the frame's time.
     crate::overlay::set_pool(crate::overlay::Pool::Thin, s[1] / 1000.0, crate::overlay::frame_ms(), THREADS.load(Relaxed));
     tracing::info!(
@@ -705,6 +708,14 @@ extern "system" fn copy_texture_region_x(
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+    if timing::on() {
+        timing::stream(|| translate_stream::<true>(list, stream, left))
+    } else {
+        translate_stream::<false>(list, stream, left)
+    }
+}
+
+fn translate_stream<const TIMED: bool>(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
     while i < stream.len() {
@@ -715,15 +726,16 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if calls % 64 == 0 {
             skip = left();
         }
+        if skip && !matches!(op, CLOSE | RESET | UPLOAD) {
+            continue;
+        }
+        let _call = TIMED.then(|| timing::call(op));
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
-            continue;
-        }
-        if skip && op != CLOSE && op != RESET {
             continue;
         }
         if run_plain(op, list, w) {
