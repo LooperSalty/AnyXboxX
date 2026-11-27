@@ -1126,6 +1126,8 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A raw buffer SRV in VRAM pre-filled with `data`.
+    DeviceRawSrv(&'a [u32]),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1161,6 +1163,31 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_inner(root, pso, d, 0, 1).map(|(out, _)| out)
+    }
+
+    /// Runs `warmup` untimed dispatches followed by `iters` GPU-timestamped
+    /// dispatches of the same compute pipeline, returning the final UAV
+    /// readbacks and per-dispatch GPU durations in milliseconds.
+    pub fn dispatch_timed(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        warmup: u32,
+        iters: u32,
+    ) -> Result<(Vec<Vec<u32>>, Vec<f64>), String> {
+        self.dispatch_inner(root, pso, d, warmup, iters)
+    }
+
+    fn dispatch_inner(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        warmup: u32,
+        iters: u32,
+    ) -> Result<(Vec<Vec<u32>>, Vec<f64>), String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1527,6 +1554,38 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
+                    View::DeviceRawSrv(data) => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    FirstElement: 0,
+                                    NumElements: n,
+                                    StructureByteStride: 0,
+                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        keep.push(b);
+                    }
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -1567,7 +1626,63 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            let timed = warmup > 0 || iters > 1;
+            let (query_heap, query_rb) = if timed {
+                let mut qh: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: iters * 2,
+                        NodeMask: 0,
+                    },
+                    &mut qh,
+                )
+                .map_err(err)?;
+                let qh = qh.ok_or_else(|| "no query heap".to_string())?;
+                let qrb = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(u64::from(iters) * 16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                (Some(qh), Some(qrb))
+            } else {
+                (None, None)
+            };
+            let uav_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            for _ in 0..warmup {
+                list.Dispatch(x, y, z);
+                list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+            }
+            for it in 0..iters {
+                if let Some(qh) = &query_heap {
+                    list.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, it * 2);
+                }
+                list.Dispatch(x, y, z);
+                if let Some(qh) = &query_heap {
+                    list.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, it * 2 + 1);
+                }
+                if it + 1 < iters {
+                    list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+                }
+            }
+            if let (Some(qh), Some(qrb)) = (&query_heap, &query_rb) {
+                list.ResolveQueryData(
+                    qh,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    0,
+                    iters * 2,
+                    qrb,
+                    0,
+                );
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1597,6 +1712,18 @@ impl Host {
                 }
                 std::thread::yield_now();
             }
+            let mut times_ms = Vec::new();
+            if let Some(qrb) = &query_rb {
+                let freq = queue.GetTimestampFrequency().map_err(err)? as f64;
+                let mut p = std::ptr::null_mut();
+                qrb.Map(0, None, Some(&mut p)).map_err(err)?;
+                let stamps = std::slice::from_raw_parts(p.cast::<u64>(), (iters * 2) as usize);
+                for it in 0..iters as usize {
+                    let dt = stamps[it * 2 + 1].saturating_sub(stamps[it * 2]) as f64;
+                    times_ms.push(dt * 1000.0 / freq);
+                }
+                qrb.Unmap(0, None);
+            }
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
@@ -1621,7 +1748,7 @@ impl Host {
                 out.push(words);
             }
             drop(keep);
-            Ok(out)
+            Ok((out, times_ms))
         }
     }
 }
