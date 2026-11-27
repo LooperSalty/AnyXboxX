@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +17,14 @@ use crate::host::host;
 
 /// Distinguishes host heaps even when a title heap address is reused.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Move an owned reference or acquire a borrowed one only when the identity changes.
+fn replace_kept<T: Clone, Id: Eq>(slot: &mut Option<T>, view: Option<Cow<'_, T>>, id: fn(&T) -> Id) -> Option<T> {
+    if slot.as_ref().map(id) == view.as_deref().map(id) {
+        return None;
+    }
+    std::mem::replace(slot, view.map(Cow::into_owned))
+}
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -3127,7 +3136,11 @@ impl HostHeap {
             if views.recording != recording {
                 views.recording = recording;
                 views.made.clear();
+                for (total, count) in LISTED_COUNTS.iter().zip(&mut views.counts) {
+                    total.fetch_add(std::mem::take(count), Ordering::Relaxed);
+                }
             }
+            views.counts[0] += 1;
             let twins = self.twins.get(index as usize).is_some();
             if !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
@@ -3138,6 +3151,7 @@ impl HostHeap {
                 }
                 let twin = twinned(&view);
                 let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                views.counts[1] += 1;
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -3156,7 +3170,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_view(index, made.kept.as_ref().map(Cow::Borrowed));
             Some(made.listed)
         })
     }
@@ -3215,17 +3229,18 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_view(index, resource.map(Cow::Owned));
+    }
+
+    /// A cached view borrows its resource until a different slot needs a reference.
+    fn keep_view(&self, index: u32, resource: Option<Cow<'_, ID3D12Resource>>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
+            replace_kept(&mut slot, resource, Interface::as_raw)
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3268,7 +3283,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_view(index, Some(Cow::Borrowed(buffer)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3313,7 +3328,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_view(index, Some(Cow::Borrowed(buffer)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3403,7 +3418,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_view(index, holds.then_some(Cow::Borrowed(buffer)));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3454,7 +3469,7 @@ impl HostHeap {
         // A constant buffer, as every other writer of a slot says: a slot
         // reused from a structured or typed view must not keep its word.
         self.write_stride(index, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_view(index, Some(Cow::Borrowed(buffer)));
         true
     }
 
@@ -6490,6 +6505,14 @@ struct ListViews {
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    // Flushed when this thread begins its next recording.
+    counts: [u64; 2],
+}
+
+static LISTED_COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn take_listed_counts() -> [u64; 2] {
+    std::array::from_fn(|i| LISTED_COUNTS[i].swap(0, Ordering::Relaxed))
 }
 
 impl ListViews {
@@ -6509,7 +6532,7 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews { recording: 0, heap, step, start, made: Default::default(), counts: [0; 2] })
         }
     }
 
@@ -6642,6 +6665,28 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+
+    #[test]
+    fn rebuilding_a_slot_only_acquires_a_changed_resource() {
+        struct Resource<'a>(u32, &'a std::cell::Cell<u32>);
+        impl Clone for Resource<'_> {
+            fn clone(&self) -> Self {
+                self.1.set(self.1.get() + 1);
+                Self(self.0, self.1)
+            }
+        }
+        let acquired = std::cell::Cell::new(0);
+        let first = Resource(1, &acquired);
+        let mut slot = None;
+        let id = |r: &Resource<'_>| r.0;
+        assert!(replace_kept(&mut slot, Some(Cow::Borrowed(&first)), id).is_none());
+        assert!(replace_kept(&mut slot, Some(Cow::Borrowed(&first)), id).is_none());
+        assert_eq!(acquired.get(), 1);
+        let next = Resource(2, &acquired);
+        assert_eq!(replace_kept(&mut slot, Some(Cow::Owned(next)), id).map(|r| r.0), Some(1));
+        assert_eq!(replace_kept(&mut slot, None, id).map(|r| r.0), Some(2));
+        assert_eq!(acquired.get(), 1);
     }
 
     #[test]
