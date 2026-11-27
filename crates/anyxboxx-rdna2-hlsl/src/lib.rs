@@ -30,6 +30,7 @@ mod vector_dot;
 mod vector_movrel;
 mod vector_ternary;
 mod vector_unary;
+mod wave64;
 
 const PRELUDE: &str = concat!(
     include_str!("prelude0.hlsl"),
@@ -41,11 +42,27 @@ const PRELUDE: &str = concat!(
 
 /// Translate a wave32 compute program, rejecting unsupported instructions by name.
 pub fn translate(data: &[u8]) -> Result<String, String> {
+    translate_wave(data, 32)
+}
+
+/// Compile a virtual wave of 32 or 64 lanes into one D3D12 thread group.
+pub fn translate_wave(data: &[u8], lanes: usize) -> Result<String, String> {
+    let (header, init) = match lanes {
+        32 => (
+            include_str!("wave32_head.hlsl"),
+            include_str!("wave32_init.hlsl"),
+        ),
+        64 => (
+            include_str!("wave64_head.hlsl"),
+            include_str!("wave64_init.hlsl"),
+        ),
+        _ => return Err(format!("unsupported wave size: {lanes}")),
+    };
     if !data.len().is_multiple_of(4) {
         return Err("truncated instruction".into());
     }
-    let mut output = String::from(PRELUDE);
-    control_flow::emit(data, &decode(data), &mut output)?;
+    let mut output = [header, PRELUDE, init].concat();
+    control_flow::emit(data, &decode(data), lanes, &mut output)?;
     output.push_str("}\n");
     Ok(output)
 }

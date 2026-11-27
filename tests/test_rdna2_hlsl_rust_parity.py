@@ -13,12 +13,12 @@ TARGET = ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
 BINARY = TARGET / "release" / ("anyxboxx-rdna2-hlsl.exe" if os.name == "nt" else "anyxboxx-rdna2-hlsl")
 
 
-def rust(data):
+def rust(data, *args):
     if not BINARY.is_file():
         if os.environ.get("ANYXBOXX_REQUIRE_RUNTIME") == "1":
             pytest.fail("build anyxboxx-rdna2-hlsl in release mode")
         pytest.skip("Rust HLSL recompiler is not built")
-    return subprocess.run([str(BINARY)], input=data, capture_output=True, check=False)
+    return subprocess.run([str(BINARY), *args], input=data, capture_output=True, check=False)
 
 
 @pytest.mark.parametrize("data", [program(), program(sopp("s_nop")), program(sopp("s_nop", 7))])

@@ -4,11 +4,15 @@ use std::{collections::BTreeSet, fmt::Write};
 
 use anyxboxx_rdna2_ref::decode::{Instruction, mnemonic};
 
-fn condition(name: &str) -> Option<&'static str> {
+fn condition(name: &str, lanes: usize) -> Option<&'static str> {
     Some(match name {
         "s_branch" => "true",
         "s_cbranch_scc0" => "!scc",
         "s_cbranch_scc1" => "scc",
+        "s_cbranch_vccz" if lanes == 64 => "(s[106] | s[107]) == 0u",
+        "s_cbranch_vccnz" if lanes == 64 => "(s[106] | s[107]) != 0u",
+        "s_cbranch_execz" if lanes == 64 => "(s[126] | s[127]) == 0u",
+        "s_cbranch_execnz" if lanes == 64 => "(s[126] | s[127]) != 0u",
         "s_cbranch_vccz" => "s[106] == 0",
         "s_cbranch_vccnz" => "s[106] != 0",
         "s_cbranch_execz" => "s[126] == 0",
@@ -17,7 +21,12 @@ fn condition(name: &str) -> Option<&'static str> {
     })
 }
 
-pub fn emit(data: &[u8], instructions: &[Instruction], output: &mut String) -> Result<(), String> {
+pub fn emit(
+    data: &[u8],
+    instructions: &[Instruction],
+    lanes: usize,
+    output: &mut String,
+) -> Result<(), String> {
     let mut leaders = BTreeSet::from([0]);
     let mut blocks = Vec::with_capacity(instructions.len());
     for inst in instructions {
@@ -29,7 +38,7 @@ pub fn emit(data: &[u8], instructions: &[Instruction], output: &mut String) -> R
         })?;
         let end = inst.offset + inst.size * 4;
         let bytes = &data[inst.offset..end];
-        let branch = if let Some(test) = condition(name) {
+        let branch = if let Some(test) = condition(name, lanes) {
             let displacement = i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64;
             let target = end as i64 + 4 * displacement;
             if target < 0
@@ -70,7 +79,12 @@ pub fn emit(data: &[u8], instructions: &[Instruction], output: &mut String) -> R
             )
             .unwrap();
         } else {
-            for line in super::statements(name, inst, bytes)? {
+            let lines = if lanes == 64 {
+                super::wave64::statements(name, inst, bytes)?
+            } else {
+                super::statements(name, inst, bytes)?
+            };
+            for line in lines {
                 writeln!(output, "{indent}{line}").unwrap();
             }
         }
