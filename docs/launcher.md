@@ -1,6 +1,6 @@
 # Graphical launcher: install and use
 
-French version: [fr/lanceur.md](fr/lanceur.md). Branch: `rust/full` (not yet in `main`). Code: `crates/anyxboxx-launcher`.
+French version: [fr/lanceur.md](fr/lanceur.md). In `main`. Code: `crates/anyxboxx-launcher`.
 
 `anyxboxx-launcher.exe` is a window that checks your machine, verifies your game folder, builds VIctory, warms the shader cache and starts the game with the measured settings of `anyxboxx run` (the same set as `main`'s `tools\lancer_victory.ps1`). It does not contain or download any game file, and it never writes into the game folder.
 
@@ -16,9 +16,8 @@ French version: [fr/lanceur.md](fr/lanceur.md). Branch: `rust/full` (not yet in 
 ### 1. Get the code
 
 ```powershell
-git clone --branch rust/full https://github.com/LooperSalty/AnyXboxX.git
+git clone https://github.com/LooperSalty/AnyXboxX.git
 cd AnyXboxX
-git submodule update --init
 ```
 
 VIctory is included in `third_party/victory`: there is nothing else to download.
@@ -46,9 +45,10 @@ The first run after a new build or a new setting recompiles hundreds of pipeline
 
 - Resolution and window mode (windowed or borderless).
 - Keyboard layout: automatic, QWERTY, AZERTY or QWERTZ (`VICTORY_KEYBOARD`).
-- Fast (default, measured set) or Quality (better lighting and textures, lower frame rate).
+- Fast (default, measured set), Quality (better lighting and textures, lower frame rate), 12 GB card or 8 GB card. The Fast profile's reserves on the card (1536 MB of draw-data windows and of buffer copies) were sized on 12 to 16 GB cards; on an RTX 5060 8 GB it stood at 8,010 MB in use against a 6,823 MB budget, Windows moved the rest into the PC's memory and the texture queue was refused. The two card presets cut those reserves (1024 MB, or 512 MB with a 256 MB list pool) and cap the title's textures with `VICTORY_TEXTURE_MAX_SIZE` (2048, or 1024 texels): the levels of a texture over the cap get no memory on the card and its views start at the first level within it, so every texture fits, slightly less sharp up close. The 12 GB preset is not measured on a 12 GB card yet.
 - Frame rate counter, automatic A press through the start screens, frame time CSV in the cache folder.
 - Advanced panel: overrides of single `VICTORY_*` variables; they always win over the profile.
+- NVIDIA Smooth Motion (RTX 40 and 50 series): the driver's own frame generation, which inserts a generated picture between two of the game's. Twice the pictures shown; responsiveness stays that of the game's own frames. It is not a VIctory variable: at each PLAY the launcher writes it into the NVIDIA driver profile that holds `victory.exe` (made if none does), through NVAPI with the setting ids NVIDIA Profile Inspector uses (`0xB0D384C0` enable, `0xB0CC0875` allowed APIs: Direct3D 12). No other driver setting is touched, and no administrator rights are needed.
 
 Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profiles.toml`). Only the Windows + NVIDIA set is measured; the others are VIctory's defaults.
 
@@ -61,6 +61,7 @@ Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profile
 | `%LOCALAPPDATA%\AnyXboxX\launcher\splash\` | Optional: your own PNG or JPEG pictures, shown as a slideshow. Nothing is shipped there. |
 | `%LOCALAPPDATA%\victory\data\` | VIctory's saves, data and `crashes.log` |
 | `third_party\victory\target\release\` | The VIctory build |
+| NVIDIA driver settings | With Smooth Motion switched on or off: the Smooth Motion settings of the profile holding `victory.exe` (`AnyXboxX (victory.exe)` when the launcher makes it) |
 
 ## Troubleshooting
 

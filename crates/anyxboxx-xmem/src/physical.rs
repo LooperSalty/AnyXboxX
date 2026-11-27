@@ -69,6 +69,13 @@ fn all_live(frames: &Frames, numbers: &[usize]) -> bool {
     numbers.iter().all(|number| frames.live.contains(number))
 }
 
+fn all_live_and_unique(frames: &Frames, numbers: &[usize]) -> bool {
+    let mut seen = HashSet::with_capacity(numbers.len());
+    numbers
+        .iter()
+        .all(|number| frames.live.contains(number) && seen.insert(*number))
+}
+
 /// # Safety
 /// `count` and `frames` as in [`request`].
 unsafe fn map_frames(address: *mut c_void, count: usize, frames: *const usize) -> *mut c_void {
@@ -134,7 +141,7 @@ pub unsafe extern "system" fn XMemFreePhysicalPages(count: usize, frames: *const
         return 0;
     };
     let freed = with_frames(|table| {
-        let live = all_live(table, numbers);
+        let live = all_live_and_unique(table, numbers);
         if live {
             numbers.iter().for_each(|number| {
                 table.live.remove(number);
@@ -185,4 +192,33 @@ pub extern "system" fn XMemTransferMemory() -> BOOL {
     log!("[xmem] XMemTransferMemory not implemented");
     set_error(ERROR_NOT_SUPPORTED);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::GetLastError;
+
+    #[test]
+    fn free_physical_pages_refuses_duplicate_frame_numbers_atomically() {
+        let mut count = 1usize;
+        let mut frame = [0usize; 1];
+        // SAFETY: valid single-element output buffer.
+        assert_eq!(
+            unsafe { XMemAllocatePhysicalPages(0x280, &mut count, frame.as_mut_ptr()) },
+            1
+        );
+        let duplicate = [frame[0], frame[0]];
+        set_error(0);
+        // SAFETY: valid 2-element slice with duplicate frame number.
+        assert_eq!(
+            unsafe { XMemFreePhysicalPages(duplicate.len(), duplicate.as_ptr()) },
+            0
+        );
+        // SAFETY: plain thread-local state.
+        assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
+        // The frame must still be live after the refused duplicate free.
+        // SAFETY: valid single-element slice.
+        assert_eq!(unsafe { XMemFreePhysicalPages(1, frame.as_ptr()) }, 1);
+    }
 }

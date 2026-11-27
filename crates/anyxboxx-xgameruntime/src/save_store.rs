@@ -252,7 +252,7 @@ pub fn used_bytes(folder: &Path) -> u64 {
 pub fn check_update(used: u64, written: u64) -> Result<(), HResult> {
     if written > MAX_BLOB_BYTES as u64 {
         Err(E_GS_UPDATE_TOO_BIG)
-    } else if used + written > QUOTA_BYTES {
+    } else if used.saturating_add(written) > QUOTA_BYTES {
         Err(E_GS_QUOTA_EXCEEDED)
     } else {
         Ok(())
@@ -267,7 +267,10 @@ pub fn apply_update(
     display_name: &[u8],
     operations: &[UpdateOperation],
 ) -> HResult {
-    let written: u64 = operations.iter().map(|op| op.data.len() as u64).sum();
+    let written: u64 = operations
+        .iter()
+        .filter(|op| !op.erase)
+        .fold(0u64, |acc, op| acc.saturating_add(op.data.len() as u64));
     if let Err(error) = check_update(used_bytes(provider), written) {
         return error;
     }
@@ -418,6 +421,20 @@ mod tests {
     fn the_quota_counts_what_is_already_used() {
         assert_eq!(check_update(QUOTA_BYTES - 10, 10), Ok(()));
         assert_eq!(check_update(QUOTA_BYTES - 10, 11), Err(E_GS_QUOTA_EXCEEDED));
+        assert_eq!(check_update(u64::MAX, 1), Err(E_GS_QUOTA_EXCEEDED));
+    }
+
+    #[test]
+    fn erase_operations_do_not_count_towards_written_bytes() {
+        let dir = TempDir::new("erase-size");
+        let provider = dir.0.join("provider");
+        let container = container_folder(&provider, b"slot");
+        let erase = UpdateOperation {
+            blob: b"old".to_vec(),
+            erase: true,
+            data: vec![0u8; MAX_BLOB_BYTES + 1],
+        };
+        assert_eq!(apply_update(&provider, &container, b"Slot", &[erase]), S_OK);
     }
 
     #[test]

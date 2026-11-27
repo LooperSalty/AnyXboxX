@@ -160,8 +160,9 @@ fn check_load_selects(format: &Format, word3: u32, count: usize) -> Result<(), E
 }
 
 /// MUBUF stores: DST_SEL must name X, Y, Z, W in order for the components of the format, with DST_SEL_Z
-/// constant (0 or 1) for a two-component format (Leonida measured on gfx1036 that DST_SEL_Z = Z or W
-/// changes the components written there).
+/// constant (0 or 1) for a two-component format. The ISA (section 8.1.4, table 31, p. 59) only says that
+/// BUFFER_STORE_FORMAT_* takes DST_SEL from the V#; what DST_SEL_Z = Z or W does to a two-component
+/// store is not documented, so those V# are refused.
 fn store_selects_ok(format: &Format, word3: u32) -> bool {
     let found = selects(word3);
     if (0..format.count()).any(|i| found[i] != SELECT_X + i as u32) {

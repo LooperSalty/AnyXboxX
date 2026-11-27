@@ -76,6 +76,7 @@ impl Settings {
 pub fn make_plan(
     settings: &Settings,
     repo: &Path,
+    victory_exe: Option<&Path>,
     profile: &Profile,
 ) -> Result<Plan, SessionError> {
     let game_dir = settings.game_path().ok_or(SessionError::NoGameFolder)?;
@@ -87,13 +88,18 @@ pub fn make_plan(
         mode: settings.xg_mode,
     });
     let env = env::build_env(&game_dir, profile, &overrides, xg.as_ref())?;
-    let warm = Victory::locate(repo, false).ok().and_then(|victory| {
+    let victory = match victory_exe {
+        Some(exe) => Victory::prebuilt(exe),
+        None => Victory::locate(repo, false),
+    };
+    let warm = victory.ok().and_then(|victory| {
         let marker = warm_state::marker_path(std::env::var_os("LOCALAPPDATA").as_deref());
         crate::launch::warm_check(
             &victory.exe,
             &env,
             &game_dir,
             settings.always_rewarm,
+            settings.options.warm_first,
             marker,
         )
     });
@@ -101,6 +107,7 @@ pub fn make_plan(
         .map(|dir| detached::game_log_path(&dir, unix_now()));
     Ok(Plan {
         repo: repo.to_path_buf(),
+        victory_exe: victory_exe.map(Path::to_path_buf),
         game_dir,
         env,
         jobs: settings.jobs_limit(),
@@ -159,7 +166,7 @@ mod tests {
     fn plan_needs_a_game_folder() {
         let settings = Settings::default();
         assert!(matches!(
-            make_plan(&settings, Path::new("."), &profile()),
+            make_plan(&settings, Path::new("."), None, &profile()),
             Err(SessionError::NoGameFolder)
         ));
     }
@@ -172,7 +179,7 @@ mod tests {
             jobs: 6,
             ..Settings::default()
         };
-        let plan = make_plan(&settings, Path::new("repo"), &profile()).expect("plan");
+        let plan = make_plan(&settings, Path::new("repo"), None, &profile()).expect("plan");
         assert_eq!(plan.jobs, Some(6));
         assert_eq!(plan.game_dir, dir.path());
         assert!(plan.env.iter().any(|(k, _)| k == "VICTORY_CARD_WINDOWS_MB"));
@@ -195,7 +202,7 @@ mod tests {
             overrides: "VICTORY_SHADER_OPT=12".to_string(),
             ..Settings::default()
         };
-        let plan = make_plan(&settings, Path::new("repo"), &profile()).expect("plan");
+        let plan = make_plan(&settings, Path::new("repo"), None, &profile()).expect("plan");
         let value = plan
             .env
             .iter()
@@ -213,7 +220,7 @@ mod tests {
             ..Settings::default()
         };
         assert!(matches!(
-            make_plan(&settings, Path::new("repo"), &profile()),
+            make_plan(&settings, Path::new("repo"), None, &profile()),
             Err(SessionError::Env(EnvError::Key(1, _)))
         ));
     }
@@ -226,7 +233,26 @@ mod tests {
             xg_dll: "Z:/nowhere/xg_xs.dll".to_string(),
             ..Settings::default()
         };
-        assert!(make_plan(&settings, Path::new("repo"), &profile()).is_err());
+        assert!(make_plan(&settings, Path::new("repo"), None, &profile()).is_err());
+    }
+
+    #[test]
+    fn plan_with_prebuilt_victory_exe_computes_warm_state_without_repo() {
+        let dir = game_folder();
+        std::fs::write(dir.path().join("shaders.rpf"), b"rpf").expect("write");
+        let prebuilt_dir = tempfile::tempdir().expect("tempdir");
+        let exe = prebuilt_dir.path().join("victory.exe");
+        std::fs::write(&exe, b"MZ").expect("write");
+        let settings = Settings {
+            game_dir: dir.path().display().to_string(),
+            ..Settings::default()
+        };
+        let plan = make_plan(&settings, Path::new(""), Some(&exe), &profile()).expect("plan");
+        assert_eq!(plan.victory_exe.as_deref(), Some(exe.as_path()));
+        assert!(
+            plan.warm.is_some(),
+            "warm check should fingerprint the prebuilt victory.exe"
+        );
     }
 
     #[test]

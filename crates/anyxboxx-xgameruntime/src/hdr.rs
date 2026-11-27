@@ -25,8 +25,8 @@ const FALLBACK_MAX_FULL_FRAME: f32 = 799.0;
 pub fn normalize(reported: HdrModeInfo) -> HdrModeInfo {
     let min = reported.min_tone_map_luminance;
     let max = reported.max_tone_map_luminance;
-    // NaN fails every comparison, so a NaN value makes the block incoherent or unusable.
-    if min.is_nan() || max.is_nan() || min < 0.0 || max <= min {
+    // Non-finite values (NaN or infinity) make the block incoherent or unusable.
+    if !min.is_finite() || !max.is_finite() || min < 0.0 || max <= min {
         return HdrModeInfo {
             min_tone_map_luminance: FALLBACK_MIN,
             max_tone_map_luminance: FALLBACK_MAX,
@@ -34,7 +34,7 @@ pub fn normalize(reported: HdrModeInfo) -> HdrModeInfo {
         };
     }
     let mut full_frame = reported.max_full_frame_tone_map_luminance;
-    if full_frame.is_nan() || full_frame <= 0.0 {
+    if !full_frame.is_finite() || full_frame <= 0.0 {
         full_frame = FALLBACK_MAX_FULL_FRAME.min(max);
     }
     HdrModeInfo {
@@ -77,6 +77,8 @@ mod tests {
             block(0.05, 0.02, 300.0),
             block(-1.0, 600.0, 400.0),
             block(f32::NAN, 600.0, 400.0),
+            block(0.01, f32::INFINITY, 400.0),
+            block(f32::NEG_INFINITY, 600.0, 400.0),
         ] {
             assert_eq!(normalize(reported), fallback, "{reported:?}");
         }
@@ -95,6 +97,10 @@ mod tests {
         assert_eq!(
             normalize(block(0.01, 400.0, 800.0)),
             block(0.01, 400.0, 400.0)
+        );
+        assert_eq!(
+            normalize(block(0.01, 1000.0, f32::INFINITY)),
+            block(0.01, 1000.0, FALLBACK_MAX_FULL_FRAME)
         );
     }
 

@@ -34,7 +34,7 @@ pub type Tiling = unsafe extern "system" fn(
 ) -> HRESULT;
 
 const SLOT_RELEASE: usize = 1;
-const SLOT_LAYOUT: usize = 2;
+pub const SLOT_LAYOUT: usize = 2;
 pub const SLOT_COPY_INTO: usize = 8;
 pub const SLOT_TILING: usize = 10;
 /// Copies compared at most, so a long session stays playable.
@@ -112,7 +112,7 @@ fn load() -> Option<Oracle> {
         tracing::error!(?path, "xg oracle: exports missing");
         return None;
     };
-    let real = std::env::var("VICTORY_XG_MODE").is_ok_and(|m| m == "real");
+    let real = mode_is_real(std::env::var("VICTORY_XG_MODE").ok().as_deref());
     tracing::info!(?path, real, "xg oracle loaded");
     type Proc = unsafe extern "system" fn() -> isize;
     Some(Oracle {
@@ -133,6 +133,12 @@ fn load() -> Option<Oracle> {
 #[cfg(not(windows))]
 fn load() -> Option<Oracle> {
     None
+}
+
+/// Whether `VICTORY_XG_MODE` asks for the real library to serve the title
+/// (anything but `real`, or no value, keeps the comparison).
+fn mode_is_real(mode: Option<&str>) -> bool {
+    mode == Some("real")
 }
 
 /// Method `index` of a COM object.
@@ -374,6 +380,14 @@ mod tests {
     fn empty() -> Box<LayoutOut> {
         // SAFETY: plain data; zeroes are a valid layout.
         Box::new(unsafe { std::mem::zeroed() })
+    }
+
+    #[test]
+    fn mode_defaults_to_compare() {
+        assert!(!mode_is_real(None));
+        assert!(!mode_is_real(Some("compare")));
+        assert!(!mode_is_real(Some("")));
+        assert!(mode_is_real(Some("real")));
     }
 
     #[test]

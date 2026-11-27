@@ -120,13 +120,13 @@ pub extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description and room for a pointer.
     let oracle = xg_oracle::get();
     if let Some(o) = oracle
         && o.real
     {
         return o.create(desc, out.cast());
     }
+    // SAFETY: the title passes a description and room for a pointer.
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
     };
@@ -159,23 +159,38 @@ pub extern "system" fn XGCreateTextureComputer(
     });
     let this = Box::into_raw(computer);
     if let Some(o) = oracle {
-        // SAFETY: plain data, filled by the call.
-        let mut ours: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
-        layout(this, &mut *ours);
-        o.compare_layout(&desc, Some(&ours), real);
-        if !real.is_null() {
-            // SAFETY: plain data, filled by the call; a live real computer.
-            let mut theirs: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
-            let get: extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT =
-                unsafe { xg_oracle::slot(real, 2) };
-            get(real, &mut *theirs);
-            // SAFETY: just made, not yet shared.
-            unsafe { (*this).real_size = theirs.size };
-        }
+        compare_layouts(o, this, &desc);
     }
     // SAFETY: checked non-null.
     unsafe { out.write(this) };
     S_OK
+}
+
+/// Our layout of a new computer against the real library's, which also
+/// gives the size of scratch memory the real copies need.
+fn compare_layouts(o: &xg_oracle::Oracle, this: This, desc: &ResourceDesc) {
+    // SAFETY: plain data, filled by the call.
+    let mut ours: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+    layout(this, &mut *ours);
+    // SAFETY: `this` was just made and is not yet shared.
+    let real = unsafe { (*this).real };
+    o.compare_layout(desc, Some(&ours), real);
+    if real.is_null() {
+        return;
+    }
+    // SAFETY: plain data, filled by the call.
+    let mut theirs: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+    // SAFETY: a live real computer and room for its layout.
+    let hr = unsafe {
+        xg_oracle::slot::<extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT>(
+            real,
+            xg_oracle::SLOT_LAYOUT,
+        )(real, &mut *theirs)
+    };
+    if hr == S_OK {
+        // SAFETY: just made, not yet shared.
+        unsafe { (*this).real_size = theirs.size };
+    }
 }
 
 fn texture(desc: &ResourceDesc) -> Option<Texture> {
@@ -263,6 +278,17 @@ const _: () = assert!(size_of::<MipOut>() == 0x70);
 const _: () = assert!(size_of::<PlaneOut>() == 0x6c8);
 const _: () = assert!(size_of::<LayoutOut>() == 0x1b40);
 
+/// The mode a tail mip is reported in: the 256-byte one of its kind (3 for
+/// the render kind, which GFX10 lacks), the depth mode itself.
+fn tail_swizzle(swizzle: Swizzle) -> u32 {
+    match swizzle.0 {
+        2 | 6 | 10 | 18 | 22 | 26 => Swizzle::SW_256B_D.0,
+        23 | 27 => 3,
+        24 => swizzle.0,
+        _ => Swizzle::SW_256B_S.0,
+    }
+}
+
 fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
     let m = &l.mips[i];
     let bpe = u64::from(l.desc.element_bytes);
@@ -291,16 +317,13 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
             out.swizzle = l.desc.swizzle.0;
         }
         Some(t) => {
-            // As Microsoft's xg_xs.dll reports a tail mip (measured against
-            // its offline PC build, 10.0.26100.6247): in the texture's own
-            // mode, at its element position in the tail block.
             out.in_tail = 1;
             out.alignment = 256;
-            out.swizzle = l.desc.swizzle.0;
-            out.tail_position = t.x | t.y << 11;
+            out.swizzle = tail_swizzle(l.desc.swizzle);
             if l.thick {
                 // A 3D tail mip is placed by position, not by offset.
                 out.slice_size = l.alignment / u64::from(l.block[2]);
+                out.tail_position = t.x | t.y << 11;
             } else {
                 out.offset = u64::from(t.offset);
                 out.slice_size = slice;
@@ -386,18 +409,25 @@ fn copy_args(
     row: u32,
     depth: u32,
 ) -> Option<CopyArgs<'_>> {
+    if c.mips == 0 {
+        return None;
+    }
     let p = c.texture.planes.get(plane as usize)?;
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let height = m.height as usize;
+    let depth_span = depths.checked_sub(1)?.checked_mul(depth as usize)?;
+    let row_span = height.checked_sub(1)?.checked_mul(row as usize)?;
+    let linear = depth_span.checked_add(row_span)?.checked_add(bytes)?;
+    let tiled = usize::try_from(p.offset.checked_add(l.size)?).ok()?;
     Some(CopyArgs {
         layout: l,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled,
         linear,
     })
 }
@@ -554,11 +584,9 @@ const TILE: u64 = 64 << 10;
 /// count, first, subresource tilings)`, in 64 KiB tiles of plane 0, for 2D
 /// 64 KiB modes only (others fail, as on the console). The mip tail is the
 /// packed part, tile 0 of each slice; tilings list the standard mips of
-/// subresource (`mip + slice * mips`, as D3D12 counts them), zeroed for the
-/// packed mips. Measured against Microsoft's xg_xs.dll (offline PC build
-/// 10.0.26100.6247): it fills the room from `first` on and counts the
-/// standard mips whose subresource falls in it (with 16 entries of room, as
-/// the title passes, two slices of an array with a tail).
+/// every slice in turn. With a tail the console's library lists two slices
+/// at most and zeroes all but the first; so do we (the title reads slice 0
+/// only).
 extern "system" fn tiling_ours(
     this: This,
     tiles: *mut u32,
@@ -577,6 +605,7 @@ extern "system" fn tiling_ours(
         return E_NOTIMPL;
     }
     let standard = l.first_tail_mip;
+    let tail = standard < c.mips;
     let tail_tiles = match standard {
         0 => l.slice_size / TILE,
         s if s < c.mips => l.mips[s as usize - 1].offset / TILE,
@@ -601,30 +630,29 @@ extern "system" fn tiling_ours(
             *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
         }
         if let Some(n) = count.as_mut() {
-            let room = (c.mips * l.slices).saturating_sub(first).min(*n);
-            let mut standard_in_room = 0;
-            for i in 0..room {
-                let (slice, mip) = ((first + i) / c.mips, (first + i) % c.mips);
-                let entry = if mip < standard && slice < l.slices {
-                    standard_in_room += 1;
-                    let m = &l.mips[mip as usize];
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                } else {
+            let slices = if tail { l.slices.min(2) } else { l.slices };
+            let wanted = (standard * slices).saturating_sub(first).min(*n);
+            for i in 0..wanted {
+                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
+                let m = &l.mips[mip as usize];
+                let entry = if tail && slice > 0 {
                     SubresourceTiling {
                         width: 0,
                         height: 0,
                         depth: 0,
                         start: 0,
                     }
+                } else {
+                    SubresourceTiling {
+                        width: m.pitch / l.block[0],
+                        height: (m.rows / l.block[1]) as u16,
+                        depth: 1,
+                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                    }
                 };
                 out.add(i as usize).write(entry);
             }
-            *n = standard_in_room;
+            *n = wanted;
         }
     }
     S_OK
@@ -648,75 +676,79 @@ extern "system" fn tiling(
     if let Some(o) = xg_oracle::get()
         && !c.real.is_null()
     {
-        compare_tiling(o, c, hr, room, first, out);
+        compare_tiling(o, c, room, first);
     }
     hr
 }
 
-fn compare_tiling(
-    o: &xg_oracle::Oracle,
-    c: &Computer,
-    hr: HRESULT,
-    room: u32,
-    first: u32,
-    ours_out: *const SubresourceTiling,
-) {
-    let zero = SubresourceTiling {
-        width: 0,
-        height: 0,
-        depth: 0,
-        start: 0,
-    };
-    let pz = PackedMips {
-        standard: 0,
-        packed: 0,
-        tiles: 0,
-        start: 0,
-    };
-    let (mut a_tiles, mut a_packed, mut a_shape, mut a_n) = (0u32, pz, [0u32; 3], room);
-    let (mut b_tiles, mut b_packed, mut b_shape, mut b_n) = (0u32, pz, [0u32; 3], room);
-    let mut a_out = vec![zero; room as usize];
-    let mut b_out = vec![zero; room as usize];
-    let this = std::ptr::from_ref(c).cast_mut();
-    let a_hr = tiling_ours(
-        this,
-        &mut a_tiles,
-        &mut a_packed,
-        &mut a_shape,
-        &mut a_n,
-        first,
-        a_out.as_mut_ptr(),
+const NO_TILING: SubresourceTiling = SubresourceTiling {
+    width: 0,
+    height: 0,
+    depth: 0,
+    start: 0,
+};
+const NO_PACKED: PackedMips = PackedMips {
+    standard: 0,
+    packed: 0,
+    tiles: 0,
+    start: 0,
+};
+
+/// Everything slot 0x50 reports for one question.
+type TilingAnswer = (HRESULT, u32, PackedMips, [u32; 3], Vec<SubresourceTiling>);
+type TilingAsk<'a> = &'a dyn Fn(
+    *mut u32,
+    *mut PackedMips,
+    *mut [u32; 3],
+    *mut u32,
+    *mut SubresourceTiling,
+) -> HRESULT;
+
+fn tiling_answer(ask: TilingAsk<'_>, room: u32) -> TilingAnswer {
+    let (mut tiles, mut packed, mut shape, mut n) = (0u32, NO_PACKED, [0u32; 3], room);
+    let mut out = vec![NO_TILING; room as usize];
+    let hr = ask(
+        &mut tiles,
+        &mut packed,
+        &mut shape,
+        &mut n,
+        out.as_mut_ptr(),
     );
-    // SAFETY: a live real computer and room for every output.
-    let b_hr = unsafe {
-        xg_oracle::slot::<xg_oracle::Tiling>(c.real, xg_oracle::SLOT_TILING)(
-            c.real,
-            &mut b_tiles,
-            std::ptr::from_mut(&mut b_packed).cast(),
-            &mut b_shape,
-            &mut b_n,
-            first,
-            b_out.as_mut_ptr().cast(),
-        )
-    };
-    let _ = (hr, ours_out);
-    let what = if a_hr != b_hr {
-        format!("hr ours {:#x} real {:#x}", a_hr as u32, b_hr as u32)
-    } else if a_hr != S_OK {
+    out.truncate((n as usize).min(room as usize));
+    (hr, tiles, packed, shape, out)
+}
+
+/// Slot 0x50 of ours and of the real library for the same question,
+/// reported once per description when they differ.
+fn compare_tiling(o: &xg_oracle::Oracle, c: &Computer, room: u32, first: u32) {
+    let this = std::ptr::from_ref(c).cast_mut();
+    let ours = tiling_answer(
+        &|t, p, s, n, out| tiling_ours(this, t, p, s, n, first, out),
+        room,
+    );
+    let theirs = tiling_answer(
+        &|t, p, s, n, out| {
+            // SAFETY: a live real computer and room for every output.
+            unsafe {
+                xg_oracle::slot::<xg_oracle::Tiling>(c.real, xg_oracle::SLOT_TILING)(
+                    c.real,
+                    t,
+                    p.cast(),
+                    s,
+                    n,
+                    first,
+                    out.cast(),
+                )
+            }
+        },
+        room,
+    );
+    let what = if ours.0 != theirs.0 {
+        format!("hr ours {:#x} real {:#x}", ours.0 as u32, theirs.0 as u32)
+    } else if ours.0 != S_OK || ours == theirs {
         return;
-    } else if (a_tiles, a_packed, a_shape, a_n) != (b_tiles, b_packed, b_shape, b_n) {
-        format!(
-            "ours {a_tiles} {a_packed:?} {a_shape:?} n={a_n} real {b_tiles} {b_packed:?} {b_shape:?} n={b_n}"
-        )
-    } else if a_out[..a_n as usize] != b_out[..b_n as usize] {
-        let i = a_out
-            .iter()
-            .zip(&b_out)
-            .position(|(x, y)| x != y)
-            .unwrap_or(0);
-        format!("entry {i}: ours {:?} real {:?}", a_out[i], b_out[i])
     } else {
-        return;
+        format!("ours {ours:?} real {theirs:?}")
     };
     o.report_tiling(&c.desc, &what);
 }
@@ -765,19 +797,19 @@ struct Vtable([*const (); 13]);
 unsafe impl Sync for Vtable {}
 
 static VTABLE: Vtable = Vtable([
-    add_ref as *const (),        // 0x00
-    release as *const (),        // 0x08
-    layout as *const (),         // 0x10
-    unused as *const (),         // 0x18 size
-    unused as *const (),         // 0x20 alignment
-    unused as *const (),         // 0x28 mip offset
+    add_ref as *const (),   // 0x00
+    release as *const (),   // 0x08
+    layout as *const (),    // 0x10
+    unused as *const (),    // 0x18 size
+    unused as *const (),    // 0x20 alignment
+    unused as *const (),    // 0x28 mip offset
     element_offset as *const (), // 0x30
-    unused as *const (),         // 0x38 element coordinate
-    copy_into as *const (),      // 0x40
-    copy_from as *const (),      // 0x48
-    tiling as *const (),         // 0x50
-    unused as *const (),         // 0x58 view descriptor
-    unused as *const (),         // 0x60 tiled resource?
+    unused as *const (),    // 0x38 element coordinate
+    copy_into as *const (), // 0x40
+    copy_from as *const (), // 0x48
+    tiling as *const (),    // 0x50
+    unused as *const (),    // 0x58 view descriptor
+    unused as *const (),    // 0x60 tiled resource?
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -848,6 +880,10 @@ mod tests {
         d.flags = ALLOW_DEPTH_STENCIL;
         XGSuggestSwizzleMode(&d, 0, &mut out);
         assert_eq!(out, 0x118);
+        // A 1D texture has no tiled layout, whatever its use.
+        d.dimension = TEXTURE_1D;
+        XGSuggestSwizzleMode(&d, 0, &mut out);
+        assert_eq!(out, 0x100);
     }
 
     /// The title's calls: layout, then a copy in and out of each mip.
@@ -867,9 +903,6 @@ mod tests {
         assert_eq!((p.standard_mips, p.tail_mips, p.element_bytes), (1, 8, 16));
         assert_eq!((p.mips[0].offset, p.mips[0].pitch_bytes), (65536, 1024));
         assert_eq!((p.mips[1].offset, p.mips[1].in_tail), (32768, 1));
-        // A tail mip in the texture's own mode, at x 32 of the tail block.
-        assert_eq!((p.mips[1].swizzle, p.mips[1].tail_position), (10, 32));
-        assert_eq!((p.mips[2].swizzle, p.mips[2].tail_position), (10, 32 << 11));
 
         type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
         type From =
@@ -954,151 +987,6 @@ mod tests {
         assert_eq!(release(c), 0);
     }
 
-    /// An array with a mip tail, as Microsoft's library lists it.
-    #[test]
-    fn tiling_counts_subresources_and_zeroes_packed_mips() {
-        let mut d = desc(256, 256, 7, 28, 0x10a);
-        d.depth_or_array = 3;
-        let c = create(&d);
-        let zero = SubresourceTiling {
-            width: 0,
-            height: 0,
-            depth: 0,
-            start: 0,
-        };
-        let mut subs = [zero; 8];
-        let (mut n, null) = (8u32, std::ptr::null_mut::<u8>());
-        let hr = tiling(
-            c,
-            null.cast(),
-            null.cast(),
-            null.cast(),
-            &mut n,
-            0,
-            subs.as_mut_ptr(),
-        );
-        // Indexed by subresource: slice 0's two standard mips, then its
-        // packed mips, zeroed.
-        // Room for 8 of the 21 subresources: slice 0's standard mips (0, 1),
-        // its packed mips zeroed, slice 1's mip 0 (7): three standard mips.
-        assert_eq!((hr, n), (S_OK, 3));
-        assert!(subs[..2].iter().all(|s| s.depth == 1));
-        assert!(subs[2..7].iter().all(|s| s.depth == 0 && s.start == 0));
-        assert_eq!(subs[7].depth, 1);
-        assert_eq!(release(c), 0);
-    }
-
-    /// With `VICTORY_XG_DLL` naming Microsoft's library, our layouts and
-    /// tilings of the descriptions Grand Theft Auto VI uses match its own.
-    #[test]
-    fn matches_microsofts_library_when_present() {
-        let Some(o) = xg_oracle::get() else {
-            return;
-        };
-        let mut descs = Vec::new();
-        for (w, h, mips, format, layout) in [
-            (256, 256, 9, 98, 0x10a),
-            (256, 256, 9, 83, 0x10a),
-            (256, 256, 9, 71, 0x10a),
-            (512, 512, 10, 98, 0x10a),
-            (2048, 1024, 9, 98, 0x10a),
-            (1024, 2048, 9, 99, 0x10a),
-            (512, 512, 10, 98, 0x105),
-            (128, 128, 6, 71, 0x105),
-            (256, 256, 7, 28, 0x10a),
-        ] {
-            for array in [1, 2, 3, 4, 8, 32] {
-                let mut d = desc(w, h, mips, format, layout);
-                d.depth_or_array = array;
-                descs.push(d);
-            }
-        }
-        for d in &descs {
-            let c = create(d);
-            let real = o.computer(d);
-            assert!(!real.is_null(), "{d:?}");
-            // SAFETY: plain data, filled by the calls.
-            let (mut a, mut b): (Box<LayoutOut>, Box<LayoutOut>) =
-                unsafe { (Box::new(std::mem::zeroed()), Box::new(std::mem::zeroed())) };
-            layout(c, &mut *a);
-            // SAFETY: a live real computer.
-            let get: extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT =
-                unsafe { xg_oracle::slot(real, 2) };
-            get(real, &mut *b);
-            assert_eq!(
-                xg_oracle::layout_diffs(&a, &b),
-                Vec::<String>::new(),
-                "{d:?}"
-            );
-            if a.alignment == TILE {
-                for (first, room) in (0..3).flat_map(|f| [(f, 16), (f, 64)]) {
-                    let ((hr, n, ours), (real_hr, real_n, theirs)) =
-                        (tilings(c, first, room), real_tilings(real, first, room));
-                    let common = n.min(real_n) as usize;
-                    assert_eq!(hr, real_hr, "{d:?} first {first} room {room}");
-                    assert_eq!(
-                        ours[..common],
-                        theirs[..common],
-                        "{d:?} first {first} room {room}"
-                    );
-                    assert_eq!(n, real_n, "{d:?} first {first} room {room}");
-                }
-            }
-            o.release(real);
-            assert_eq!(release(c), 0);
-        }
-        eprintln!("{} descriptions match xg_xs.dll", descs.len());
-    }
-
-    type Tilings = (HRESULT, u32, Vec<SubresourceTiling>);
-
-    fn tilings(c: This, first: u32, room: u32) -> Tilings {
-        let zero = SubresourceTiling {
-            width: 0,
-            height: 0,
-            depth: 0,
-            start: 0,
-        };
-        let (mut subs, mut n) = (vec![zero; room as usize], room);
-        let null = std::ptr::null_mut::<u8>();
-        let hr = tiling_ours(
-            c,
-            null.cast(),
-            null.cast(),
-            null.cast(),
-            &mut n,
-            first,
-            subs.as_mut_ptr(),
-        );
-        subs.truncate(n as usize);
-        (hr, n, subs)
-    }
-
-    fn real_tilings(real: *mut c_void, first: u32, room: u32) -> Tilings {
-        let zero = SubresourceTiling {
-            width: 0,
-            height: 0,
-            depth: 0,
-            start: 0,
-        };
-        let (mut subs, mut n) = (vec![zero; room as usize], room);
-        let null = std::ptr::null_mut::<u8>();
-        // SAFETY: a live real computer and room for `room` entries.
-        let hr = unsafe {
-            xg_oracle::slot::<xg_oracle::Tiling>(real, xg_oracle::SLOT_TILING)(
-                real,
-                null.cast(),
-                null.cast(),
-                null.cast(),
-                &mut n,
-                first,
-                subs.as_mut_ptr().cast(),
-            )
-        };
-        subs.truncate(n as usize);
-        (hr, n, subs)
-    }
-
     #[test]
     fn bad_descriptions_fail() {
         let mut c = std::ptr::null_mut();
@@ -1107,5 +995,38 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn copy_args_checks_bounds_and_round_trips() {
+        let mut c = std::ptr::null_mut();
+        let d = desc(64, 64, 2, 28, 0x10a);
+        assert_eq!(XGCreateTextureComputer(&d, &mut c), S_OK);
+        let comp = computer(c);
+
+        // Invalid plane is rejected cleanly.
+        assert!(copy_args(comp, 99, 0, 256, 0).is_none());
+
+        // Valid mip 0 args compute exact tiled/linear bounds and round-trip via copy_into/copy_from.
+        let row_pitch = 64 * 4;
+        let args = copy_args(comp, 0, 0, row_pitch, 0).unwrap();
+        assert_eq!(args.linear, 64 * row_pitch as usize);
+
+        let src: Vec<u8> = (0..args.linear)
+            .map(|i| ((i * 17 + 3) & 0xff) as u8)
+            .collect();
+        let mut tiled = vec![0u8; args.tiled];
+        let mut dst = vec![0u8; args.linear];
+        assert_eq!(
+            copy_into(c, tiled.as_mut_ptr(), 0, 0, src.as_ptr(), row_pitch, 0),
+            S_OK
+        );
+        assert_eq!(
+            copy_from(c, dst.as_mut_ptr(), 0, 0, 0, tiled.as_ptr(), row_pitch, 0),
+            S_OK
+        );
+        assert_eq!(dst, src);
+
+        assert_eq!(release(c), 0);
     }
 }

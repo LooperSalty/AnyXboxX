@@ -276,7 +276,7 @@ Variable added to the table above (diagnostic, `diag` build):
 
 ## Install
 
-On the `rust/full` branch, the graphical launcher does the build, the shader warm-up and the launch for you: see [launcher.md](launcher.md). The steps below are for `main` and the command line.
+The graphical launcher does the build, the shader warm-up and the launch for you: see [launcher.md](launcher.md). The steps below are for `main` and the command line.
 
 1. [Git](https://git-scm.com/).
 2. Rust through [rustup](https://rustup.rs/). The exact toolchain is pinned by `third_party/victory/rust-toolchain.toml` and is installed automatically on the first `cargo` command.
@@ -324,6 +324,14 @@ The former defaults `VICTORY_RT_MISS`, `VICTORY_WAVE32_READFIRSTLANE`, `VICTORY_
 These values are unchanged since the 57 Proton and AMD commits: they are the maintainer's Windows settings, not yet measured with those commits. On Linux with RADV, `VICTORY_LATE_WAIT=3` loses the device (fork issue #184); the settings of the measured Linux run are in the Proton and AMD fixes section above.
 
 `VICTORY_HEAP_PASS_DIRTY=1` (the heap pass looks only at the slots marked since its last pass; ported from [reddxd-byte/ShakiraRED-dt](https://github.com/reddxd-byte/ShakiraRED-dt)), `VICTORY_COPY_COALESCE=256` (changed runs up to 256 bytes apart go up as one range), `VICTORY_CARD_WINDOWS_MB=1536` (was 4096: that was sized for a 16 GB card and spilled VRAM into system RAM on a 12 GB card), `VICTORY_CARD_BUFFERS_MB=1536`, `VICTORY_TEXTURE_ROOM_PERCENT=93`, `VICTORY_VRAM_IDLE_MS=8000,2000,1000` (was 15000,2500,1000) and `VICTORY_LIST_POOL_MB=512` (was 2048) are now the launcher's defaults, and the table above is superseded where they differ. Measured by automated 13-minute Series X runs on 2026-11-25 (logs `main-neptune-2258` against `auto-gpu-2319`, RTX 4070 SUPER): median 13.8 fps in the world (15.6 to 17.0 over the last minute), 72.5 ms a frame, 46.5 ms preparing a frame, heap passes 9.6 ms against 14 to 38 ms; `main` before it: median 10.9 fps (13.5 to 14.8 over the last minute), 92 ms a frame, 57 ms preparing. `VICTORY_CARD_WINDOWS_MB=0` was tried and cost about 5 fps. `VICTORY_INPLACE=1` placed only one 2 MB window and is not enabled. System RAM stays at about 22 GB private (title memory and mirrors): not solved by these settings.
+
+Since PR #358 (2026-11-26), `VICTORY_WINDOW_SKIP_SAME=1` (transient windows leave out pages that hold what they last sent), `VICTORY_MERGE_SUBMISSIONS=1` (consecutive title submissions as one host submission) and `VICTORY_PAGE_WRITES=5` (host copies under finished reads) are launcher defaults too, on top of the twelve copy pull requests of that batch. Measured by the maintainer on 2026-11-26 (RTX 4070 SUPER, Series X, VIctory logs): `main` 13.4 fps median, about 65 ms a frame with about 20 ms of copies up and 30 to 50 ms of copies back, card about 70-77 % busy; with the batch and these three switches 15.2 fps median over 11 minutes, card 78-85 % busy, copies back down to about 55 MB a frame. One run per configuration.
+
+Since PR #386, `VICTORY_STEP_INDEX=1` (a submission's steps find their copy by an index instead of a search), `VICTORY_CARD_SYNC_BATCH=1` (card copies recorded in three steps) and `VICTORY_PARALLEL_REFRESH=1` (texture checks on the helper pool), ported from fxceless/victory-gta6 in PR #383, are launcher defaults too. Measured by the maintainer on 2026-11-26 in one run with the three set to `alt` (on and off every 20 s, so both halves see the same scenes; RTX 4070 SUPER, Series X): 14.8 fps median with them against 12.7 without, +17 %.
+
+`VICTORY_HEAP_SCAN_ALT=1` is a launcher default too: the heap pass scans every kept descriptor slot once every 16 passes instead of every pass. Read from the VIctory logs of 2026-11-26, that full scan was the largest single cause of frames over 100 ms (see [research/stutter-2026-11-26.md](research/stutter-2026-11-26.md)). Measured by the maintainer in one run with it set to `alt` (RTX 4070 SUPER, Series X): 15.2 fps median against 14.2, and 1 frame window over 100 ms against 4.
+
+Do not turn on `VICTORY_CLAMP_AFTER_WRITER` (#377): with it, character faces draw black, only eyes and hair showing (seen by the maintainer on 2026-11-26 in a run with that switch alone, Series X). `VICTORY_WAVE32_NVIDIA` alone was not involved.
 
 `VICTORY_RELAY_WIDE_MERGE=1` (the relay's landed pieces merged on the kept threads) is in VIctory, off by default, and has not been measured.
 

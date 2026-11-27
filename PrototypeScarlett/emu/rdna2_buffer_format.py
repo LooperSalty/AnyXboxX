@@ -15,16 +15,17 @@ ac_translate_buffer_dataformat : R10G10B10A2 → 2_10_10_10, R11G11B10_FLOAT →
 Conversions en lecture (valeur 32 bits écrite dans le VGPR) :
 - UNORM sur n bits : c / (2^n - 1) ; SNORM : max(c / (2^(n-1) - 1), -1), donc -2^(n-1) donne -1
   (spécification Vulkan, « Fixed-Point Data Conversions »). Arrondi au plus proche du quotient
-  exact (mesuré sur Radeon RX 6700 par Leonida, third_party/leonida/rdna2spirv.py, decode_format) ;
-  le quotient n'est jamais à mi-chemin de deux float32 : son écriture binaire se répète sans fin.
+  exact (supposé, non mesuré : Vulkan admet un écart) ; le quotient n'est jamais à mi-chemin de deux
+  float32 : son écriture binaire se répète sans fin.
 - USCALED, SSCALED : l'entier converti en float32, exact (16 bits au plus) ; UINT : étendu par des
-  zéros ; SINT : étendu par le signe (Leonida, mesuré sur gfx1036).
+  zéros ; SINT : étendu par le signe (XML d'AMD : « convert the data to 32 bit integral » ; ISA,
+  section 8.1.4, p. 59 : « Control over int vs. float is controlled by FORMAT »).
 - FLOAT 32 bits : les bits tels quels ; FLOAT 16 bits : élargissement exact en float32 (dénormaux
-  compris) ; un NaN garde signe et charge utile décalée, sans bit « quiet » ajouté (Leonida, mesuré
-  sur gfx1036, formats 13, 29 et 71).
+  compris) ; un NaN garde signe et charge utile décalée, sans bit « quiet » ajouté (supposé,
+  non mesuré).
 Écriture : seulement les formats UINT et SINT (sur 8, 16, 10, 11, 2 et 32 bits) et FLOAT 32 bits.
-UINT sature la valeur 32 bits à 2^n - 1, SINT la borne à [-2^(n-1), 2^(n-1) - 1] (Leonida, mesuré
-sur gfx1036). Les écritures UNORM, SNORM, SCALED et FLOAT 16 bits (arrondi non vérifié ici) et
+UINT sature la valeur 32 bits à 2^n - 1, SINT la borne à [-2^(n-1), 2^(n-1) - 1] (supposé, non
+mesuré). Les écritures UNORM, SNORM, SCALED et FLOAT 16 bits (arrondi non vérifié ici) et
 les formats flottants 11/10 bits (10_11_11_FLOAT, 11_11_10_FLOAT) sont refusés en les nommant.
 
 The _d16 forms (16 bits per component) narrow and widen these values: emu/rdna2_buffer_d16.py.
@@ -176,8 +177,9 @@ def check_load_selects(fmt, word3, count):
 
 def store_selects_ok(fmt, word3):
     """MUBUF : écriture acceptée si DST_SEL nomme X, Y, Z, W dans l'ordre pour les composantes du
-    format, avec DST_SEL_Z constant (0 ou 1) pour un format à deux composantes : Leonida mesure sur
-    gfx1036 que DST_SEL_Z = Z ou W y change les composantes écrites (XYZW écrit x et w)."""
+    format, avec DST_SEL_Z constant (0 ou 1) pour un format à deux composantes. L'ISA (section 8.1.4,
+    table 31, p. 59) dit seulement que BUFFER_STORE_FORMAT_* prend DST_SEL du V# ; ce que DST_SEL_Z = Z
+    ou W change à une écriture de deux composantes n'est pas documenté : ces V# sont refusés."""
     found = selects(word3)
     if any(found[i] != SELECT_X + i for i in range(fmt.count)):
         return False
@@ -277,6 +279,7 @@ def encode(fmt, values):
 
 
 def select_one(fmt):
-    """Valeur de DST_SEL = 1 : 1.0 pour les formats flottants, normalisés et SCALED, 1 sinon (Leonida,
-    mesuré sur gfx1036 pour les 128 valeurs de FORMAT)."""
+    """Valeur de DST_SEL = 1 : 1.0 pour les formats flottants, normalisés et SCALED, 1 sinon. L'ISA
+    (section 8.1.5, p. 62, note 1) dit seulement que SEL_1 donne « 1 » ; 1.0 contre l'entier 1 selon le
+    type du format est supposé, non mesuré."""
     return ONE_INTEGER if fmt.kind in INTEGER_KINDS else ONE_FLOAT

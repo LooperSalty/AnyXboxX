@@ -2,7 +2,7 @@
 
 # VIctory, xcl et five-star-recomp : les trois voisins suivis depuis le 24 novembre
 
-État au 24 novembre 2026, après la suppression de Leonida. La règle 2 de [AGENTS.md](../../../AGENTS.md) s'applique : seulement des noms d'exports, slots, formes, flags/HRESULT et comptes, chacun étiqueté « mesuré » ; aucune adresse, octet, chaîne, nom ou hash de shader, aucun log du jeu. Vue d'ensemble des autres voisins : [voisins.md](voisins.md).
+État au 24 novembre 2026. La règle 2 de [AGENTS.md](../../../AGENTS.md) s'applique : seulement des noms d'exports, slots, formes, flags/HRESULT et comptes, chacun étiqueté « mesuré » ; aucune adresse, octet, chaîne, nom ou hash de shader, aucun log du jeu. Vue d'ensemble des autres voisins : [voisins.md](voisins.md).
 
 | Projet | Langage, licence | Ce qu'il fait |
 | --- | --- | --- |

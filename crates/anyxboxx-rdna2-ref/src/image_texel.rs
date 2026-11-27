@@ -9,7 +9,8 @@
 use crate::format_convert::unorm_bits;
 use crate::image_desc::{
     FORMAT_8_8_8_8_UNORM, FORMAT_8_8_UNORM, FORMAT_32_32_32_32_FLOAT, FORMAT_32_32_FLOAT,
-    FORMAT_32_FLOAT, Image, texel_bytes,
+    FORMAT_32_32_SINT, FORMAT_32_32_UINT, FORMAT_32_FLOAT, FORMAT_32_SINT, FORMAT_32_UINT, Image,
+    texel_bytes,
 };
 use crate::memory::{Memory, le_words};
 
@@ -52,7 +53,12 @@ pub fn texel(memory: &Memory, image: &Image, x: u64, y: u64) -> [u32; 4] {
             let w = words(2);
             [w[0], w[1], 0, ONE_BITS]
         }
+        FORMAT_32_32_UINT | FORMAT_32_32_SINT => {
+            let w = words(2);
+            [w[0], w[1], 0, 1]
+        }
         FORMAT_32_FLOAT => [words(1)[0], 0, 0, ONE_BITS],
+        FORMAT_32_UINT | FORMAT_32_SINT => [words(1)[0], 0, 0, 1],
         FORMAT_8_8_8_8_UNORM => {
             let raw = memory.read(address, 4);
             [
@@ -140,8 +146,8 @@ pub fn store_texel(
     let packed = unpack_dmask(dmask, values);
     let channels = match image.format {
         FORMAT_32_32_32_32_FLOAT => 4,
-        FORMAT_32_32_FLOAT => 2,
-        FORMAT_32_FLOAT => 1,
+        FORMAT_32_32_FLOAT | FORMAT_32_32_UINT | FORMAT_32_32_SINT => 2,
+        FORMAT_32_FLOAT | FORMAT_32_UINT | FORMAT_32_SINT => 1,
         _ => 0,
     };
     if channels != 0 {

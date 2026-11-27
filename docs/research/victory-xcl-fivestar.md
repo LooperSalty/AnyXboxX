@@ -2,7 +2,7 @@
 
 # VIctory, xcl and five-star-recomp: the three neighbours tracked since 24 November
 
-State on 24 November 2026, after the deletion of Leonida. Rule 2 of [AGENTS.md](../../AGENTS.md) applies: only export names, slots, shapes, flags/HRESULT and counts, each labelled "measured"; no addresses, bytes, strings, shader names or hashes, no logs of the game. Overview of the other neighbours: [neighbors.md](neighbors.md).
+State on 24 November 2026. Rule 2 of [AGENTS.md](../../AGENTS.md) applies: only export names, slots, shapes, flags/HRESULT and counts, each labelled "measured"; no addresses, bytes, strings, shader names or hashes, no logs of the game. Overview of the other neighbours: [neighbors.md](neighbors.md).
 
 | Project | Language, licence | What it does |
 | --- | --- | --- |

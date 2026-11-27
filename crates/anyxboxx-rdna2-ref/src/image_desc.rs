@@ -15,8 +15,12 @@ use crate::error::Error;
 
 pub const FORMAT_8_UNORM: u32 = 1;
 pub const FORMAT_8_8_UNORM: u32 = 14;
+pub const FORMAT_32_UINT: u32 = 20;
+pub const FORMAT_32_SINT: u32 = 21;
 pub const FORMAT_32_FLOAT: u32 = 22;
 pub const FORMAT_8_8_8_8_UNORM: u32 = 56;
+pub const FORMAT_32_32_UINT: u32 = 62;
+pub const FORMAT_32_32_SINT: u32 = 63;
 pub const FORMAT_32_32_FLOAT: u32 = 64;
 pub const FORMAT_32_32_32_32_FLOAT: u32 = 77;
 const TYPE_2D: u32 = 9;
@@ -37,6 +41,25 @@ const DIRECT_OPS: [&str; 5] = [
     "image_store_mip",
     "image_get_resinfo",
 ];
+const ATOMIC_OPS: [&str; 16] = [
+    "image_atomic_swap",
+    "image_atomic_cmpswap",
+    "image_atomic_add",
+    "image_atomic_sub",
+    "image_atomic_smin",
+    "image_atomic_umin",
+    "image_atomic_smax",
+    "image_atomic_umax",
+    "image_atomic_and",
+    "image_atomic_or",
+    "image_atomic_xor",
+    "image_atomic_inc",
+    "image_atomic_dec",
+    "image_atomic_fcmpswap",
+    "image_atomic_fmin",
+    "image_atomic_fmax",
+];
+const ATOMIC_CMPSWAP_OPS: [&str; 2] = ["image_atomic_cmpswap", "image_atomic_fcmpswap"];
 
 /// The kind of a supported MIMG instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +68,16 @@ pub enum Op {
     Sample,
     Compare,
     Gather,
+    Atomic,
 }
 
 /// The kind of `name`, or `None` when the interpreter does not run it.
 pub fn op(name: &str) -> Option<Op> {
     if DIRECT_OPS.contains(&name) {
         return Some(Op::Direct);
+    }
+    if ATOMIC_OPS.contains(&name) {
+        return Some(Op::Atomic);
     }
     [
         ("image_sample_c", Op::Compare),
@@ -65,6 +92,44 @@ pub fn op(name: &str) -> Option<Op> {
     })
 }
 
+/// True for compare-and-swap image atomics (`image_atomic_cmpswap`, `image_atomic_fcmpswap`).
+pub fn is_cmpswap(name: &str) -> bool {
+    ATOMIC_CMPSWAP_OPS.contains(&name)
+}
+
+/// Width in bits (32 or 64) of an `image_atomic_*` from its DMASK; `Untranslated` otherwise.
+pub fn atomic_width(name: &str, dmask: u32) -> Result<u32, Error> {
+    if is_cmpswap(name) {
+        match dmask {
+            0x3 => Ok(32),
+            0xF => Ok(64),
+            _ => refuse(format!(
+                "{name} : dmask 0x{dmask:x} non pris en charge (0x3 ou 0xf attendus)"
+            )),
+        }
+    } else {
+        match dmask {
+            0x1 => Ok(32),
+            0x3 => Ok(64),
+            _ => refuse(format!(
+                "{name} : dmask 0x{dmask:x} non pris en charge (0x1 ou 0x3 attendus)"
+            )),
+        }
+    }
+}
+
+/// Whether `format` is a valid raw 32-bit or 64-bit format for an `image_atomic_*` of `width` bits.
+pub fn atomic_format_ok(format: u32, width: u32) -> bool {
+    match width {
+        32 => matches!(format, FORMAT_32_UINT | FORMAT_32_SINT | FORMAT_32_FLOAT),
+        64 => matches!(
+            format,
+            FORMAT_32_32_UINT | FORMAT_32_32_SINT | FORMAT_32_32_FLOAT
+        ),
+        _ => false,
+    }
+}
+
 /// The fields of a MIMG instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fields {
@@ -72,6 +137,7 @@ pub struct Fields {
     pub dim: u32,
     pub dmask: u32,
     pub unorm: bool,
+    pub glc: bool,
     flags: [(&'static str, bool); 5],
     /// VADDR, then the bytes of the NSA words.
     pub vaddr: Vec<usize>,
@@ -96,6 +162,7 @@ pub fn instruction_fields(words: &[u32]) -> Fields {
         dim: (low >> 3) & 0x7,
         dmask: (low >> 8) & 0xF,
         unorm: bit(low, 12),
+        glc: bit(low, 13),
         flags: [
             ("r128", bit(low, 15)),
             ("tfe", bit(low, 16)),
@@ -134,6 +201,9 @@ pub fn check_instruction(name: &str, fields: &Fields) -> Result<Op, Error> {
             fields.dmask
         ));
     }
+    if op == Op::Atomic {
+        atomic_width(name, fields.dmask)?;
+    }
     Ok(op)
 }
 
@@ -146,7 +216,7 @@ pub fn address_count(name: &str, op: Op) -> usize {
     match name {
         "image_get_resinfo" => 1,
         "image_load_mip" | "image_store_mip" => 3,
-        _ if op == Op::Direct => 2,
+        _ if op == Op::Direct || op == Op::Atomic => 2,
         _ => {
             2 + usize::from(suffix_has(name, "o"))
                 + usize::from(op == Op::Compare)
@@ -199,8 +269,8 @@ pub fn texel_bytes(format: u32) -> Option<u64> {
     match format {
         FORMAT_8_UNORM => Some(1),
         FORMAT_8_8_UNORM => Some(2),
-        FORMAT_32_FLOAT | FORMAT_8_8_8_8_UNORM => Some(4),
-        FORMAT_32_32_FLOAT => Some(8),
+        FORMAT_32_UINT | FORMAT_32_SINT | FORMAT_32_FLOAT | FORMAT_8_8_8_8_UNORM => Some(4),
+        FORMAT_32_32_UINT | FORMAT_32_32_SINT | FORMAT_32_32_FLOAT => Some(8),
         FORMAT_32_32_32_32_FLOAT => Some(16),
         _ => None,
     }
@@ -296,7 +366,18 @@ mod tests {
         assert_eq!(op("image_sample_c_lz_o"), Some(Op::Compare));
         assert_eq!(op("image_gather4_l"), Some(Op::Gather));
         assert_eq!(op("image_sample_d"), None);
-        assert_eq!(op("image_atomic_add"), None);
+        assert_eq!(op("image_atomic_add"), Some(Op::Atomic));
+        assert_eq!(op("image_atomic_fcmpswap"), Some(Op::Atomic));
+        assert_eq!(address_count("image_atomic_add", Op::Atomic), 2);
+        assert_eq!(atomic_width("image_atomic_add", 0x1).unwrap(), 32);
+        assert_eq!(atomic_width("image_atomic_add", 0x3).unwrap(), 64);
+        assert!(atomic_width("image_atomic_add", 0xF).is_err());
+        assert_eq!(atomic_width("image_atomic_cmpswap", 0x3).unwrap(), 32);
+        assert_eq!(atomic_width("image_atomic_fcmpswap", 0xF).unwrap(), 64);
+        assert!(atomic_width("image_atomic_cmpswap", 0x1).is_err());
+        assert!(atomic_format_ok(FORMAT_32_UINT, 32));
+        assert!(atomic_format_ok(FORMAT_32_32_SINT, 64));
+        assert!(!atomic_format_ok(FORMAT_8_8_8_8_UNORM, 32));
         assert_eq!(address_count("image_sample_c_l_o", Op::Compare), 5);
         assert_eq!(address_count("image_sample_lz", Op::Sample), 2);
         assert_eq!(address_count("image_load_mip", Op::Direct), 3);

@@ -58,6 +58,8 @@ pub struct Running {
 
 pub struct App {
     pub repo: Option<PathBuf>,
+    /// Prebuilt `victory.exe` passed via `--victory-exe`: skips the cargo build and needs no repo.
+    pub victory_exe: Option<PathBuf>,
     pub profiles: Profiles,
     pub host: Host,
     pub gpu: GpuVendor,
@@ -103,6 +105,7 @@ pub struct App {
     pick_rx: Option<Receiver<(Pick, Option<PathBuf>)>>,
     settings_path: Option<PathBuf>,
     last_saved: Stored,
+    title_id_cache: Option<(PathBuf, u32)>,
 }
 
 /// The checklist as the machine is now; `adapters` is what DXGI listed (None when it failed).
@@ -141,6 +144,7 @@ impl App {
             .map(|a| a.name.clone());
         let mut app = App {
             repo: anyxboxx::run::find_repo(None),
+            victory_exe: None,
             profiles,
             host,
             gpu,
@@ -177,6 +181,7 @@ impl App {
             clock: Instant::now(),
             pick_rx: None,
             settings_path,
+            title_id_cache: None,
         };
         app.find_game_folder();
         if app.settings.game_path().is_some() {
@@ -273,16 +278,26 @@ impl App {
         self.repo.clone().unwrap_or_default()
     }
 
-    /// Where VIctory keeps saves and data: `VICTORY_DATA_DIR`, else `%LOCALAPPDATA%\victory\data`.
-    pub fn data_dir_label(&self) -> String {
-        let data = std::env::var_os("VICTORY_DATA_DIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("LOCALAPPDATA")
-                    .map(|l| PathBuf::from(l).join("victory").join("data"))
-            });
-        data.map_or("unknown".to_string(), |d| d.display().to_string())
+    /// Where VIctory keeps the game's saves (`<data>\<TitleId>\saves`), or the data root when no
+    /// game folder is set yet.
+    pub fn data_dir_label(&mut self) -> String {
+        let Some(data) = cache::current_data_dir() else {
+            return "unknown".to_string();
+        };
+        let Some(game_dir) = self.settings.game_path() else {
+            return data.display().to_string();
+        };
+        let title_id = match &self.title_id_cache {
+            Some((cached, id)) if *cached == game_dir => *id,
+            _ => {
+                let id = cache::read_title_id(&game_dir);
+                self.title_id_cache = Some((game_dir, id));
+                id
+            }
+        };
+        cache::title_saves_dir(&data, title_id)
+            .display()
+            .to_string()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -304,21 +319,45 @@ impl App {
             return;
         }
         let profile = self.profile().clone();
-        let Some(repo) = self.repo.clone() else {
-            self.notice = Some(
-                "AnyXboxX folder not found: run the launcher from the repository (target\\release).".to_string(),
-            );
-            return;
+        let repo = match (&self.repo, &self.victory_exe) {
+            (Some(repo), _) => repo.clone(),
+            (None, Some(_)) => PathBuf::new(),
+            (None, None) => {
+                self.notice = Some(
+                    "AnyXboxX folder not found: run the launcher from the repository (target\\release) or pass --victory-exe <path>."
+                        .to_string(),
+                );
+                return;
+            }
         };
-        let plan = match session::make_plan(&self.settings, &repo, &profile) {
+        let plan = match session::make_plan(
+            &self.settings,
+            &repo,
+            self.victory_exe.as_deref(),
+            &profile,
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 self.notice = Some(error.to_string());
                 return;
             }
         };
+        if !precompile_only {
+            // NVIDIA Smooth Motion lives in the driver's profile, not in VIctory's environment:
+            // written now, so the game starts with the switch as the Play page shows it. A failure
+            // is reported and the game starts all the same.
+            let on = self.settings.options.smooth_motion;
+            match crate::smooth_motion::sync(on) {
+                Ok(Some(done)) => self.log_line(format!("== {done} ==")),
+                Ok(None) => {}
+                Err(error) if on => {
+                    self.notice = Some(format!("Smooth Motion could not be turned on: {error}"));
+                }
+                Err(_) => {}
+            }
+        }
         let steps: Result<Vec<Step>, anyxboxx::run::RunError> = if precompile_only {
-            launch::precompile_steps(&plan)
+            launch::precompile_steps(&plan, self.settings.options.warm_first)
         } else {
             launch::play_steps(&plan, self.settings.options.warm_first)
         };

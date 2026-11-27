@@ -133,6 +133,19 @@ fn performance_card(app: &mut App, ui: &mut Ui) {
             "Tap A through the start screens for 150 seconds",
             &mut settings.options.auto_a,
         );
+        ui.add_space(tokens::S);
+        toggle_row(
+            ui,
+            "NVIDIA Smooth Motion: driver frame generation (RTX 40 and 50 series)",
+            &mut settings.options.smooth_motion,
+        );
+        ui.label(
+            RichText::new(
+                "Twice the pictures shown, not more responsive. Written into the NVIDIA driver's profile for victory.exe at each launch.",
+            )
+            .color(theme::TEXT_MUTED)
+            .size(tokens::CAPTION),
+        );
     });
 }
 

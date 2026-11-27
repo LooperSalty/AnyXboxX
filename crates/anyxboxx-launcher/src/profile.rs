@@ -301,6 +301,24 @@ mod tests {
     }
 
     #[test]
+    fn linux_amd_is_exactly_the_cli_linux_amd_set() {
+        use anyxboxx::run::LINUX_AMD;
+        let profile = embedded().by_id("linux-amd").expect("profile").clone();
+        let mut expected: Vec<(String, String)> = LINUX_AMD
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut actual: Vec<(String, String)> = profile
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn linux_amd_has_no_pending_switch_and_no_tuned_only_key() {
         let profile = embedded().by_id("linux-amd").expect("profile").clone();
         assert!(profile.pending.is_empty());

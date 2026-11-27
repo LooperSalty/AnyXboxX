@@ -42,9 +42,9 @@ static COUNTER: Mutex<Counter> = Mutex::new(Counter {
 });
 
 /// Summarises the frame times of a window: the rate over `elapsed` seconds, the mean frame time and
-/// the slowest share. `None` when no frame was timed.
+/// the slowest share. `None` when no frame was timed or `elapsed` is not positive and finite.
 pub fn summarise(frame_ms: &[f64], elapsed: f64) -> Option<Report> {
-    if frame_ms.is_empty() || elapsed <= 0.0 {
+    if frame_ms.is_empty() || !elapsed.is_finite() || elapsed <= 0.0 {
         return None;
     }
     let mut sorted = frame_ms.to_vec();
@@ -58,6 +58,16 @@ pub fn summarise(frame_ms: &[f64], elapsed: f64) -> Option<Report> {
         average_ms: total / frames as f64,
         slowest_ms: sorted[slow_index],
     })
+}
+
+/// Converts a slowest-frame duration in milliseconds into frames per second, returning 0 when the
+/// duration is non-positive or non-finite so logs and titles never display `inf`.
+pub fn low_fps(slowest_ms: f64) -> f64 {
+    if slowest_ms.is_finite() && slowest_ms > 0.0 {
+        1000.0 / slowest_ms
+    } else {
+        0.0
+    }
 }
 
 /// Records one `Present`: the first call starts the clock; each later one adds a frame time and,
@@ -85,7 +95,7 @@ pub fn frame(title_text: impl FnOnce() -> Option<String>) {
             "[fps] {:.1} i/s · {:.2} ms (1 % bas : {:.1} i/s)",
             report.fps,
             report.average_ms,
-            1000.0 / report.slowest_ms
+            low_fps(report.slowest_ms)
         );
         write_csv(&mut counter, since_start, report);
         show_in_title(title_text, report);
@@ -96,7 +106,7 @@ pub fn frame(title_text: impl FnOnce() -> Option<String>) {
 
 /// Appends the report to `ANYXBOXX_FPS_CSV`, with its header on first use. Errors are ignored.
 fn write_csv(counter: &mut Counter, since_start: f64, report: Report) {
-    let Some(path) = std::env::var_os("ANYXBOXX_FPS_CSV") else {
+    let Some(path) = std::env::var_os("ANYXBOXX_FPS_CSV").filter(|p| !p.is_empty()) else {
         return;
     };
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
@@ -123,7 +133,7 @@ fn show_in_title(title_text: impl FnOnce() -> Option<String>, report: Report) {
         crate::dxgi_factory::set_window_title(&format!(
             "{text} | AnyXboxX {:.0} i/s (1 % bas {:.0})",
             report.fps,
-            1000.0 / report.slowest_ms
+            low_fps(report.slowest_ms)
         ));
     }
 }
@@ -148,5 +158,16 @@ mod tests {
     fn an_empty_window_has_no_report() {
         assert_eq!(summarise(&[], 1.0), None);
         assert_eq!(summarise(&[16.0], 0.0), None);
+        assert_eq!(summarise(&[16.0], f64::NAN), None);
+        assert_eq!(summarise(&[16.0], f64::INFINITY), None);
+    }
+
+    #[test]
+    fn low_fps_avoids_division_by_zero_and_non_finite_values() {
+        assert_eq!(low_fps(0.0), 0.0);
+        assert_eq!(low_fps(-1.0), 0.0);
+        assert_eq!(low_fps(f64::NAN), 0.0);
+        assert_eq!(low_fps(f64::INFINITY), 0.0);
+        assert!((low_fps(20.0) - 50.0).abs() < 1e-9);
     }
 }

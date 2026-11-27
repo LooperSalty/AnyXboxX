@@ -12,7 +12,9 @@
 use std::ffi::c_void;
 
 use victory_hle::modules::xmem::EraFields;
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError, SetLastError};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, GetLastError, SetLastError,
+};
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
@@ -66,8 +68,14 @@ fn alignment(kind: u32) -> usize {
     }
 }
 
-fn round_up(value: usize, unit: usize) -> usize {
-    (value + unit - 1) & !(unit - 1)
+fn round_up(value: usize, unit: usize) -> Option<usize> {
+    value.checked_add(unit - 1).map(|v| v & !(unit - 1))
+}
+
+fn no_memory() -> *mut c_void {
+    // SAFETY: plain thread-local state.
+    unsafe { SetLastError(ERROR_NOT_ENOUGH_MEMORY) };
+    std::ptr::null_mut()
 }
 
 /// At a requested address: the range is widened to the alignment, as VirtualAlloc does.
@@ -79,7 +87,12 @@ fn at_address(
     protect: u32,
 ) -> *mut c_void {
     let start = address as usize & !(alignment - 1);
-    let end = round_up(address as usize + size, alignment);
+    let Some(end) = (address as usize)
+        .checked_add(size)
+        .and_then(|end| round_up(end, alignment))
+    else {
+        return no_memory();
+    };
     // SAFETY: the title's own range, with host flags.
     unsafe { VirtualAlloc(start as *const c_void, end - start, kind, protect) }
 }
@@ -107,7 +120,9 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     let alignment = alignment(kind);
     let block = if address.is_null() {
-        let bytes = round_up(size.max(1), alignment);
+        let Some(bytes) = round_up(size.max(1), alignment) else {
+            return no_memory();
+        };
         allocate_aligned(bytes, alignment, host_kind, host_protect)
     } else {
         at_address(address, size, alignment, host_kind, host_protect)

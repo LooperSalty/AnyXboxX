@@ -6,6 +6,8 @@
 //! image_load gives zeros outside the image or for a mip level other than 0; image_store writes nothing
 //! there. image_get_resinfo gives (width, height, 1, 1) for mip 0, else (0, 0, 0, 1).
 
+use crate::atomic;
+use crate::buffer_format::format_name;
 use crate::error::Error;
 use crate::image_desc::{
     self, Fields, Image, Op, SamplerAddresses, address_registers, check_instruction,
@@ -204,12 +206,86 @@ fn sampled(
     Ok(())
 }
 
+fn atomic_op(
+    wave: &mut Wave,
+    name: &str,
+    fields: &Fields,
+    image: &Image,
+    addrs: &[usize],
+) -> Result<(), Error> {
+    let width = image_desc::atomic_width(name, fields.dmask)?;
+    if !image_desc::atomic_format_ok(image.format, width) {
+        return Err(Error::Untranslated(format!(
+            "{name} ({width} bits) : format {} non pris en charge",
+            format_name(image.format)
+        )));
+    }
+    let kind = name.strip_prefix("image_atomic_").unwrap_or("");
+    let cmpswap = image_desc::is_cmpswap(name);
+    let words_per_val = (width / 32) as usize;
+    let texel_bytes = (width / 8) as usize;
+    for lane in wave.active()? {
+        let (x, y) = (vgpr(wave, addrs[0], lane)?, vgpr(wave, addrs[1], lane)?);
+        if x >= image.width || y >= image.height {
+            if fields.glc {
+                for i in 0..words_per_val {
+                    set_vgpr(wave, fields.vdata + i, lane, 0)?;
+                }
+            }
+            continue;
+        }
+        let address = image.address.wrapping_add(
+            u64::from(y)
+                .wrapping_mul(u64::from(image.width))
+                .wrapping_add(u64::from(x))
+                .wrapping_mul(texel_bytes as u64),
+        );
+        let raw = wave.memory.read(address, texel_bytes);
+        let mut buf = [0u8; 8];
+        buf[..texel_bytes].copy_from_slice(&raw);
+        let old = u64::from_le_bytes(buf);
+        let (data0, data1) = if width == 32 {
+            let d0 = u64::from(vgpr(wave, fields.vdata, lane)?);
+            let d1 = if cmpswap {
+                u64::from(vgpr(wave, fields.vdata + 1, lane)?)
+            } else {
+                0
+            };
+            (d0, d1)
+        } else {
+            let d0 = u64::from(vgpr(wave, fields.vdata, lane)?)
+                | u64::from(vgpr(wave, fields.vdata + 1, lane)?) << 32;
+            let d1 = if cmpswap {
+                u64::from(vgpr(wave, fields.vdata + 2, lane)?)
+                    | u64::from(vgpr(wave, fields.vdata + 3, lane)?) << 32
+            } else {
+                0
+            };
+            (d0, d1)
+        };
+        let new_val = atomic::apply(kind, width, old, data0, data1)
+            .ok_or_else(|| Error::Untranslated(format!("atomique non pris en charge : {name}")))?;
+        wave.memory
+            .write(address, &new_val.to_le_bytes()[..texel_bytes]);
+        if fields.glc {
+            set_vgpr(wave, fields.vdata, lane, old as u32)?;
+            if width == 64 {
+                set_vgpr(wave, fields.vdata + 1, lane, (old >> 32) as u32)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Executes a MIMG instruction; `words` holds its two dwords and its NSA words.
 pub fn execute(wave: &mut Wave, name: &str, words: &[u32]) -> Result<(), Error> {
     let fields = image_desc::instruction_fields(words);
     let op = check_instruction(name, &fields)?;
     let image = image_desc::image(&scalars(wave, fields.srsrc, IMAGE_WORDS)?)?;
     let addrs = address_registers(name, op, &fields);
+    if op == Op::Atomic {
+        return atomic_op(wave, name, &fields, &image, &addrs);
+    }
     if op == Op::Direct {
         return direct(wave, name, &fields, &image, &addrs);
     }

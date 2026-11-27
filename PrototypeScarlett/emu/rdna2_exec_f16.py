@@ -103,6 +103,110 @@ def half_toward_zero(value):
     return bits - 1 if abs(bits_half(bits)) > abs(value) else bits
 
 
+def half_rcp(bits):
+    """v_rcp_f16 (ISA RDNA 2, §12.8, VOP1 84, p. 147) : 1.0 / S0.f16 selon IEEE (±0 → ±inf, ±inf → ±0)."""
+    sign, mag = bits & 0x8000, bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return sign | HALF_INFINITY
+    if mag == HALF_INFINITY:
+        return sign
+    return half_bits(1.0 / bits_half(bits))
+
+
+def half_sqrt(bits):
+    """v_sqrt_f16 (ISA RDNA 2, §12.8, VOP1 85, p. 147) : sqrt(S0.f16) (-0 → -0, négatif non nul → NaN)."""
+    mag = bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return bits
+    if bits & 0x8000:
+        return HALF_NAN
+    if mag == HALF_INFINITY:
+        return HALF_INFINITY
+    return half_bits(math.sqrt(bits_half(bits)))
+
+
+def half_rsq(bits):
+    """v_rsq_f16 (ISA RDNA 2, §12.8, VOP1 86, p. 147) : 1.0 / sqrt(S0.f16) (±0 → ±inf, +inf → +0)."""
+    sign, mag = bits & 0x8000, bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return sign | HALF_INFINITY
+    if sign:
+        return HALF_NAN
+    if mag == HALF_INFINITY:
+        return 0
+    return half_bits(1.0 / math.sqrt(bits_half(bits)))
+
+
+def half_log2(bits):
+    """v_log_f16 (ISA RDNA 2, §12.8, VOP1 87, p. 147) : log2(S0.f16) (±0 → -inf, +1 → +0, négatif → NaN)."""
+    mag = bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return 0x8000 | HALF_INFINITY
+    if bits & 0x8000:
+        return HALF_NAN
+    if mag == HALF_INFINITY:
+        return HALF_INFINITY
+    if bits == HALF_ONE:
+        return 0
+    return half_bits(math.log2(bits_half(bits)))
+
+
+def half_exp2(bits):
+    """v_exp_f16 (ISA RDNA 2, §12.8, VOP1 88, p. 148) : 2 ** S0.f16 (-inf → +0, ±0 → +1, +inf → +inf)."""
+    mag = bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return HALF_ONE
+    if bits == (0x8000 | HALF_INFINITY):
+        return 0
+    if bits == HALF_INFINITY:
+        return HALF_INFINITY
+    value = bits_half(bits)
+    if value >= 16.0:
+        return HALF_INFINITY
+    if value <= -25.0:
+        return 0
+    return half_bits(2.0 ** value)
+
+
+def half_trig(bits, is_cos):
+    """v_sin_f16 / v_cos_f16 (ISA RDNA 2, §12.8, VOP1 96-97, p. 149) : sin/cos(S0.f16 × 2π), réduction exacte
+    par tours avant la multiplication par 2π (sin(-0) = -0, sin(±65504) = +0, cos(±65504) = +1, cos(0.25) = +0)."""
+    mag = bits & 0x7FFF
+    if mag >= HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return HALF_ONE if is_cos else bits
+    value = abs(bits_half(bits))
+    neg = bool(bits & 0x8000) and not is_cos
+    frac = value - math.trunc(value)
+    quadrant = int(math.floor(frac * 4.0))
+    offset = frac - quadrant * 0.25
+    if is_cos:
+        quadrant = (quadrant + 1) & 3
+    if offset == 0.0:
+        if quadrant & 1 == 0:
+            return 0
+        return (0x8000 | HALF_ONE) if ((quadrant == 3) ^ neg) else HALF_ONE
+    if quadrant & 1:
+        offset = 0.25 - offset
+    if offset > 0.125:
+        result = math.cos((0.25 - offset) * math.tau)
+    else:
+        result = math.sin(offset * math.tau)
+    encoded = half_bits(result)
+    return encoded ^ 0x8000 if encoded and ((quadrant >= 2) ^ neg) else encoded
+
+
 H = bits_half
 
 # Opérations f16 : nom → (types des sources src0..src2, fonction(a, b, c, d, k)).
@@ -136,6 +240,14 @@ OPERATIONS = {
     "v_frexp_mant_f16": ("h", lambda a, b, c, d, k: half_frexp(a)[0]),
     "v_frexp_exp_i16_f16": ("h", lambda a, b, c, d, k: half_frexp(a)[1] & 0xFFFF),
     "v_fract_f16": ("h", lambda a, b, c, d, k: half_fract(a)),
+    # ISA RDNA 2, §12.8, opcodes VOP1 84-88 et 96-97 (p. 147-149) : transcendantes f16 (0.51 ULP, dénormaux).
+    "v_rcp_f16": ("h", lambda a, b, c, d, k: half_rcp(a)),
+    "v_sqrt_f16": ("h", lambda a, b, c, d, k: half_sqrt(a)),
+    "v_rsq_f16": ("h", lambda a, b, c, d, k: half_rsq(a)),
+    "v_log_f16": ("h", lambda a, b, c, d, k: half_log2(a)),
+    "v_exp_f16": ("h", lambda a, b, c, d, k: half_exp2(a)),
+    "v_sin_f16": ("h", lambda a, b, c, d, k: half_trig(a, False)),
+    "v_cos_f16": ("h", lambda a, b, c, d, k: half_trig(a, True)),
 }
 # Résultat sur 32 bits (le VGPR entier) ; les autres écrivent une moitié et gardent l'autre.
 WORD_RESULT = frozenset({"v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32"})

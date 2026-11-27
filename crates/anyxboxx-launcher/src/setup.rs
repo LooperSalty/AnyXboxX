@@ -171,16 +171,33 @@ pub fn rustc_version() -> Option<String> {
         .map(|line| line.trim().to_string())
 }
 
+/// Parses a dotted numeric Windows SDK version folder name (e.g. `10.0.26100.0`).
+fn parse_sdk_version(name: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = name
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
 /// `dxc.exe` in `<kits_bin>\<version>\x64`, the newest version folder that has one.
 pub fn find_dxc(kits_bin: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(kits_bin)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("x64").join("dxc.exe"))
-        .filter(|path| path.is_file())
-        .collect();
+    let mut candidates: Vec<(Option<Vec<u64>>, std::ffi::OsString, PathBuf)> =
+        std::fs::read_dir(kits_bin)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let dxc = entry.path().join("x64").join("dxc.exe");
+                if !dxc.is_file() {
+                    return None;
+                }
+                let name = entry.file_name();
+                let version = name.to_str().and_then(parse_sdk_version);
+                Some((version, name, dxc))
+            })
+            .collect();
     candidates.sort();
-    candidates.pop()
+    candidates.pop().map(|(_, _, path)| path)
 }
 
 #[cfg(test)]
@@ -293,5 +310,23 @@ mod tests {
         std::fs::create_dir_all(kits.path().join("10.0.99999.0").join("x64")).expect("mkdir");
         let found = find_dxc(kits.path()).expect("dxc");
         assert!(found.to_string_lossy().contains("10.0.26100.0"));
+    }
+
+    #[test]
+    fn find_dxc_compares_sdk_versions_numerically_and_prefers_version_folders() {
+        let kits = tempfile::tempdir().expect("tempdir");
+        for folder in ["10.0.9999.0", "10.0.26100.0", "tools"] {
+            let x64 = kits.path().join(folder).join("x64");
+            std::fs::create_dir_all(&x64).expect("mkdir");
+            std::fs::write(x64.join("dxc.exe"), b"x").expect("write");
+        }
+        let found = find_dxc(kits.path()).expect("dxc");
+        assert!(found.to_string_lossy().contains("10.0.26100.0"));
+
+        let newer = kits.path().join("10.0.100000.0").join("x64");
+        std::fs::create_dir_all(&newer).expect("mkdir");
+        std::fs::write(newer.join("dxc.exe"), b"x").expect("write");
+        let found = find_dxc(kits.path()).expect("dxc");
+        assert!(found.to_string_lossy().contains("10.0.100000.0"));
     }
 }

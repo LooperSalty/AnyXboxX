@@ -3,42 +3,40 @@
 //! the Python code that catches pefile's errors.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use victory_pe::{ImageInfo, ImportSymbol};
 
 use crate::dll_name;
 
-const HEADER_PROBE: usize = 0x400;
+const DOS_HEADER_SIZE: usize = 0x40;
 const PE_SIGNATURE: &[u8] = b"PE\0\0";
 const PE32_PLUS_MAGIC: [u8; 2] = 0x20B_u16.to_le_bytes();
 const E_LFANEW: usize = 0x3C;
 const MAGIC_OFFSET: usize = 24;
+const NT_PROBE_SIZE: usize = MAGIC_OFFSET + 2;
 /// `PATTERNS` of bench.py: `*.dll` and `*.exe`, matched case-insensitively as on Windows.
 const EXTENSIONS: [&str; 2] = ["dll", "exe"];
 
 /// `bench.is_pe32_plus`: true for an x86-64 module (a 32-bit or .NET launcher is not one).
 pub fn is_pe32_plus(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut header = Vec::with_capacity(HEADER_PROBE);
-    if file
-        .take(HEADER_PROBE as u64)
-        .read_to_end(&mut header)
-        .is_err()
-    {
+    let mut dos = [0u8; DOS_HEADER_SIZE];
+    if file.read_exact(&mut dos).is_err() || &dos[..2] != b"MZ" {
         return false;
     }
-    if header.len() < 0x40 || &header[..2] != b"MZ" {
+    let pe = u32::from_le_bytes(dos[E_LFANEW..E_LFANEW + 4].try_into().expect("4 bytes"));
+    if file.seek(SeekFrom::Start(u64::from(pe))).is_err() {
         return false;
     }
-    let pe =
-        u32::from_le_bytes(header[E_LFANEW..E_LFANEW + 4].try_into().expect("4 bytes")) as usize;
-    pe + MAGIC_OFFSET + 2 <= header.len()
-        && &header[pe..pe + 4] == PE_SIGNATURE
-        && header[pe + MAGIC_OFFSET..pe + MAGIC_OFFSET + 2] == PE32_PLUS_MAGIC
+    let mut nt = [0u8; NT_PROBE_SIZE];
+    if file.read_exact(&mut nt).is_err() {
+        return false;
+    }
+    &nt[..4] == PE_SIGNATURE && nt[MAGIC_OFFSET..MAGIC_OFFSET + 2] == PE32_PLUS_MAGIC
 }
 
 fn has_module_extension(path: &Path) -> bool {
@@ -115,5 +113,44 @@ mod tests {
         assert!(has_module_extension(Path::new("GAME.EXE")));
         assert!(has_module_extension(Path::new("a.Dll")));
         assert!(!has_module_extension(Path::new("a.sys")));
+    }
+
+    #[test]
+    fn pe32_plus_detection_handles_large_dos_stubs_and_bad_offsets() {
+        let dir = std::env::temp_dir().join(format!("anyxboxx-modules-pe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make = |e_lfanew: u32, magic: u16, size: usize| {
+            let mut bytes = vec![0u8; size];
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[E_LFANEW..E_LFANEW + 4].copy_from_slice(&e_lfanew.to_le_bytes());
+            let pe = e_lfanew as usize;
+            if pe + NT_PROBE_SIZE <= bytes.len() {
+                bytes[pe..pe + 4].copy_from_slice(PE_SIGNATURE);
+                bytes[pe + MAGIC_OFFSET..pe + MAGIC_OFFSET + 2]
+                    .copy_from_slice(&magic.to_le_bytes());
+            }
+            bytes
+        };
+
+        let standard = dir.join("standard.dll");
+        std::fs::write(&standard, make(0x80, 0x20B, 0x200)).unwrap();
+        assert!(is_pe32_plus(&standard));
+
+        // NT header past the old 0x400 probe window.
+        let large_stub = dir.join("large_stub.dll");
+        std::fs::write(&large_stub, make(0x500, 0x20B, 0x600)).unwrap();
+        assert!(is_pe32_plus(&large_stub));
+
+        let pe32 = dir.join("pe32.dll");
+        std::fs::write(&pe32, make(0x80, 0x10B, 0x200)).unwrap();
+        assert!(!is_pe32_plus(&pe32));
+
+        let huge_offset = dir.join("huge_offset.dll");
+        std::fs::write(&huge_offset, make(u32::MAX, 0x20B, 0x80)).unwrap();
+        assert!(!is_pe32_plus(&huge_offset));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

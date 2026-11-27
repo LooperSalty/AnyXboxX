@@ -17,18 +17,18 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
-pub mod fidelityfx;
-#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
 pub mod keymap;
+pub mod mouse;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
@@ -43,6 +43,7 @@ pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
+pub mod window_identity;
 pub mod xsystem;
 pub mod xuser;
 
@@ -64,17 +65,13 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
-    // Only when asked for: the title's own upscaler runs otherwise.
-    #[cfg(windows)]
-    if fidelityfx::enabled() {
-        all.push(fidelityfx::module());
-    }
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
+    all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]

@@ -128,6 +128,13 @@ pub fn operation(
             "{name}: clamp on integer result"
         )));
     }
+    let needs_literal = matches!(
+        name,
+        "v_madmk_f32" | "v_madak_f32" | "v_fmamk_f32" | "v_fmaak_f32"
+    );
+    if needs_literal && literal.is_none() {
+        return Err(Error::Untranslated(format!("{name} en VOP3 sans littéral")));
+    }
     let destination = fields.vdst as usize;
     let k = literal.unwrap_or(0);
     let select = if name == "v_cndmask_b32" {
@@ -269,8 +276,9 @@ pub fn mad64(
             i128::from(a) * i128::from(b) + i128::from(c)
         };
         let bits = total as u128;
-        wave.v[fields.vdst as usize][lane] = (bits as u64 & MASK32) as u32;
-        wave.v[fields.vdst as usize + 1][lane] = ((bits as u64 >> 32) & 0xFFFF_FFFF) as u32;
+        let destination = wave.vgpr_group(fields.vdst as usize, 2)?;
+        wave.v[destination][lane] = (bits as u64 & MASK32) as u32;
+        wave.v[destination + 1][lane] = ((bits as u64 >> 32) & 0xFFFF_FFFF) as u32;
         if !signed && bits >> 64 != 0 {
             carries |= 1u64 << lane;
         }
@@ -298,5 +306,24 @@ mod tests {
         let absolute = Fields::new(1 << 8);
         assert_eq!(modify(0x8000_0001, 0, &absolute, true), 0x0000_0001);
         assert_eq!(modify(0x8000_0001, 0, &fields, false), 0x8000_0001);
+    }
+
+    #[test]
+    fn literal_vop2_forms_in_vop3_require_a_literal() {
+        let mut wave = Wave::new(32).expect("wave32");
+        let fields = Fields::new(1 | (256u64 << 32) | (257u64 << 41));
+        for (opcode, name) in [
+            (0x120, "v_madmk_f32"),
+            (0x121, "v_madak_f32"),
+            (0x12C, "v_fmamk_f32"),
+            (0x12D, "v_fmaak_f32"),
+        ] {
+            let err = operation(&mut wave, name, opcode, &fields, None).unwrap_err();
+            assert!(matches!(err, Error::Untranslated(_)), "{name}: {err:?}");
+            assert!(
+                operation(&mut wave, name, opcode, &fields, Some(0x3F80_0000)).unwrap(),
+                "{name} with literal executes"
+            );
+        }
     }
 }

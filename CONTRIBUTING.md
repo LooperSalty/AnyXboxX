@@ -20,7 +20,7 @@ The `main` branch is protected. **Nobody can push to it directly.** To propose a
 
 A pull request is merged only after the maintainer's review and approval, and once the CI checks pass:
 
-- `lint` (Linux, ~1 min): ruff and consistency of the READMEs in the 9 languages;
+- `lint` (Linux, ~1 min): ruff and consistency of the English and French READMEs;
 - `pytest` (Windows): build of the C++ runtime and the Rust code, then the whole suite. It also checks the test count stated in the READMEs: the hundred below, followed by "+" (806 tests → "800+"). Only change it if your PR crosses a hundred.
 - `politique VIctory` (Linux): VIctory's asset policy (`cargo xtask policy`) on `third_party/victory`.
 

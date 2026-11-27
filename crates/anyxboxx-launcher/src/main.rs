@@ -39,6 +39,7 @@ mod progress;
 mod session;
 mod setup;
 mod shade;
+mod smooth_motion;
 mod splash;
 mod store;
 mod theme;

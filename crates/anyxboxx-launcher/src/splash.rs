@@ -199,6 +199,7 @@ pub struct Splash {
     failed: HashSet<usize>,
     textures: HashMap<usize, TextureHandle>,
     hidden_for_job: bool,
+    startup_skipped: bool,
     was_running: bool,
 }
 
@@ -233,6 +234,7 @@ impl Splash {
             failed: HashSet::new(),
             textures: HashMap::new(),
             hidden_for_job: false,
+            startup_skipped: false,
             was_running: false,
         }
     }
@@ -293,12 +295,17 @@ impl Splash {
             self.slides_started = Instant::now();
         }
         self.was_running = job_running;
-        is_visible(self.started.elapsed(), job_running, self.hidden_for_job)
+        let elapsed = if self.startup_skipped {
+            STARTUP_DURATION
+        } else {
+            self.started.elapsed()
+        };
+        is_visible(elapsed, job_running, self.hidden_for_job)
     }
 
     /// Ends the start-up moment now (a click on the splash).
     pub fn skip_startup(&mut self) {
-        self.started -= STARTUP_DURATION;
+        self.startup_skipped = true;
     }
 
     /// Hides the launch screen until the next job ("Show details").
@@ -448,6 +455,17 @@ mod tests {
         assert!(!is_visible(long, false, false));
         assert!(is_visible(long, true, false));
         assert!(!is_visible(long, true, true));
+    }
+
+    #[test]
+    fn skip_startup_is_idempotent_and_ends_startup_visibility() {
+        let mut splash = Splash::new();
+        assert!(splash.visible(false));
+        for _ in 0..5 {
+            splash.skip_startup();
+        }
+        assert!(!splash.visible(false));
+        assert!(splash.visible(true));
     }
 
     #[test]

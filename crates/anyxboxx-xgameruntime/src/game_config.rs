@@ -34,17 +34,15 @@ fn read_text() -> String {
     narrow(&bytes)
 }
 
-/// The text of `bytes`: UTF-16 (either byte order, with its mark) loses its zero bytes.
+/// The text of `bytes`: UTF-16 (either byte order, with its mark) drops its BOM and zero bytes.
 fn narrow(bytes: &[u8]) -> String {
-    let utf16 = matches!(bytes, [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]);
-    if utf16 {
-        bytes
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] | [0xFE, 0xFF, rest @ ..] => rest
             .iter()
             .filter(|&&byte| byte != 0)
             .map(|&byte| byte as char)
-            .collect()
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
+            .collect(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 
@@ -76,47 +74,81 @@ pub fn package_details() -> (String, String, String, String) {
     )
 }
 
-fn attribute_text(text: &str, element: &str, attribute: &str) -> String {
-    let Some(start) = text.find(&format!("<{element}")) else {
-        return String::new();
-    };
-    let tag = &text[start..];
-    let tag = tag.split('>').next().unwrap_or(tag);
-    let key = format!(" {attribute}=\"");
-    let Some(start) = tag.find(&key) else {
-        return String::new();
-    };
-    let value = &tag[start + key.len()..];
-    value
-        .find('"')
-        .map_or_else(String::new, |end| value[..end].to_owned())
+/// Finds the opening tag `<element ...>` without matching longer element names sharing the prefix.
+fn opening_tag<'a>(text: &'a str, element: &str) -> Option<&'a str> {
+    let needle = format!("<{element}");
+    let mut rest = text;
+    while let Some(pos) = rest.find(&needle) {
+        let after = &rest[pos + needle.len()..];
+        let boundary = after
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/');
+        if boundary {
+            let tag = &rest[pos..];
+            return Some(tag.split('>').next().unwrap_or(tag));
+        }
+        rest = after;
+    }
+    None
 }
 
-/// The Title ID declared by `<TitleId>` (hexadecimal), or 0 when it is missing or malformed.
-pub fn title_id() -> u32 {
-    let value = element_text(&read_text(), "TitleId");
+fn attribute_text(text: &str, element: &str, attribute: &str) -> String {
+    let Some(tag) = opening_tag(text, element) else {
+        return String::new();
+    };
+    let needle = format!("{attribute}=\"");
+    let mut rest = tag;
+    while let Some(pos) = rest.find(&needle) {
+        let preceded_by_ws = pos > 0 && rest.as_bytes()[pos - 1].is_ascii_whitespace();
+        if preceded_by_ws {
+            let value = &rest[pos + needle.len()..];
+            return value
+                .find('"')
+                .map_or_else(String::new, |end| value[..end].to_owned());
+        }
+        rest = &rest[pos + needle.len()..];
+    }
+    String::new()
+}
+
+fn parse_title_id(text: &str) -> u32 {
+    let raw = element_text(text, "TitleId");
+    let value = raw.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
     if value.is_empty() || value.len() > MAX_TITLE_ID_DIGITS {
         return 0;
     }
-    match u32::from_str_radix(&value, 16) {
-        Ok(id) => {
-            trace!("[runtime] Title ID du jeu : {id:08X}");
-            id
-        }
-        Err(_) => 0,
-    }
+    u32::from_str_radix(value, 16).unwrap_or(0)
 }
 
-/// The persistent local storage size declared by `<SizeMB>`, in bytes; 0 when missing.
-#[allow(dead_code)] // read by the local storage object (next step of the port)
-pub fn local_storage_bytes() -> u64 {
-    let value = element_text(&read_text(), "SizeMB");
+fn parse_local_storage_bytes(text: &str) -> u64 {
+    let raw = element_text(text, "SizeMB");
+    let value = raw.trim();
     if value.is_empty() || value.len() > MAX_SIZE_DIGITS {
         return 0;
     }
     value
         .parse::<u64>()
         .map_or(0, |megabytes| megabytes * 1024 * 1024)
+}
+
+/// The Title ID declared by `<TitleId>` (hexadecimal), or 0 when it is missing or malformed.
+pub fn title_id() -> u32 {
+    let id = parse_title_id(&read_text());
+    if id != 0 {
+        trace!("[runtime] Title ID du jeu : {id:08X}");
+    }
+    id
+}
+
+/// The persistent local storage size declared by `<SizeMB>`, in bytes; 0 when missing.
+#[allow(dead_code)] // read by the local storage object (next step of the port)
+pub fn local_storage_bytes() -> u64 {
+    parse_local_storage_bytes(&read_text())
 }
 
 #[cfg(test)]
@@ -136,7 +168,30 @@ mod tests {
         for unit in "<TitleId>AB</TitleId>".encode_utf16() {
             bytes.extend(unit.to_le_bytes());
         }
-        assert_eq!(element_text(&narrow(&bytes), "TitleId"), "AB");
+        let narrowed = narrow(&bytes);
+        assert_eq!(narrowed, "<TitleId>AB</TitleId>");
+        assert_eq!(element_text(&narrowed, "TitleId"), "AB");
+    }
+
+    #[test]
+    fn attributes_parse_across_newlines_tabs_and_skip_prefix_elements() {
+        let text = "<Game>\n\
+            <IdentityExtra Name=\"Wrong\" />\n\
+            <Identity\n\
+            \tName=\"MyGame\"\n\
+            \nPublisher=\"CN=Dev\"\n\
+            \tVersion=\"1.2.3.4\" />\n\
+            </Game>";
+        assert_eq!(attribute_text(text, "Identity", "Name"), "MyGame");
+        assert_eq!(attribute_text(text, "Identity", "Publisher"), "CN=Dev");
+        assert_eq!(attribute_text(text, "Identity", "Version"), "1.2.3.4");
+    }
+
+    #[test]
+    fn title_id_and_storage_size_trim_whitespace_and_hex_prefix() {
+        let text = "<Game><TitleId> 0x7952987A </TitleId><SizeMB>\n  128 \t</SizeMB></Game>";
+        assert_eq!(parse_title_id(text), 0x7952_987A);
+        assert_eq!(parse_local_storage_bytes(text), 128 * 1024 * 1024);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The launch side of the window state: the outcome card of the last job, cancelling a job, the
 //! log as text for "Copy log", the events of the running job, and the command line (`--page`,
-//! `--preview-launch`).
+//! `--victory-exe`, `--preview-launch`).
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use crate::app::{App, Tab};
@@ -25,10 +26,12 @@ impl Banner {
     }
 }
 
-/// What the command line asks for: the first page, and the launch screen preview.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What the command line asks for: the first page, a prebuilt `victory.exe`, and the launch screen
+/// preview.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Args {
     pub page: Option<Tab>,
+    pub victory_exe: Option<PathBuf>,
     pub preview_launch: bool,
 }
 
@@ -44,14 +47,27 @@ pub fn tab_named(name: &str) -> Option<Tab> {
     }
 }
 
-/// Reads `--page <name>` and `--preview-launch`; anything else is ignored. The preview is only
-/// honoured by debug builds (see `App::apply_args`).
+fn non_empty_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim().trim_matches('"');
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Reads `--page <name>`, `--victory-exe <path>` (or `--victory-exe=<path>`), and
+/// `--preview-launch`; anything else is ignored. The preview is only honoured by debug builds
+/// (see `App::apply_args`).
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
     let mut out = Args::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--victory-exe=") {
+            out.victory_exe = non_empty_path(value);
+            continue;
+        }
         match arg.as_str() {
             "--page" => out.page = args.next().as_deref().and_then(tab_named),
+            "--victory-exe" => {
+                out.victory_exe = args.next().as_deref().and_then(non_empty_path);
+            }
             "--preview-launch" => out.preview_launch = true,
             _ => {}
         }
@@ -65,11 +81,15 @@ impl App {
         self.clock.elapsed().as_secs_f64()
     }
 
-    /// Applies the command line: the first page, and the preview in debug builds.
+    /// Applies the command line: the first page, a prebuilt `victory.exe`, and the preview in
+    /// debug builds.
     pub fn apply_args(&mut self, args: Args) {
         if let Some(page) = args.page {
             self.tab = page;
             self.shown_tab = page;
+        }
+        if let Some(exe) = args.victory_exe {
+            self.victory_exe = Some(exe);
         }
         self.preview_launch = cfg!(debug_assertions) && args.preview_launch;
     }
@@ -187,6 +207,31 @@ mod tests {
         let a = args(&["--preview-launch", "--page", "play"]);
         assert!(a.preview_launch);
         assert_eq!(a.page, Some(Tab::Play));
+    }
+
+    #[test]
+    fn the_victory_exe_flag_reads_separate_and_equals_forms() {
+        let separate = args(&[
+            "--victory-exe",
+            "Z:\\prebuilt\\victory.exe",
+            "--page",
+            "play",
+        ]);
+        assert_eq!(
+            separate.victory_exe,
+            Some(PathBuf::from("Z:\\prebuilt\\victory.exe"))
+        );
+        assert_eq!(separate.page, Some(Tab::Play));
+
+        let equals = args(&["--victory-exe=\"C:\\out\\victory.exe\""]);
+        assert_eq!(
+            equals.victory_exe,
+            Some(PathBuf::from("C:\\out\\victory.exe"))
+        );
+
+        assert_eq!(args(&["--victory-exe"]).victory_exe, None);
+        assert_eq!(args(&["--victory-exe", "   "]).victory_exe, None);
+        assert_eq!(args(&["--victory-exe="]).victory_exe, None);
     }
 
     #[test]

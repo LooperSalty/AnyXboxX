@@ -23,9 +23,11 @@ pub fn spawn_flags() -> u32 {
     DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 }
 
-/// `%LOCALAPPDATA%\AnyXboxX\logs`, `None` when LOCALAPPDATA is not set.
+/// `%LOCALAPPDATA%\AnyXboxX\logs`, `None` when LOCALAPPDATA is not set or empty.
 pub fn log_dir(local_app_data: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    local_app_data.map(|local| PathBuf::from(local).join("AnyXboxX").join("logs"))
+    local_app_data
+        .filter(|v| !v.is_empty())
+        .map(|local| PathBuf::from(local).join("AnyXboxX").join("logs"))
 }
 
 /// `game-<unix seconds>.log` in `dir`: one file per launch.
@@ -66,10 +68,11 @@ pub fn wait_until_up(child: &mut Child, wait: Duration) -> io::Result<Result<(),
         if let Some(status) = child.try_wait()? {
             return Ok(Err(status.code().unwrap_or(1)));
         }
-        if started.elapsed() >= wait {
+        let elapsed = started.elapsed();
+        if elapsed >= wait {
             return Ok(Ok(()));
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(POLL.min(wait.saturating_sub(elapsed)));
     }
 }
 
@@ -90,6 +93,7 @@ mod tests {
         let dir = log_dir(Some(std::ffi::OsStr::new(r"C:\Users\me\AppData\Local"))).expect("dir");
         assert!(dir.ends_with(Path::new("AnyXboxX").join("logs")));
         assert!(log_dir(None).is_none());
+        assert!(log_dir(Some(std::ffi::OsStr::new(""))).is_none());
         let log = game_log_path(&dir, 1_795_654_414);
         assert_eq!(
             log.file_name().and_then(|n| n.to_str()),

@@ -52,7 +52,8 @@ uint BufSize(uint info) {{ return (info >> {SIZE_SHIFT}) & 31u; }}
 
 // m / (2^n - 1) arrondi au plus proche, 1 <= n <= 16 : l'écriture binaire du quotient est m répété ;
 // T (hi:lo, 64 bits) en garde les 64 premiers bits, la mantisse et le bit d'arrondi en sont tirés
-// (jamais d'égalité : la suite répétée n'est jamais nulle). Méthode de norm_bits (Leonida), en mots de 32 bits.
+// (jamais d'égalité : la suite répétée n'est jamais nulle). Identité m / (2^n - 1) = 0,mmm… en base 2^n,
+// calculée en mots de 32 bits.
 uint BufUnorm(uint m, uint n) {{
   if (m == 0u) return 0u;
   if (m == (1u << n) - 1u) return 0x3F800000u;

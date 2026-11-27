@@ -52,7 +52,7 @@ Line counts include comments and tests in the same folder (measured with a line 
 | `rust/` | Rust | 930 | `anyxboxx-rdna2` (TomBox decoder bridge), `anyxboxx-texture` (BC7, SW_4K_S), `anyxboxx-audio` (XMA2) |
 | `third_party/victory` | Rust | 120 000 | VIctory: `victory-core`, `-pe`, `-loader`, `-hle`, `-gpu`, `-shader`, `-formats`, `-pipeline`, `-game`, app `victory` |
 | `third_party/tombox` | Rust | submodule | TomBox console DLLs (`compat/*`), `tombox-xshader`, PE and RPF tools |
-| `third_party/leonida`, `third_party/xbox2windows` | Python | frozen copies | Leonida's SPIR-V translator, Xbox2Windows' DXIL retarget |
+| `third_party/xbox2windows` | Python | frozen copy | Xbox2Windows' DXIL retarget |
 | `tools/` | Python, PowerShell | 1 900 | Table generators, `jour_j.py`, `lancer_victory.ps1`, `Run-GpuCheck.ps1`, measurements |
 | `tests/` | Python (pytest) | 1 113 tests | The oracle of every port |
 
@@ -77,7 +77,7 @@ One Cargo workspace at the repository root (`Cargo.toml`), crates in `crates/`:
 
 What is **not** ported, because VIctory already does it: the HLSL recompiler (`rdna2_hlsl*.py`,
 replaced by `victory-shader`'s DXIL path once coverage matches), the Unicorn sandbox (see
-decision D2), Leonida's SPIR-V translator and the DXIL retarget (deleted with Python).
+decision D2) and the DXIL retarget (deleted with Python).
 
 ```mermaid
 graph TD
@@ -215,7 +215,7 @@ longer installs a C++ toolchain.
       `translate --cache --pipelines` step of the former `anyxboxx run`; no regression,
       and the Python interpreter is out of every measured path.
 
-Done when: `PrototypeScarlett/emu/rdna2*.py`, `third_party/leonida`, `third_party/xbox2windows`
+Done when: `PrototypeScarlett/emu/rdna2*.py`, `third_party/xbox2windows`
 are deleted.
 
 ### Phase 5: isolated mode and remaining HLE

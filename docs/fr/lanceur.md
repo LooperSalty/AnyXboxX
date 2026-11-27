@@ -1,6 +1,6 @@
 # Lanceur graphique : installation et utilisation
 
-Version anglaise : [../launcher.md](../launcher.md). Branche : `rust/full` (pas encore dans `main`). Code : `crates/anyxboxx-launcher`.
+Version anglaise : [../launcher.md](../launcher.md). Dans `main`. Code : `crates/anyxboxx-launcher`.
 
 `anyxboxx-launcher.exe` est une fenêtre qui vérifie votre machine et votre dossier du jeu, compile VIctory, préchauffe le cache des shaders et lance le jeu avec les réglages mesurés de `anyxboxx run` (les mêmes que `tools\lancer_victory.ps1` dans `main`). Il ne contient ni ne télécharge aucun fichier du jeu, et n'écrit jamais dans le dossier du jeu.
 
@@ -16,9 +16,8 @@ Version anglaise : [../launcher.md](../launcher.md). Branche : `rust/full` (pas 
 ### 1. Récupérer le code
 
 ```powershell
-git clone --branch rust/full https://github.com/LooperSalty/AnyXboxX.git
+git clone https://github.com/LooperSalty/AnyXboxX.git
 cd AnyXboxX
-git submodule update --init
 ```
 
 VIctory est inclus dans `third_party/victory` : rien d'autre à télécharger.
@@ -46,9 +45,10 @@ Le premier lancement après un nouveau build ou un nouveau réglage recompile de
 
 - Résolution et mode de fenêtre (fenêtré ou sans bordure).
 - Disposition du clavier : automatique, QWERTY, AZERTY ou QWERTZ (`VICTORY_KEYBOARD`).
-- Rapide (par défaut, réglages mesurés) ou Qualité (meilleurs éclairages et textures, moins d'images par seconde).
+- Rapide (par défaut, réglages mesurés), Qualité (meilleurs éclairages et textures, moins d'images par seconde), carte 12 Go ou carte 8 Go. Les réserves du profil Rapide sur la carte (1 536 Mo de fenêtres de données de dessin et de copies de tampons) ont été dimensionnées sur des cartes de 12 à 16 Go ; sur une RTX 5060 8 Go, il occupait 8 010 Mo pour un budget de 6 823 Mo, Windows déplaçait le reste dans la mémoire du PC et la file des textures était refusée. Les deux préréglages de carte réduisent ces réserves (1 024 Mo, ou 512 Mo avec une réserve de listes de 256 Mo) et plafonnent les textures du jeu avec `VICTORY_TEXTURE_MAX_SIZE` (2048, ou 1024 texels) : les niveaux d'une texture au-dessus du plafond ne reçoivent pas de mémoire sur la carte et ses vues commencent au premier niveau sous le plafond ; toutes les textures tiennent, un peu moins nettes de près. Le préréglage 12 Go n'est pas encore mesuré sur une carte de 12 Go.
 - Compteur d'images, appui automatique sur A pendant les écrans de démarrage, CSV des temps d'image dans le dossier du cache.
 - Panneau avancé : surcharge de variables `VICTORY_*` une à une ; elles priment toujours sur le profil.
+- NVIDIA Smooth Motion (RTX séries 40 et 50) : la génération d'images du pilote lui-même, qui insère une image générée entre deux images du jeu. Deux fois plus d'images affichées ; la réactivité reste celle des vraies images du jeu. Ce n'est pas une variable de VIctory : à chaque PLAY, le lanceur l'écrit dans le profil du pilote NVIDIA qui contient `victory.exe` (créé s'il n'y en a pas), via NVAPI, avec les identifiants de réglage qu'utilise NVIDIA Profile Inspector (`0xB0D384C0` activation, `0xB0CC0875` API autorisées : Direct3D 12). Aucun autre réglage du pilote n'est touché, et aucun droit administrateur n'est nécessaire.
 
 Les réglages sont des profils par système et par fabricant de carte (`crates/anyxboxx-launcher/profiles.toml`). Seul le jeu Windows + NVIDIA est mesuré ; les autres reprennent les valeurs par défaut de VIctory.
 
@@ -61,6 +61,7 @@ Les réglages sont des profils par système et par fabricant de carte (`crates/a
 | `%LOCALAPPDATA%\AnyXboxX\launcher\splash\` | Facultatif : vos propres images PNG ou JPEG, en diaporama. Rien n'y est fourni. |
 | `%LOCALAPPDATA%\victory\data\` | Sauvegardes, données et `crashes.log` de VIctory |
 | `third_party\victory\target\release\` | Le build de VIctory |
+| Réglages du pilote NVIDIA | Quand Smooth Motion est activé ou désactivé : les réglages Smooth Motion du profil qui contient `victory.exe` (`AnyXboxX (victory.exe)` quand le lanceur le crée) |
 
 ## Dépannage
 

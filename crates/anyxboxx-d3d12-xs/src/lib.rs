@@ -25,9 +25,10 @@ pub struct VirtualMemoryConfigurationHead {
 /// before device creation (without it the title stops on "UNIMPLEMENTED
 /// d3d12_xs.dll!D3D12ConfigureVirtualMemoryX").
 ///
-/// On the real executable the title fills only page_table_pages (+4) and tests only the result;
-/// the pointer may not cover 32 bytes. As Leonida measured (its shim writes nothing, #6750), only
-/// flags and page_table_pages are read (and logged), no output is written. Null is refused.
+/// What the title fills and reads in this structure is not measured by AnyXboxX: the pointer is
+/// assumed not to cover 32 bytes for sure (it may point into the caller's stack frame). Cautious
+/// choice: only flags and page_table_pages are read (and logged), no output is written, S_OK is
+/// returned. Null is refused.
 ///
 /// # Safety
 /// `description` is null or points at 8 readable bytes.

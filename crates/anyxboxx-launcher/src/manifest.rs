@@ -208,7 +208,12 @@ pub fn list_files(dir: &Path) -> io::Result<Vec<String>> {
         let is_rpf = Path::new(&name)
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("rpf"));
-        if is_rpf && entry.file_type()?.is_file() && !names.contains(&name) {
+        if is_rpf
+            && entry.file_type()?.is_file()
+            && !names
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
             names.push(name);
         }
     }
@@ -237,6 +242,10 @@ pub fn run(dir: &Path, cache_file: Option<&Path>, progress: &Progress) -> Outcom
     let mut cache = cache_file.map(load_cache).unwrap_or_default();
     let mut entries = Vec::new();
     for (name, (size, mtime)) in names.iter().zip(keys) {
+        if progress.cancel.load(Ordering::Relaxed) {
+            persist(cache_file, &cache);
+            return Outcome::Cancelled;
+        }
         if let Ok(mut current) = progress.current.lock() {
             current.clone_from(name);
         }
@@ -433,6 +442,38 @@ mod tests {
         let progress = Progress::new();
         progress.cancel.store(true, Ordering::Relaxed);
         assert_eq!(run(dir.path(), None, &progress), Outcome::Cancelled);
+    }
+
+    #[test]
+    fn a_cancel_stops_the_run_even_when_all_hashes_are_cached() {
+        let dir = folder();
+        let cache_file = dir.path().join("cache.toml");
+        assert!(matches!(
+            run(dir.path(), Some(&cache_file), &Progress::new()),
+            Outcome::Done(_)
+        ));
+        let progress = Progress::new();
+        progress.cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            run(dir.path(), Some(&cache_file), &progress),
+            Outcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn list_files_deduplicates_required_archives_case_insensitively() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("SHADERS.RPF"), b"shaders").expect("write");
+        let names = list_files(dir.path()).expect("list");
+        let matches: Vec<&String> = names
+            .iter()
+            .filter(|n| n.eq_ignore_ascii_case("shaders.rpf"))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "got duplicate shader archive entries: {names:?}"
+        );
     }
 
     #[test]

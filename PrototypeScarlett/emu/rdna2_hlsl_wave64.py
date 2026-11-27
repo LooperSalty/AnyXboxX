@@ -16,11 +16,13 @@ import re
 from emu import (rdna2, rdna2_hlsl, rdna2_hlsl_cmpf16, rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_f16,
                  rdna2_hlsl_format, rdna2_hlsl_image, rdna2_hlsl_int16, rdna2_hlsl_pkf16, rdna2_hlsl_sad,
                  rdna2_hlsl_wide)
+from emu import rdna2_hlsl_gather
 from emu.rdna2_exec_cmp16 import check_vop3
 from emu.rdna2_exec_cmpf16 import COMPAREF16
 from emu.rdna2_exec_memory import ADD_TID, LDS_ADD_TID
 from emu.rdna2_exec_vop3 import Fields, float_inputs
 from emu.rdna2_hlsl_clamp import CARRY, carry_write, refuse_integer_clamp
+from emu import rdna2_hlsl_f16conv
 from emu.rdna2_hlsl_memory import memory_statements
 from emu.rdna2_hlsl import SCALAR_FAMILIES, _fields, _literal, _words, modified
 from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, NULL, Untranslatable, compare_condition,
@@ -235,7 +237,9 @@ def translate(data, sgprs=None):
     helpers = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPERS, rdna2_hlsl_image.HELPERS,
                          rdna2_hlsl_format.HELPERS, rdna2_hlsl_dot.HELPERS,
                          rdna2_hlsl_sad.HELPERS, rdna2_hlsl_f16.HELPERS, rdna2_hlsl_cmpf16.HELPERS,
-                         rdna2_hlsl_int16.HELPERS, rdna2_hlsl_pkf16.HELPERS))
+                         rdna2_hlsl_int16.HELPERS, rdna2_hlsl_pkf16.HELPERS,
+                         rdna2_hlsl_gather.HELPERS,
+                         rdna2_hlsl_f16conv.HELPERS))
     prelude = PRELUDE.replace("[numthreads", helpers + "\n[numthreads", 1)
     lines = rdna2_hlsl.body(data, sgprs, branches=BRANCHES64, translate_one=statements)
     return "\n".join([prelude.rstrip("\n"), *lines, "}", ""])

@@ -1,12 +1,23 @@
 """Images RDNA 2 (MIMG) : champs de l'instruction, descripteurs T# (image) et S# (échantillonneur).
 
 Positions des champs et constantes :
-- Descripteurs T# (`SQ_IMG_RSRC_WORD*`, dont `BASE_LEVEL`/`LAST_LEVEL` bits 12..19 de WORD3) et
-  S# (`SQ_IMG_SAMP_WORD*`, constantes `SQ_TEX_CLAMP_*`, `SQ_TEX_XY_FILTER_*`,
-  `SQ_TEX_DEPTH_COMPARE_*`, `SQ_TEX_BORDER_COLOR_*`) : décodage de Leonida,
-  runtime/src/gfx10_descriptors.h (GPL-3.0, d'après Mesa src/amd/registers/gfx10-rsrc.json, MIT).
+- T# (`SQ_IMG_RSRC_WORD*`) : AMD RDNA 2 ISA (novembre 2020), section 8.2.6, table 45 (p. 75) :
+  adresse 39:0, format 60:52, width-1 77:62, height-1 93:78, dst_sel_x..w 107:96 (0 = 0, 1 = 1,
+  4..7 = R, G, B, A), base level 111:108, last level 115:112 (bits 12..19 de WORD3), type 127:124
+  (9 = 2d).
+- S# (`SQ_IMG_SAMP_WORD*`) : même ISA, section 8.2.7, table 46 (p. 76-77) : clamp x et y 2:0 et 5:3
+  (`SQ_TEX_CLAMP_*`, 0 à 7), depth compare func 14:12 (`SQ_TEX_DEPTH_COMPARE_*`, 0 à 7), force
+  unnormalized 15, xy mag et min filter 85:84 et 87:86 (0 = point, 1 = bilinear), border color type
+  127:126. La table 46 nomme les types de bordure sans leurs valeurs ; 0 = noir transparent, 1 = noir
+  opaque, 2 = blanc opaque viennent de l'énumération `SQ_TEX_BORDER_COLOR` de Mesa
+  (src/amd/registers/gfx6.json, MIT, lu dans le code).
+- Noms des champs et des constantes : Mesa src/amd/registers/gfx10-rsrc.json et gfx6.json (MIT) ; chaque
+  position et valeur ci-dessus est celle de l'ISA et de Mesa (lus et comparés au code).
 - Encodage MIMG gfx10 : LLVM SIInstrFormats.td (MIMGe_gfx10, Apache 2.0).
-- Noms des formats : data/gfx10_formats.json (Leonida).
+- Codes des formats : ISA, section 8.2.8, table 47 (p. 78-79). Noms : data/gfx10_formats.json,
+  l'énumération `GFX10_FORMAT` de Mesa src/amd/registers/gfx10-rsrc.json (MIT, commit 1a24f43d97b3,
+  dernier changement du fichier) écrite une entrée par ligne, `"valeur": "nom"`, dans l'ordre de Mesa ;
+  les 105 codes de la table 47 y portent le même nom.
 - Ordre des registres d'adresse MIMG (`[offset], [z_ref], s, t, [lod]`) et décalages signés sur
   6 bits (`off_x = bits[5:0]`, `off_y = bits[13:8]`) : AMD RDNA 2 ISA, Table 8.9.
 - Sens de comparaison profondeur (`z_ref <op> texel`) : AMD RDNA 2 ISA / D3D12 `SampleCmp`.

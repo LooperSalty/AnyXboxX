@@ -54,7 +54,7 @@ compteur de lignes sur `main` à `07d3981`).
 | `rust/` | Rust | 930 | `anyxboxx-rdna2` (passerelle vers le décodeur de TomBox), `anyxboxx-texture` (BC7, SW_4K_S), `anyxboxx-audio` (XMA2) |
 | `third_party/victory` | Rust | 120 000 | VIctory : `victory-core`, `-pe`, `-loader`, `-hle`, `-gpu`, `-shader`, `-formats`, `-pipeline`, `-game`, application `victory` |
 | `third_party/tombox` | Rust | sous-module | DLL console de TomBox (`compat/*`), `tombox-xshader`, outils PE et RPF |
-| `third_party/leonida`, `third_party/xbox2windows` | Python | copies figées | Traducteur SPIR-V de Leonida, retarget DXIL de Xbox2Windows |
+| `third_party/xbox2windows` | Python | copie figée | Retarget DXIL de Xbox2Windows |
 | `tools/` | Python, PowerShell | 1 900 | Générateurs de tables, `jour_j.py`, `lancer_victory.ps1`, `Run-GpuCheck.ps1`, mesures |
 | `tests/` | Python (pytest) | 1 113 tests | L'oracle de chaque portage |
 
@@ -80,8 +80,8 @@ Un seul espace Cargo à la racine du dépôt (`Cargo.toml`), les crates dans `cr
 
 Ce qui **n'est pas** porté, parce que VIctory le fait déjà : le recompilateur HLSL
 (`rdna2_hlsl*.py`, remplacé par le chemin DXIL de `victory-shader` quand la couverture est
-égale), le bac à sable Unicorn (voir la décision D2), le traducteur SPIR-V de Leonida et le
-retarget DXIL (supprimés avec Python).
+égale), le bac à sable Unicorn (voir la décision D2) et le retarget DXIL (supprimé avec
+Python).
 
 ```mermaid
 graph TD
@@ -229,7 +229,7 @@ n'installe plus de chaîne C++.
       image mesurés avec l'étape `translate --cache --pipelines` de l'ancien `anyxboxx run` ;
       aucune régression, et l'interpréteur Python ne figure dans aucun chemin mesuré.
 
-Finie quand : `PrototypeScarlett/emu/rdna2*.py`, `third_party/leonida`, `third_party/xbox2windows`
+Finie quand : `PrototypeScarlett/emu/rdna2*.py`, `third_party/xbox2windows`
 sont supprimés.
 
 ### Phase 5 : mode isolé et HLE restant

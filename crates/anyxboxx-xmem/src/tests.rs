@@ -6,7 +6,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_NOACCESS, ERROR_NOT_SUPPORTED, GetLastError, SetLastError,
+    ERROR_INVALID_PARAMETER, ERROR_NOACCESS, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED,
+    GetLastError, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
@@ -253,6 +254,17 @@ fn virtual_alloc_refuses_undefined_flags() {
         let at = XMemVirtualAlloc(std::ptr::null_mut(), 0x1_0000, kind, attributes, protect);
         assert!(at.is_null());
         assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+    }
+}
+
+#[test]
+fn virtual_alloc_refuses_overflowing_sizes_without_panicking() {
+    let _serial = serial();
+    for address in [std::ptr::null_mut(), 0x1_0000_usize as *mut c_void] {
+        clear_error();
+        let at = XMemVirtualAlloc(address, usize::MAX, 0x2040_2000, 0x21, 4);
+        assert!(at.is_null());
+        assert_eq!(last_error(), ERROR_NOT_ENOUGH_MEMORY);
     }
 }
 

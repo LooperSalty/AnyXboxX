@@ -5,6 +5,7 @@
 //! archives. The next launch compares the fingerprint of the moment with the marker: a missing,
 //! unreadable or different marker means the warm runs again before the game starts.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -14,9 +15,9 @@ pub const MARKER_FILE: &str = "warm-state.txt";
 /// Variables that do not change the shader cache: the game folder and the log level.
 const NOT_IN_KEY: [&str; 2] = ["VICTORY_GAME_DIR", "VICTORY_LOG"];
 
-/// `%LOCALAPPDATA%\AnyXboxX\launcher\warm-state.txt`, `None` when LOCALAPPDATA is not set.
+/// `%LOCALAPPDATA%\AnyXboxX\launcher\warm-state.txt`, `None` when LOCALAPPDATA is not set or empty.
 pub fn marker_path(local_app_data: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    local_app_data.map(|local| {
+    local_app_data.filter(|v| !v.is_empty()).map(|local| {
         PathBuf::from(local)
             .join("AnyXboxX")
             .join("launcher")
@@ -47,15 +48,19 @@ pub fn build_id(exe: &Path) -> String {
     }
 }
 
-/// The cache-relevant variables, sorted, one `KEY=VALUE` per line.
+/// The cache-relevant variables, sorted and deduplicated (last entry wins), one `KEY=VALUE` per line.
 pub fn env_key(env: &Env) -> String {
-    let mut pairs: Vec<String> = env
-        .iter()
-        .filter(|(key, _)| key.starts_with("VICTORY_") && !NOT_IN_KEY.contains(&key.as_str()))
-        .map(|(key, value)| format!("{key}={}", value.to_string_lossy()))
-        .collect();
-    pairs.sort();
-    pairs.join("\n")
+    let mut effective: BTreeMap<&str, String> = BTreeMap::new();
+    for (key, value) in env {
+        if key.starts_with("VICTORY_") && !NOT_IN_KEY.contains(&key.as_str()) {
+            effective.insert(key.as_str(), value.to_string_lossy().into_owned());
+        }
+    }
+    effective
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `name:size:modified` of each archive, in the order given.
@@ -234,6 +239,22 @@ mod tests {
         let path = marker_path(Some(std::ffi::OsStr::new(r"C:\L"))).expect("path");
         assert!(path.ends_with(Path::new("AnyXboxX").join("launcher").join(MARKER_FILE)));
         assert!(marker_path(None).is_none());
+        assert!(marker_path(Some(std::ffi::OsStr::new(""))).is_none());
+    }
+
+    #[test]
+    fn overridden_victory_variables_keep_only_the_last_value() {
+        let overridden = env(&[
+            ("VICTORY_RELAY", "2"),
+            ("VICTORY_A", "1"),
+            ("VICTORY_RELAY", "0"),
+        ]);
+        let direct = env(&[("VICTORY_A", "1"), ("VICTORY_RELAY", "0")]);
+        assert_eq!(env_key(&overridden), "VICTORY_A=1\nVICTORY_RELAY=0");
+        assert_eq!(
+            fingerprint("1:1", &overridden, &archives()),
+            fingerprint("1:1", &direct, &archives())
+        );
     }
 
     #[test]
