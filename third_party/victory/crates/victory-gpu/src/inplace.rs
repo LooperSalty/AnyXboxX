@@ -451,13 +451,25 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     if len == 0 {
         return Vec::new();
     }
-    let v = views();
+    section_views(&views(), section, offset, len, Some(crate::watch::MANY_VIEWS))
+}
+
+/// Includes heavily aliased pages when every view must be accounted for.
+#[allow(dead_code)] // Used by the lazy readback port.
+pub(crate) fn views_of_section_all(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    section_views(&views(), section, offset, len, None)
+}
+
+fn section_views(v: &Views, section: usize, offset: u64, len: usize, limit: Option<usize>) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
     let end = offset.saturating_add(len as u64);
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
     while at < end {
         if let Some(shown) = v.pages.get(&(section, at))
-            && shown.len() <= crate::watch::MANY_VIEWS
+            && limit.is_none_or(|limit| shown.len() <= limit)
         {
             pages.extend(shown.iter().copied());
         }
@@ -1333,6 +1345,20 @@ pub(crate) fn tick() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn uncapped_section_views_include_every_alias() {
+        let section = usize::MAX;
+        let aliases: Vec<usize> = (0..=crate::watch::MANY_VIEWS)
+            .map(|i| 0x6000_0000_0000 + i * 2 * K64)
+            .collect();
+        views_mut().pages.insert((section, 0), aliases.clone());
+        let capped = views_of_section(section, 0, K64);
+        let all = views_of_section_all(section, 0, K64);
+        views_mut().pages.remove(&(section, 0));
+        assert!(capped.is_empty());
+        assert_eq!(all, aliases.into_iter().map(|at| (at, K64)).collect::<Vec<_>>());
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
