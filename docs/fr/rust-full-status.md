@@ -130,6 +130,8 @@ VOP3 utilise aussi les expressions VOP1/VOP2 pour leurs encodages longs. WARP v�
 
 Les lectures et écritures LDS ADDTID utilisent M0, le déplacement immédiat et le numéro de ligne en wave32 et wave64. Les tests sous EXEC partiel échangent des données via la LDS et comparent la mémoire sous WARP à l’interpréteur.
 
+Les formes VOP3b avec retenue ou emprunt non signé, avec ou sans retenue en entrée et saturation, et les multiplications-additions 64 bits signées et non signées concordent sous WARP en wave32 et wave64.
+
 MIMG couvre les 57 opérations d’image traduites par Python, dont les atomiques 32 bits et toutes les variantes de gather. Pour chaque encodage, un test compare le texte HLSL et la mémoire obtenue sur WARP.
 
 Deux désaccords mesurés entre les oracles empêchent une parité inconditionnelle à l’octet près. Avec M0 = 250, `v_movrels_b32 v1, v10` lit v260. Les deux générateurs HLSL produisent le même shader, qui écrit zéro sur les 32 lignes sous WARP. L’interpréteur Python lève `Untranslated` avant de produire des octets. Pour une entrée valide, `v_cos_f32(0x3E800000)` (un quart de tour), le shader Python exécuté sur WARP donne `0xB33BBD2E` et la référence Python donne `0x248D3132`. Le port Rust refuse actuellement cet opcode en le nommant. Ces mesures utilisent des programmes synthétiques, DXC et WARP sous Windows.

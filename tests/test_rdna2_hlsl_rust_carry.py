@@ -1,49 +1,39 @@
-﻿"""Carry/borrow VOP2 text and WARP lane and VCC parity."""
-import struct
+"""VOP3b carry-in, carry-out, saturation and 64-bit multiplication in both wave sizes."""
 
 import pytest
 
 from emu import rdna2_exec, rdna2_gpu, rdna2_hlsl
-from test_rdna2_exec import LITERAL, V, program, sop1, vop1, vop2
+from test_rdna2_exec import LITERAL, V, sop1, vop1, vop3
+from test_rdna2_exec_memory import OUTPUT
+from test_rdna2_hlsl import MEMORY_SIZE, store_lane, with_lane_offset
 from test_rdna2_hlsl_rust_parity import rust
+from test_rdna2_hlsl_wave64 import store_lane as store64
 
-OPS = ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32")
 
-
-@pytest.mark.parametrize("name", OPS)
-@pytest.mark.parametrize("a,b,vcc,mask", [(0, 0, 0, 0xffffffff), (0, 0, 0xffffffff, 0xffffffff),
-                                          (0xffffffff, 0, 0x55555555, 0xffffffff),
-                                          (0xffffffff, 1, 0xaaaaaaaa, 0x55555555),
-                                          (1, 1, 0xffffffff, 0xaaaaaaaa),
-                                          (0x12345678, 0xfedcba98, 0x12345678, 0xf0f0f0f0)])
-def test_vop2_carry_text_and_warp(name, a, b, vcc, mask, monkeypatch):
-    if not rdna2_gpu.available():
-        pytest.skip("dxc or GPU runner is unavailable")
-    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
-    data = program(vop1("v_mov_b32", 1, LITERAL), a, vop1("v_mov_b32", 2, LITERAL), b,
-                   vop1("v_mov_b32", 3, LITERAL), 0x12345678, sop1("s_mov_b32", 106, LITERAL), vcc,
-                   sop1("s_mov_b32", 126, LITERAL), mask, vop2(name, 3, V + 1, 2))
-    result = rust(data)
+@pytest.mark.parametrize("lanes", [32, 64])
+def test_vop3b_arithmetic(lanes):
+    store = store_lane if lanes == 32 else store64
+    ops = [sop1("s_mov_b32", 2, LITERAL), OUTPUT, sop1("s_mov_b32", 8, LITERAL), 0xFF00F103,
+           sop1("s_mov_b32", 9, LITERAL), 0x835FB002, vop1("v_mov_b32", 1, LITERAL), 0xFFFFFFFF]
+    for i, op in enumerate(("add", "sub", "subrev")):
+        for carry_in in (False, True):
+            name = f"v_{op}_co{'_ci' if carry_in else ''}_u32"
+            ops += [*vop3(name, 3, V + 1, V, 8, sdst=12, clamp=1),
+                    *store(3, 0), vop1("v_mov_b32", 4, 12), *store(4, 1),
+                    vop1("v_mov_b32", 4, 13), *store(4, 2)]
+            # Move the output base after each group so every result stays observable.
+            ops += [sop1("s_mov_b32", 2, LITERAL), OUTPUT + (2 * i + int(carry_in) + 1) * 4096]
+    ops += [*vop3("v_mad_u64_u32", 4, V, V + 1, V, sdst=12), *store(4, 0), *store(5, 1),
+            *vop3("v_mad_i64_i32", 6, V, V + 1, V, sdst=125), *store(6, 2), *store(7, 3)]
+    data = with_lane_offset(*ops)
+    result = rust(data, *(["--wave64"] if lanes == 64 else []))
     assert result.returncode == 0, result.stderr.decode()
-    hlsl = result.stdout.decode("utf-8")
-    assert hlsl == rdna2_hlsl.translate(data)
-    wave = rdna2_exec.run(data)
-    hlsl = hlsl.replace("  return;\n", "  g_memory.Store(lane * 4u, v[3]); "
-                        "if (lane == 0) g_memory.Store(128, s[106]);\n  return;\n")
-    assert rdna2_gpu.run(hlsl, bytes(132)) == struct.pack("<33I", *wave.v[3], wave.s[106])
-
-
-@pytest.mark.parametrize("name", OPS)
-def test_vop2_carry_literal_and_lane_source(name, monkeypatch):
+    hlsl = result.stdout.decode()
+    assert hlsl == rdna2_hlsl.translate(data, wave_size=lanes)
     if not rdna2_gpu.available():
-        pytest.skip("dxc or GPU runner is unavailable")
-    monkeypatch.setenv("ANYXBOXX_GPU", "warp")
-    data = program(sop1("s_mov_b32", 106, LITERAL), 0x55555555, vop2(name, 1, LITERAL, 0), 0xfffffff0)
-    result = rust(data)
-    assert result.returncode == 0, result.stderr.decode()
-    hlsl = result.stdout.decode("utf-8")
-    assert hlsl == rdna2_hlsl.translate(data)
-    wave = rdna2_exec.run(data)
-    hlsl = hlsl.replace("  return;\n", "  g_memory.Store(lane * 4u, v[1]); "
-                        "if (lane == 0) g_memory.Store(128, s[106]);\n  return;\n")
-    assert rdna2_gpu.run(hlsl, bytes(132)) == struct.pack("<33I", *wave.v[1], wave.s[106])
+        pytest.skip("dxc or GPU runner unavailable")
+    wave = rdna2_exec.Wave(lanes=lanes)
+    initial = bytes(MEMORY_SIZE)
+    wave.memory.write(0, initial)
+    rdna2_exec.run(data, wave)
+    assert rdna2_gpu.run(hlsl, initial) == wave.memory.read(0, MEMORY_SIZE)
