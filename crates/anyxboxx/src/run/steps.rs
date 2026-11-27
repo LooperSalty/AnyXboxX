@@ -9,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 
 use super::identity::{BuildProfile, IdentityError, MANIFEST_PIN_ENV, VerifiedPrebuilt};
-use super::{RunArgs, RunError, settings};
+use super::{Console, RunArgs, RunError, settings};
 
 pub const GAME_EXE: &str = "game_scarlett_master.exe";
 /// The game's two DLLs warmed with its shaders by `--precompile`.
@@ -143,13 +143,20 @@ impl Victory {
         Ok(self.warm_command(&[], env))
     }
 
-    /// `victory run <game> --execute` with the game's environment.
+    /// `victory run <game> --execute` with the game's environment, as a Series X.
     pub fn game_command(&self, game_dir: &Path, env: &Env) -> RuntimeCommand {
+        self.game_command_as(game_dir, env, Console::SeriesX)
+    }
+
+    /// `victory run <game> --execute`, then the arguments of `console` (none for Series X).
+    pub fn game_command_as(&self, game_dir: &Path, env: &Env, console: Console) -> RuntimeCommand {
         let mut command = self.runtime_command();
         command
+            .command
             .arg("run")
             .arg(game_dir.join(GAME_EXE))
-            .arg("--execute");
+            .arg("--execute")
+            .args(console.victory_args());
         apply_env(&mut command.command, env);
         command
     }

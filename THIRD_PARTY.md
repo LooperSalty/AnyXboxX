@@ -35,7 +35,7 @@ Co-authored-by: Nom <e-mail>
 
 Depuis le 26 novembre au soir, la base est **[TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay)** (Taynan Piza et ses contributeurs, GPL-3.0 ou ultérieure) au commit `a252348`, sans son dossier `.github` (commit « chore: move third_party/victory to the Vice-Tay base »), puis nos changements, chacun dans son commit : la colle AnyXboxX (clavier, fenêtre sans bordure, `EraFields`, emplacements `XThread`), l'oracle XG, l'overlay, l'appui automatique sur A et la Rich Presence Discord, repris de la base Neptune ci-dessous. Vice-Tay est lui-même bâti sur Marvisak/VIctory et ses forks ; ses crédits sont dans `third_party/victory/docs/credits.md`. Mesuré sur RTX 4070 SUPER, Series X, cache chaud : environ 20 fps médians dans le monde contre 14,2 pour la base Neptune.
 
-Repris ensuite sur la base Vice-Tay : [KainanP/VIctory](https://github.com/KainanP/VIctory) (KainanP, fork de Marvisak/VIctory, GPL-3.0 ou ultérieure), banc des appels de liste (branche `perf/list-call-bench`, test ignoré `pipeline::list_bench`).
+Repris ensuite sur la base Vice-Tay : [KainanP/VIctory](https://github.com/KainanP/VIctory) (KainanP, fork de Marvisak/VIctory, GPL-3.0 ou ultérieure), banc des appels de liste (branche `perf/list-call-bench`, test ignoré `pipeline::list_bench`) ; [101Leafy/victory-leafy](https://github.com/101Leafy/victory-leafy) (Altorru, fork de Marvisak/VIctory, GPL-3.0), forme de la réserve de la carte pour les cibles de rendu qui suit le budget de la carte (PR #26, adaptée : autre formule, sans sa partie `pool::spares`) ; [KainanP/VIctory-7900XTX](https://github.com/KainanP/VIctory-7900XTX) (KainanP, fork d'avatarmanz/VIctory-7900XTX, GPL-3.0), la même réserve et son test (commit `6e76be9`, branche `gpu/targets-reserve-follows-budget`).
 
 Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : la source correspondante livrée avec son paquet (`neptune-ve-source.zip`, GPL-3.0 ou ultérieure), committée telle quelle (commit « feat: VIctory base moved to Neptune (VIctory Edit.) 2026-11-25c »), puis nos changements, chacun dans son commit. Aucune dépendance git ni chemin hors de l'arbre : `Cargo.toml` et `Cargo.lock` ne prennent que crates.io.
 
@@ -43,18 +43,29 @@ Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : l
 | --- | --- | --- | --- |
 | Neptune (VIctory Edit.), paquet du 2026-11-25 au soir (auteur sans contact public) | GPL-3.0 ou ultérieure | L'assemblage et ses propres changements : temps d'image, souris et clavier, Rich Presence Discord, éclairage ambiant de remplacement, file de textures et mémoire de la carte, attente de pipelines bornée à 2,5 s, `play.ps1` (jeu de réglages repris dans `anyxboxx run`) | Rich Presence Discord éteinte sauf `VICTORY_DISCORD=1` |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Validation du stockage persistant hors du cache, y compris les alias de casse Windows (dereoalex, [PR #1789](https://github.com/Marvisak/VIctory/pull/1789)) |
+<<<<<<< HEAD
+<<<<<<< HEAD
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Adaptation de la [PR #1398](https://github.com/Marvisak/VIctory/pull/1398) (EatCodeSleep2) pour les additions et soustractions VOP3 non signées avec saturation. |
+=======
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Tests sur GPU de l'alignement des éléments de sommets ajoutés pour l'expansion CPU des rectangles ([`691236d`](https://github.com/Marvisak/VIctory/commit/691236d606b9de8cbccfa8540e2b27ca6070f8ae), JFIREonFIRE) |
+>>>>>>> pr324
+=======
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Portage du [correctif des CBV nulles](https://github.com/Marvisak/VIctory/commit/78ed12eb79774bf141efaaf6ebd626a10bfb5bbf) (Matsvey Makushenka) |
+>>>>>>> pr305
 | [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (fxceless ; PR de Jonirulah, Flyander, AscilCH) | GPL-3.0 | La base : niveaux à la demande, synchronisation du tas de descripteurs (`a26859f`, `9376fd6`) | Pages physiques en sections de 2 Mio au plus (`VICTORY_SECTION_MB`) : idée et premier patch de RyanCase94 (issue #1089), portage de CuteBooty (PR #1274) |
 | [myokex/victory-amd](https://github.com/myokex/victory-amd) (myokex) | GPL-3.0 | La base, avec fxceless/victory-fork | |
 | [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) (soldsawn) | GPL-3.0 | Le traducteur de shaders (programmes wave64 appariés sur les cartes NVIDIA à 32 lanes) | |
 | Belobug, [reddxd-byte/ShakiraRED-dt](https://github.com/reddxd-byte/ShakiraRED-dt) | GPL-3.0 ou ultérieure | La passe de lumière ambiante | La passe du tas sur les emplacements marqués (`VICTORY_HEAP_PASS_DIRTY`, commit `2c6dc966`, portée de `c2271e5`, squash de VIwork de Trexies/victory-fork) |
 | [ZSlayerHQ/victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime) (ZSlayerHQ) | GPL-3.0 | Écritures vues entre vues, lectures noyau, dispatchs en parties | |
 | [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) (fxceless) | GPL-3.0 | Non (hors base Neptune) | Index des copies par étape (`VICTORY_STEP_INDEX`, `84c5dc00`) ; copies de la carte en trois temps (`VICTORY_CARD_SYNC_BATCH`, `6aed0780`) ; vérifications de textures sur le pool d'aides (`VICTORY_PARALLEL_REFRESH`, `ceb9e1f7`, partie host.rs seule) |
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/ea488a9f9901e4375c547a57795ae8cb79d577a4) (lhnizdo) | GPL-3.0 ou ultérieure | | Adaptation de la vérification des formats inscriptibles pour les vues UAV de texture |
 | [JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd) (JoshuuDev) | GPL-3.0 | Verrou de remappage par plage ; corrections de blend et de descripteurs | |
 | zm0kie | GPL-3.0 | Overlay (F10), envois de fenêtres, lignes mémoire, `tools/` (`start-neptune.ps1`, `memwatch.ps1`) | |
 | [skornuta/victory-fork](https://github.com/skornuta/victory-fork) (skornuta) | GPL-3.0 | Export des temps d'image (`VICTORY_FRAMETIME_DUMP`) | |
 | Trexies | GPL-3.0 | Petits tampons regroupés | |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/94c1ead4ed8499f2ae3c05d4d5f99b28164cc2cf) (Flare) | GPL-3.0 ou ultérieure | | Filtrage mip par point des samplers anisotropes dans les tas de descripteurs |
 | Le correctif de redirection FidelityFX reçu pour DexNom Runtime | GPL-3.0 | `VICTORY_FSR_DLL` (mode Series S, non utilisé par le lanceur) | |
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/97c8783f4a260996b602b75cabfe17568b1d1a26) (AnoHunted) | GPL-3.0 ou ultérieure | | Séparation du format `A8_UNORM` de la famille sans type `R8` |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
 | [JMAN730/victory](https://github.com/JMAN730/victory) (JMAN730 ; commit `b975c652` de fever308) | GPL-3.0 | Non (hors base Neptune) | Idée seule, non portée : copies volumineuses en morceaux sur les fils conservés (`VICTORY_WIDE_COPY`, version réduite écrite contre notre `copy_mapped`) |
 

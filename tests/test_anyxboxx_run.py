@@ -429,11 +429,13 @@ def test_cli_warms_and_launches_prebuilt_without_cargo(tmp_path, binary, fake_to
     call_log = tmp_path / "calls.log"
     env = prebuilt_env(tmp_path)
     env.update({"FAKE_TOOL_LOG": str(call_log), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT)})
+    console = []
     if verify:
         env[PIN_KEY] = prebuilt_manifest(exe, exe.read_bytes())
+        console = ["--console", "series-s"]
     done = subprocess.run(
         [str(binary), "run", "--repo", str(tmp_path / "no-repo"), "--warm",
-         "--game-dir", str(game_dir), "--victory-exe", str(exe)],
+         "--game-dir", str(game_dir), "--victory-exe", str(exe), *console],
         env=env, capture_output=True, text=True, timeout=30,
     )
     assert done.returncode == VICTORY_EXIT, done.stderr
@@ -441,3 +443,5 @@ def test_cli_warms_and_launches_prebuilt_without_cargo(tmp_path, binary, fake_to
     assert done.stdout.count("VICTORY_RUNTIME_IDENTITY=") == (2 if verify else 0)
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert [call.split()[:2] for call in calls] == [["victory", "warm"], ["victory", "run"]]
+    if console:
+        assert calls[1].split(" | ", 1)[0].endswith(" --console series-s")
