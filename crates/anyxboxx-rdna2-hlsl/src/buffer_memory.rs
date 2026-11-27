@@ -26,7 +26,7 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     };
     let count = match width {
         "dword" => 1,
-        "ubyte" | "sbyte" if !write => 1,
+        "ubyte" | "sbyte" | "ushort" | "sshort" if !write => 1,
         "dwordx2" => 2,
         "dwordx3" => 3,
         "dwordx4" => 4,
@@ -71,6 +71,8 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
     };
     let size = if matches!(width, "ubyte" | "sbyte") {
         1
+    } else if matches!(width, "ushort" | "sshort") {
+        2
     } else {
         count * 4
     };
@@ -106,7 +108,9 @@ pub fn statements(name: &str, word: u64) -> Result<Vec<String>, String> {
             "AllMemoryBarrierWithGroupSync();".into(),
         ])
     } else {
-        let loads = if matches!(width, "ubyte" | "sbyte") {
+        let loads = if matches!(width, "ushort" | "sshort") {
+            format!("v[{data}] = {};", crate::subword::half(width, &address))
+        } else if matches!(width, "ubyte" | "sbyte") {
             let value = format!(
                 "((g_memory.Load(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & 0xFFu)"
             );

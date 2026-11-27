@@ -11,7 +11,7 @@ from test_rdna2_hlsl_rust_parity import rust
 
 
 @pytest.mark.parametrize("family", ["global", "global_off", "flat"])
-@pytest.mark.parametrize("width", ["ubyte", "sbyte"])
+@pytest.mark.parametrize("width", ["ubyte", "sbyte", "ushort", "sshort"])
 @pytest.mark.parametrize("byte_offset", [0, 1, 2, 3])
 @pytest.mark.parametrize("mask", [0xffffffff, 0x55555555])
 def test_byte_load_text_and_warp(family, width, byte_offset, mask, monkeypatch):
@@ -33,7 +33,7 @@ def test_byte_load_text_and_warp(family, width, byte_offset, mask, monkeypatch):
     hlsl = result.stdout.decode("utf-8")
     assert hlsl == rdna2_hlsl.translate(data)
     initial = bytearray(1024)
-    initial[256:384] = bytes([0, 127, 128, 255]) * 32
+    initial[256:384] = bytes([0x34, 127, 128, 255]) * 32
     wave = rdna2_exec.Wave()
     wave.memory.write(0, bytes(initial))
     rdna2_exec.run(data, wave)
@@ -43,7 +43,7 @@ def test_byte_load_text_and_warp(family, width, byte_offset, mask, monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(initial)) == bytes(expected)
 
 
-@pytest.mark.parametrize("name", ["flat_store_byte", "global_store_short", "global_load_ushort"])
+@pytest.mark.parametrize("name", ["flat_store_byte", "global_store_short", "global_atomic_sub"])
 def test_unported_subword_forms_are_named(name):
     encoder = flat if name.startswith("flat_") else global_
     result = rust(program(*encoder(name, 1, data=4, vdst=10)))

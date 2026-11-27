@@ -9,7 +9,8 @@ from emu import rdna2_exec, rdna2_gpu, rdna2_hlsl
 from test_rdna2_exec import LITERAL, const, program, sop1, sop2, sopc, sopp
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target" / "release" / ("anyxboxx-rdna2-hlsl.exe" if os.name == "nt" else "anyxboxx-rdna2-hlsl")
+TARGET = ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
+BINARY = TARGET / "release" / ("anyxboxx-rdna2-hlsl.exe" if os.name == "nt" else "anyxboxx-rdna2-hlsl")
 
 
 def rust(data):

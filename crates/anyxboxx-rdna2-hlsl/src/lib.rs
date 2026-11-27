@@ -15,6 +15,7 @@ mod scalar_immediate;
 mod scalar_memory;
 mod scalar_movrel;
 mod scalar_wide;
+mod subword;
 mod vector_binary;
 mod vector_compare;
 mod vector_dot;

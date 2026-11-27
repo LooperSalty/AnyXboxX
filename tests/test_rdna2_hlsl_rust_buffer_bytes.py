@@ -9,7 +9,7 @@ from test_rdna2_exec_memory import mubuf
 from test_rdna2_hlsl_rust_parity import rust
 
 
-@pytest.mark.parametrize("width", ["ubyte", "sbyte"])
+@pytest.mark.parametrize("width", ["ubyte", "sbyte", "ushort", "sshort"])
 @pytest.mark.parametrize("offset", [0, 1, 2, 3])
 @pytest.mark.parametrize("records,stride,mask", [(19, 0, 0xffffffff), (0, 0, 0x55555555),
                                                  (2, 16, 0xaaaaaaaa)])
@@ -27,7 +27,7 @@ def test_buffer_byte_load(width, offset, records, stride, mask, monkeypatch):
     hlsl = result.stdout.decode("utf-8")
     assert hlsl == rdna2_hlsl.translate(data)
     initial = bytearray(1024)
-    initial[264:392] = bytes([0, 127, 128, 255]) * 32
+    initial[264:392] = bytes([0x34, 127, 128, 255]) * 32
     wave = rdna2_exec.Wave()
     wave.memory.write(0, bytes(initial))
     rdna2_exec.run(data, wave)
@@ -37,7 +37,7 @@ def test_buffer_byte_load(width, offset, records, stride, mask, monkeypatch):
     assert rdna2_gpu.run(hlsl, bytes(initial)) == bytes(expected)
 
 
-@pytest.mark.parametrize("name", ["buffer_store_byte", "buffer_load_ushort"])
+@pytest.mark.parametrize("name", ["buffer_store_byte", "buffer_store_short"])
 def test_unsupported_subword_form_is_named(name):
     result = rust(program(*mubuf(name, 1, 10, 20, offen=1)))
     assert result.returncode != 0 and name.encode() in result.stderr

@@ -22,7 +22,7 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
     let addtid = family == "GLOBAL" && width == "dword_addtid";
     let count = match width {
         "dword" | "dword_addtid" => 1,
-        "ubyte" | "sbyte" if !store => 1,
+        "ubyte" | "sbyte" | "ushort" | "sshort" if !store => 1,
         "dwordx2" => 2,
         "dwordx3" => 3,
         "dwordx4" => 4,
@@ -70,7 +70,9 @@ pub fn statements(name: &str, family: &str, word: u64) -> Result<Vec<String>, St
             "AllMemoryBarrierWithGroupSync();".into(),
         ])
     } else {
-        let loads = if matches!(width, "ubyte" | "sbyte") {
+        let loads = if matches!(width, "ushort" | "sshort") {
+            format!("v[{vdst}] = {};", crate::subword::half(width, &address))
+        } else if matches!(width, "ubyte" | "sbyte") {
             let value = format!(
                 "((g_memory.Load(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & 0xFFu)"
             );

@@ -26,7 +26,12 @@ def _load_lines(target, address, kind, buffer="g_memory.Load"):
     """Chargement de WIDTHS[kind] octets à `address` dans les VGPR à partir de `target`."""
     if kind in BYTE_LOADS:
         mask, sign_bits = BYTE_LOADS[kind]
-        value = f"(({buffer}(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & {mask})"
+        if kind in ("ushort", "sshort", "u16", "i16"):
+            # A halfword at byte offset 3 spans two aligned dwords.
+            value = (f"((({buffer}(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) | "
+                     f"(((({address}) & 3u) == 3u ? {buffer}((({address}) & ~3u) + 4u) : 0u) << 8u)) & {mask})")
+        else:
+            value = f"(({buffer}(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & {mask})"
         if sign_bits:
             value = f"asuint((asint({value}) << {32 - sign_bits}) >> {32 - sign_bits})"
         return [f"v[{target}] = {value};"]
