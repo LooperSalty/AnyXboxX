@@ -6,6 +6,8 @@ mod buffer_memory;
 mod control_flow;
 mod flat_atomic;
 mod flat_memory;
+mod half;
+mod half_templates;
 mod lds;
 mod lds_lanes;
 mod scalar;
@@ -100,6 +102,17 @@ fn statements(name: &str, instruction: &Instruction, bytes: &[u8]) -> Result<Vec
             pc as u32,
             pc >> 32
         )]);
+    }
+    if let Some((kinds, template)) = half_templates::operation(name) {
+        return half::statement(
+            name,
+            family,
+            pair,
+            if family == "VOP3" { literal } else { second },
+            kinds,
+            template,
+        )
+        .map(|line| vec![line]);
     }
     let line = match family {
         "MUBUF" => return buffer_memory::statements(name, pair),

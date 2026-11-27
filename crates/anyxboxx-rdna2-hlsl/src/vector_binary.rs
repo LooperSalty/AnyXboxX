@@ -1,6 +1,5 @@
 //! VOP2 wave32 integer arithmetic, bitwise operations and selection.
 use crate::scalar::source;
-use crate::vector_compare::half_operand;
 
 pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, String> {
     let code = word & 0x1ff;
@@ -14,27 +13,6 @@ pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, 
     };
     let b = format!("v[{}]", (word >> 9) & 0xff);
     let d = (word >> 17) & 0xff;
-    let ah = half_operand(code, &a);
-    let bh = format!("({b} & 0xFFFFu)");
-    let k = format!("0x{:X}u", literal.unwrap_or(0) & 0xFFFF);
-    let half = match name {
-        "v_add_f16" => Some(format!("F16Add({ah}, {bh})")),
-        "v_sub_f16" => Some(format!("F16Sub({ah}, {bh})")),
-        "v_subrev_f16" => Some(format!("F16Sub({bh}, {ah})")),
-        "v_mul_f16" => Some(format!("F16Mul({ah}, {bh})")),
-        "v_fmac_f16" => Some(format!("F16Fma({ah}, {bh}, (v[{d}] & 0xFFFFu))")),
-        "v_fmamk_f16" => Some(format!("F16Fma({ah}, {k}, {bh})")),
-        "v_fmaak_f16" => Some(format!("F16Fma({ah}, {bh}, {k})")),
-        "v_max_f16" => Some(format!("F16Max({ah}, {bh})")),
-        "v_min_f16" => Some(format!("F16Min({ah}, {bh})")),
-        "v_ldexp_f16" => Some(format!("F16Ldexp({ah}, {bh})")),
-        _ => None,
-    };
-    if let Some(expression) = half {
-        return Ok(format!(
-            "if (((s[126] >> lane) & 1u) != 0) v[{d}] = (v[{d}] & 0xFFFF0000u) | {expression};"
-        ));
-    }
     if let Some((result, carry)) = match name {
         "v_add_co_ci_u32" => Some(("x + y + k", "(r < x) || (k != 0 && r == x)")),
         "v_sub_co_ci_u32" => Some(("x - y - k", "(x < y) || (k != 0 && x == y)")),
