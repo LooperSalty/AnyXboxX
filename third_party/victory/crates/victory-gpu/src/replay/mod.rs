@@ -15,3 +15,12 @@ pub mod record;
 mod snap;
 mod states;
 mod wire;
+
+/// The recorder's wire bytes for a closed D3D12 list in the THIN equivalence test.
+#[cfg(test)]
+pub(crate) fn closed_list_bytes(
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    use windows::core::Interface;
+    record::recorder()?.list(list.as_raw())?.closed()?.0
+}
