@@ -40,29 +40,19 @@ Repris ensuite sur la base Vice-Tay : [KainanP/VIctory](https://github.com/Kaina
 Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : la source correspondante livrée avec son paquet (`neptune-ve-source.zip`, GPL-3.0 ou ultérieure), committée telle quelle (commit « feat: VIctory base moved to Neptune (VIctory Edit.) 2026-11-25c »), puis nos changements, chacun dans son commit. Aucune dépendance git ni chemin hors de l'arbre : `Cargo.toml` et `Cargo.lock` ne prennent que crates.io.
 
 | Dépôt d'origine | Licence | Dans la base Neptune (d'après son `NEPTUNE-README.txt`) | Repris après |
-| --- | --- | --- | --- |
 | Neptune (VIctory Edit.), paquet du 2026-11-25 au soir (auteur sans contact public) | GPL-3.0 ou ultérieure | L'assemblage et ses propres changements : temps d'image, souris et clavier, Rich Presence Discord, éclairage ambiant de remplacement, file de textures et mémoire de la carte, attente de pipelines bornée à 2,5 s, `play.ps1` (jeu de réglages repris dans `anyxboxx run`) | Rich Presence Discord éteinte sauf `VICTORY_DISCORD=1` |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Validation du stockage persistant hors du cache, y compris les alias de casse Windows (dereoalex, [PR #1789](https://github.com/Marvisak/VIctory/pull/1789)) |
-<<<<<<< HEAD
-<<<<<<< HEAD
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Adaptation de la [PR #1398](https://github.com/Marvisak/VIctory/pull/1398) (EatCodeSleep2) pour les additions et soustractions VOP3 non signées avec saturation. |
-=======
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Tests sur GPU de l'alignement des éléments de sommets ajoutés pour l'expansion CPU des rectangles ([`691236d`](https://github.com/Marvisak/VIctory/commit/691236d606b9de8cbccfa8540e2b27ca6070f8ae), JFIREonFIRE) |
->>>>>>> pr324
-=======
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | Portage du [correctif des CBV nulles](https://github.com/Marvisak/VIctory/commit/78ed12eb79774bf141efaaf6ebd626a10bfb5bbf) (Matsvey Makushenka) |
->>>>>>> pr305
 | [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (fxceless ; PR de Jonirulah, Flyander, AscilCH) | GPL-3.0 | La base : niveaux à la demande, synchronisation du tas de descripteurs (`a26859f`, `9376fd6`) | Pages physiques en sections de 2 Mio au plus (`VICTORY_SECTION_MB`) : idée et premier patch de RyanCase94 (issue #1089), portage de CuteBooty (PR #1274) |
 | [myokex/victory-amd](https://github.com/myokex/victory-amd) (myokex) | GPL-3.0 | La base, avec fxceless/victory-fork | |
 | [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) (soldsawn) | GPL-3.0 | Le traducteur de shaders (programmes wave64 appariés sur les cartes NVIDIA à 32 lanes) | |
 | Belobug, [reddxd-byte/ShakiraRED-dt](https://github.com/reddxd-byte/ShakiraRED-dt) | GPL-3.0 ou ultérieure | La passe de lumière ambiante | La passe du tas sur les emplacements marqués (`VICTORY_HEAP_PASS_DIRTY`, commit `2c6dc966`, portée de `c2271e5`, squash de VIwork de Trexies/victory-fork) |
 | [ZSlayerHQ/victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime) (ZSlayerHQ) | GPL-3.0 | Écritures vues entre vues, lectures noyau, dispatchs en parties | |
-<<<<<<< HEAD
 | [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) (fxceless) | GPL-3.0 | Non (hors base Neptune) | Index des copies par étape (`VICTORY_STEP_INDEX`, `84c5dc00`) ; copies de la carte en trois temps (`VICTORY_CARD_SYNC_BATCH`, `6aed0780`) ; vérifications de textures sur le pool d'aides (`VICTORY_PARALLEL_REFRESH`, `ceb9e1f7`, partie host.rs seule ; équivalent dans la base actuelle : `VICTORY_WIDE_TEXTURES`) ; seuils de listes en vol et de plages modifiées (`VICTORY_SETTLE_ROOM`, `06702fe86`) |
-=======
 | [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) (fxceless) | GPL-3.0 | Non (hors base Neptune) | Index des copies par étape (`VICTORY_STEP_INDEX`, `84c5dc00`) ; copies de la carte en trois temps (`VICTORY_CARD_SYNC_BATCH`, `6aed0780`) ; vérifications de textures sur le pool d'aides (`VICTORY_PARALLEL_REFRESH`, `ceb9e1f7`, partie host.rs seule) |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/ea488a9f9901e4375c547a57795ae8cb79d577a4) (lhnizdo) | GPL-3.0 ou ultérieure | | Adaptation de la vérification des formats inscriptibles pour les vues UAV de texture |
->>>>>>> origin/main
 | [JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd) (JoshuuDev) | GPL-3.0 | Verrou de remappage par plage ; corrections de blend et de descripteurs | |
 | zm0kie | GPL-3.0 | Overlay (F10), envois de fenêtres, lignes mémoire, `tools/` (`start-neptune.ps1`, `memwatch.ps1`) | |
 | [skornuta/victory-fork](https://github.com/skornuta/victory-fork) (skornuta) | GPL-3.0 | Export des temps d'image (`VICTORY_FRAMETIME_DUMP`) | |
@@ -78,7 +68,6 @@ Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : l
 Le détail par changement est dans `git log -- third_party/victory`. La copie initiale (commit « chore: intégrer VIctory dans third_party/victory au lieu d'un sous-module ») n'a pas un commit par changement : le tableau garde ce qu'elle contenait, puis ce qui est venu après, par dépôt d'origine.
 
 | Dépôt d'origine | Licence | Dans la copie initiale | Repris après |
-| --- | --- | --- | --- |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | `main` jusqu'à `ffe310e`, base de tout le reste | Portages des PR #1722 (Impre-visible, bibliothèque de pipelines sous vkd3d-proton), #1718 (tjthebigbearcat-hub), #1696 (Calvix2k) et du commit `86a5ed6` (Marvisak) |
 | [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (fxceless, anciennement victory-gta6) | GPL-3.0 | Le fork à `7b0f736`, dont la PR #1 (ZazaJr24) ; ses PR #63, #32 (arminkhaleghirod), #71 (MartinIndra02), #82 (Kaivyyy), #83 (ryotdev), #81 (undeadhuman37), #77 (m335671), #11 (cxchhh), #349, #355, #353 (AscilCH), #396, #386 (JordanFableFur), #358 (HailLucifer666), #374 (davutsimsekk), #282 (t4l03, porté) ; deux commits de Yorivel (`e49864a`, `bf870de`, `VICTORY_DSTORAGE_NOTIFY`) | Le commit `1684989` (fxceless, nettoyage des shaders), la PR #14 (oddiums) ; portages des PR #127 (BitWuehler), #9 (MartinIndra02), #134 (triippywhale), #115 (Spexivus, avec la correction de joroyt), #141 (adritoyalser), #135 (alexdeliu), #191 (gdawid9407), #206 (AscilCH), #114 (Kaivyyy), #98 (sillynocodecat), #150 (wildheathen) |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | L'assemblage du fork et de ses PR (`80d58f8`), l'adaptation de #282, les commits `xg:` (`1f0fe1d`, reprises de `4466d2e` et `a16f040`) qui font répondre le HLE de `xg_xs.dll` comme la DLL de Microsoft, et `19feca8` qui charge la `xg_xs.dll` du GDK de l'utilisateur (jamais copiée dans le dépôt) | |
@@ -97,7 +86,6 @@ Les autres commits de cette base précédente étaient écrits pour AnyXboxX (Pr
 Registre des données propriétaires indispensables à un format, admises par décision du mainteneur, sur le modèle de `docs/asset-policy.md` de VIctory (tables BCPack). Chaque entrée est une table constante sans laquelle le format ne peut pas être décodé et qu'on ne peut pas recalculer. **La licence du dépôt (GPL-3.0 ou ultérieure) ne couvre pas ces données.** Tout le reste (assets, shaders extraits, textures, sons, archives, sauvegardes, dumps, clés, exécutables) reste interdit.
 
 | Fichier | Format | Contenu | Décision du mainteneur |
-| --- | --- | --- | --- |
 | `third_party/victory/crates/victory-formats/src/bcpack-tables.bin` (environ 78 Kio, venu avec la copie de VIctory, identique octet pour octet dans la base Neptune) | BCPack | Tables constantes du format : modèles d'entropie, tables de rang des indices, codes de contrôle, dictionnaires par format (voir `third_party/victory/docs/asset-policy.md`) | **Admise par décision du mainteneur le 2026-11-25** (#199) ; admise dans VIctory par décision de son propriétaire le 2026-11-23 |
 
 Aucun fichier de jeu, de console ou de SDK n'est inclus dans le dépôt.
