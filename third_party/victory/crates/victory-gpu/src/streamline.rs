@@ -29,6 +29,7 @@ mod check;
 mod device;
 mod frames;
 mod hudless;
+pub(crate) mod latency;
 mod options;
 mod present;
 mod stats;
@@ -154,7 +155,8 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
     let dlss = asked.dlss && report("DLSS Super Resolution", abi::FEATURE_DLSS, supported(abi::FEATURE_DLSS), sl);
     let framegen = framegen_asked
         && report("DLSS Frame Generation", abi::FEATURE_DLSS_G, supported(abi::FEATURE_DLSS_G), sl)
-        && report("Reflex", abi::FEATURE_REFLEX, supported(abi::FEATURE_REFLEX), sl);
+        && report("Reflex", abi::FEATURE_REFLEX, supported(abi::FEATURE_REFLEX), sl)
+        && report("PCL latency markers", abi::FEATURE_PCL, supported(abi::FEATURE_PCL), sl);
     tracing::info!(
         library = %path.display(),
         sdk = "2.14.16",
@@ -271,13 +273,12 @@ struct Calls {
     optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
     /// The mode, sizes and preset the last options named.
     last: Option<(u32, [u32; 2], [u32; 2])>,
-    /// Frame generation: on, and the frame whose simulation began.
+    /// Last accepted frame generation setting.
     framegen_on: bool,
     framegen_times: u32,
-    simulating: Option<u32>,
 }
 
-static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, framegen_times: 0, simulating: None });
+static CALLS: Mutex<Calls> = Mutex::new(Calls { optimal: Vec::new(), last: None, framegen_on: false, framegen_times: 0 });
 
 fn calls() -> std::sync::MutexGuard<'static, Calls> {
     CALLS.lock().unwrap_or_else(|e| e.into_inner())

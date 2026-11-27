@@ -9883,6 +9883,17 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        self.present_planes_for_frame(texture, state, overlay, frame, frame)
+    }
+
+    pub(crate) fn present_planes_for_frame(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+        token: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {
@@ -9923,7 +9934,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes_for_frame(texture, state_u32, None, frame, token);
                 }
             }
         }
@@ -9964,7 +9975,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes_for_frame(texture, state_u32, None, frame, token);
                 }
             }
         }
@@ -10025,7 +10036,7 @@ impl Host {
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_planes_for_frame(texture, state_u32, None, frame, token);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -10152,7 +10163,7 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             // Frame generation: the frame's markers, constants and tags.
             let presenting = crate::streamline::present_begins(
-                frame,
+                token,
                 crate::streamline::Planes {
                     base: (texture, state_u32),
                     overlay: overlay.filter(|_| composed),

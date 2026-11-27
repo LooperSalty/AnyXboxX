@@ -15,14 +15,22 @@ pub(super) static FG_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Presents with frame generation on, and frames it showed, in all.
 pub(super) static FG_ON_ALL: AtomicU64 = AtomicU64::new(0);
 pub(super) static FG_SHOWN_ALL: AtomicU64 = AtomicU64::new(0);
-// Since the last frame-rate line, microseconds: on the presenting thread
-// before the present (of them in the latency markers), in the present call
+// Since the last frame-rate line, microseconds except T_MARKERS: on the presenting thread
+// before the present, in the present call
 // (and the longest), after it (of them asking frame generation's state); on
 // the threads that record upscalings, recording one (of them waiting for our
 // lock); recording the copy of the colour without the interface.
 static TIMES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 pub(super) const T_BEFORE: usize = 0;
-pub(super) const T_MARKERS: usize = 1;
+// Marker calls can take less than a microsecond. Accumulate nanoseconds
+// across the title and presentation threads before converting for the log.
+const T_MARKERS: usize = 1;
+static MARKER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn marker_spent(since: std::time::Instant) {
+    TIMES[T_MARKERS].fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    MARKER_CALLS.fetch_add(1, Relaxed);
+}
 const T_PRESENT: usize = 2;
 const T_PRESENT_LONGEST: usize = 3;
 pub(super) const T_AFTER: usize = 4;
@@ -71,15 +79,19 @@ pub(crate) fn line(frames: f64) {
         );
         // Where the time of a frame goes in Streamline's calls.
         let t: Vec<u64> = TIMES.iter().map(|t| t.swap(0, Relaxed)).collect();
+        let markers = MARKER_CALLS.swap(0, Relaxed);
+        tracing::info!(
+            "DLSS Frame Generation latency markers: {markers} calls, {:.3} ms per frame",
+            t[T_MARKERS] as f64 / 1_000_000.0 / frames
+        );
         if on + off > 0 {
             let ms = |slot: usize| t[slot] as f64 / 1000.0 / frames;
             tracing::info!(
-                "DLSS Frame Generation, time per frame: the presenting thread {:.2} ms before the present call, {:.2} ms in it (the longest {:.1} ms), {:.2} ms after it; of those {:.2} ms in the latency markers and {:.2} ms asking frame generation's state; an upscaling recorded in {:.2} ms ({:.2} ms of it waiting for the lock it shares with the present); the copy of the colour without the interface recorded in {:.3} ms",
+                "DLSS Frame Generation, time per frame: the presenting thread {:.2} ms before the present call, {:.2} ms in it (the longest {:.1} ms), {:.2} ms after it; {:.2} ms asking frame generation's state; an upscaling recorded in {:.2} ms ({:.2} ms of it waiting for the lock it shares with the present); the copy of the colour without the interface recorded in {:.3} ms",
                 ms(T_BEFORE),
                 ms(T_PRESENT),
                 t[T_PRESENT_LONGEST] as f64 / 1000.0,
                 ms(T_AFTER),
-                ms(T_MARKERS),
                 ms(T_STATE),
                 ms(T_UPSCALE),
                 ms(T_UPSCALE_LOCK),

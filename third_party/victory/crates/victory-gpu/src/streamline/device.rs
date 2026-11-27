@@ -58,36 +58,15 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
         functions.pcl_set_marker = f!(abi::FEATURE_PCL, c"slPCLSetMarker", abi::SlPclSetMarker);
         log_version(sl, abi::FEATURE_DLSS_G, "DLSS Frame Generation");
         log_version(sl, abi::FEATURE_REFLEX, "Reflex");
-        let have = functions.dlssg_set_options.is_some()
-            && functions.dlssg_get_state.is_some()
-            && functions.reflex_set_options.is_some()
-            && functions.pcl_set_marker.is_some();
-        if have {
-            if let Some(reflex) = functions.reflex_set_options {
-                let options = abi::ReflexOptions {
-                    base: abi::BaseStructure::new(abi::REFLEX_OPTIONS, 1),
-                    mode: abi::REFLEX_LOW_LATENCY,
-                    frame_limit_us: 0,
-                    use_markers_to_optimize: false,
-                    virtual_key: 0,
-                    id_thread: 0,
-                };
-                // SAFETY: filled options.
-                let code = unsafe { reflex(&options) };
-                if code == 0 {
-                    tracing::info!("Streamline: Reflex low latency on");
-                    queue = proxied_queue(sl, device);
-                } else {
-                    tracing::warn!(code, result = abi::result_name(code), "Reflex refused low latency; frame generation stays off");
-                }
-            }
+        if functions.dlssg_set_options.is_some() && functions.dlssg_get_state.is_some() && latency::enable_reflex(&functions) {
+            queue = proxied_queue(sl, device);
         }
-        FG_READY.store(have && queue.is_some(), Release);
-        if !(have && queue.is_some()) {
+        if queue.is_none() {
             tracing::warn!("DLSS Frame Generation stays off: the device hand-over to Streamline did not complete");
         }
     }
     let _ = FUNCTIONS.set(functions);
+    FG_READY.store(queue.is_some(), Release);
     queue
 }
 

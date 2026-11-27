@@ -185,6 +185,8 @@ fn exercise(host: &crate::host::Host, asked: &Asked, output: [u32; 2], present: 
         };
         let tagged = HUD_TAGGED_ALL.load(Relaxed);
         for frame in 1..=180u64 {
+            latency::mark(|| frame, latency::Phase::Simulation);
+            latency::mark(|| frame, latency::Phase::RenderSubmit);
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
             *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Noted {
                 id,
@@ -195,6 +197,7 @@ fn exercise(host: &crate::host::Host, asked: &Asked, output: [u32; 2], present: 
             if let Some(copy) = &copy {
                 lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
             }
+            latency::mark(|| frame, latency::Phase::Submitted);
             host.present_planes(&base, 0, None, frame).ok_or("synthetic present failed")?;
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
