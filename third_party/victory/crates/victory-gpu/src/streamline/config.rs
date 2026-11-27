@@ -50,7 +50,7 @@ impl Asked {
             framegen,
             mode,
             preset,
-            dir: streamline_dir()?,
+            dir: std::env::var_os("VICTORY_STREAMLINE_DIR").map_or_else(|| PathBuf::from(super::DEFAULT_DIR), PathBuf::from),
             jitter: plan::pair(var("VICTORY_DLSS_JITTER").as_deref()),
             mvec: plan::pair(var("VICTORY_DLSS_MV").as_deref()),
             reactive: var("VICTORY_DLSS_REACTIVE").is_none_or(|v| v.trim() != "0"),
@@ -71,14 +71,4 @@ impl Asked {
 pub struct Available {
     pub dlss: bool,
     pub framegen: bool,
-}
-
-
-fn streamline_dir() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("VICTORY_STREAMLINE_DIR").filter(|dir| !dir.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
-    std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty())
-        .map(|dir| PathBuf::from(dir).join("victory/nvidia-sdk/Streamline/bin/x64"))
-        .ok_or_else(|| "set VICTORY_STREAMLINE_DIR to the folder containing sl.interposer.dll".into())
 }

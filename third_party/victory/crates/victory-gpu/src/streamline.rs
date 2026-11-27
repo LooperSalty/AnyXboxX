@@ -1,5 +1,6 @@
 //! NVIDIA Streamline 2.14.16, loaded from the user's signed runtime.
-mod abi;
+pub(crate) mod abi;
+pub const DEFAULT_DIR: &str = r"C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64";
 mod config;
 mod library;
 pub mod plan;
@@ -11,9 +12,38 @@ use library::*;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::*;
 
+macro_rules! once {
+    ($level:ident, $($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::$level!($($arg)*));
+    }};
+}
+
+mod check;
+mod device;
+mod frames;
+mod hudless;
+mod present;
+mod shutdown;
+use check::COPY_DEST;
+use frames::*;
+use present::{FG_ON_ALL, FG_SHOWN_ALL, FG_STATUS};
+use hudless::*;
+pub(crate) use present::{Planes, present_begins, present_ends, resizing};
+pub use check::{check, check_command};
+
+mod upscale;
+pub(crate) use device::{device_made, swap_chain_factory, swap_chain_made, present_hooked};
+use upscale::*;
+
+const VIEWPORT_FG: u32 = 0;
+const VIEWPORT_DLSS: u32 = 1;
 const INTERPOSER: &str = "sl.interposer.dll";
 /// The project id NGX is given (engine "custom", no NVIDIA application id).
 const PROJECT_ID: &CStr = c"6f0d7b2e-3a41-4c1e-9b57-2d8e4f1a9c30";
@@ -50,18 +80,16 @@ pub fn init(asked: &Asked) -> Available {
 }
 
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
-    let path = std::path::absolute(asked.dir.join(INTERPOSER)).map_err(|e| e.to_string())?;
-    if !path.is_file() {
-        return Err(format!("no {INTERPOSER} in that folder (VICTORY_STREAMLINE_DIR)"));
-    }
-    let sl = load(&path)?;
+    let dir = trust::runtime_dir(&asked.dir)?;
+    let path = dir.join(INTERPOSER);
+    let framegen_asked = asked.framegen && (!require_line || line_asked());
+    let sl = load(&dir, asked.dlss, framegen_asked)?;
     let sl = SL.get_or_init(|| sl);
-    let dir_wide: Vec<u16> = wide(path.parent().expect("interposer has a parent"));
+    let dir_wide = wide(&dir);
     let paths = [dir_wide.as_ptr()];
     let log_wide = asked.log_dir.as_deref().map(wide);
     // Frame generation presents from the line's thread, in order with the
     // submissions: without the line it is not loaded at all.
-    let framegen_asked = asked.framegen && (!require_line || line_asked());
     if asked.framegen && !framegen_asked {
         tracing::warn!(
             "DLSS Frame Generation needs the line of submissions (VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1): frame generation stays off"
@@ -212,18 +240,50 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
 }
 
 
-/// Probe the driver without creating a title process.
-pub fn check() -> Result<(), String> {
-    let mut asked = Asked::from_env()?;
-    asked.dlss = true;
-    asked.framegen = true;
-    let available = load_and_init(&asked, false)
-        .map_err(|why| format!("Streamline at {}: {why}", asked.dir.display()))?;
-    println!("DLSS Super Resolution: {}. Frame Generation with Reflex: {}.",
-        available.dlss, available.framegen);
-    // SAFETY: this command owns the only session; no device or frame exists.
-    let code = unsafe { (SL.get().unwrap().shutdown)() };
-    if code != 0 { return Err(format!("slShutdown: {} ({code})", abi::result_name(code))); }
-    if !available.dlss && !available.framegen { return Err("no requested feature is supported".into()); }
-    Ok(())
+/// The per-feature functions, once the device is set.
+#[derive(Default)]
+struct Functions {
+    dlss_optimal: Option<abi::SlDlssGetOptimalSettings>,
+    dlss_set_options: Option<abi::SlDlssSetOptions>,
+    dlssg_set_options: Option<abi::SlDlssgSetOptions>,
+    dlssg_get_state: Option<abi::SlDlssgGetState>,
+    reflex_set_options: Option<abi::SlReflexSetOptions>,
+    pcl_set_marker: Option<abi::SlPclSetMarker>,
+}
+
+static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
+static DLSS_READY: AtomicBool = AtomicBool::new(false);
+static FG_READY: AtomicBool = AtomicBool::new(false);
+static SWAP_CHAIN_PROXIED: AtomicBool = AtomicBool::new(false);
+/// Our swap chain is Streamline's proxy of it ([`present_hooked`]).
+static PRESENT_HOOKED: AtomicBool = AtomicBool::new(false);
+
+/// Library calls that are not thread safe, and what the upscaling keeps
+/// between frames, one caller at a time.
+#[derive(Default)]
+struct Calls {
+    /// Optimal render sizes by output size and mode.
+    optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
+    /// Frame generation: on, and the frame whose simulation began.
+    framegen_on: bool,
+    simulating: Option<u32>,
+}
+
+static CALLS: Mutex<Calls> = Mutex::new(Calls {
+    optimal: Vec::new(),
+    framegen_on: false,
+    simulating: None,
+});
+
+fn calls() -> std::sync::MutexGuard<'static, Calls> {
+    CALLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+/// [`check`] presents from its one thread, with nothing else submitting.
+static CHECKING: AtomicBool = AtomicBool::new(false);
+fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: an out pointer and an index.
+    let code = unsafe { (sl.get_new_frame_token)(&mut token, &index) };
+    (code == 0 && !token.is_null()).then_some(token)
 }

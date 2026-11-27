@@ -1073,10 +1073,13 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
+            Some(queue) => queue,
+            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?,
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -9868,6 +9871,7 @@ impl Host {
             }
         }
         if (p.width, p.height, p.format) != (width, height, format) {
+            crate::streamline::resizing();
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -10088,7 +10092,17 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Frame generation: the frame's markers, constants and tags.
+            let presenting = crate::streamline::present_begins(
+                frame,
+                crate::streamline::Planes {
+                    base: (texture, state_u32),
+                    overlay: overlay.filter(|_| composed),
+                    size: [width, height],
+                },
+            );
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -10102,6 +10116,14 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Lets the swap chain and what presents with it go, once everything
+    /// sent has run (`victory upscaler-check`: before Streamline is shut
+    /// down; nothing presents afterwards).
+    pub(crate) fn drop_presenter(&self) {
+        settle_now(WHY_SYNC);
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn presenter(
@@ -10131,9 +10153,34 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            // With frame generation, through Streamline's factory proxy and
+            // on its queue proxy: the swap chain is its proxy.
+            let proxied = crate::streamline::swap_chain_factory(&factory).map(|(proxy, queue)| {
+                proxy
+                    .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
+                    .and_then(|s| s.cast::<IDXGISwapChain3>())
+            });
+            let swap_chain = match proxied {
+                Some(Ok(swap_chain)) => {
+                    crate::streamline::swap_chain_made(true, None);
+                    // Frame generation must be off across a change between
+                    // windowed and full screen (Streamline's guide, 12.0):
+                    // the system's own Alt+Enter is not taken for this window.
+                    if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
+                        let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                    }
+                    swap_chain
+                }
+                Some(Err(e)) => {
+                    crate::streamline::swap_chain_made(false, Some(&e));
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
+                }
+                // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
+                // generation: Streamline's proxy of it, for its present hook.)
+                None => crate::streamline::present_hooked(
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
+                ),
+            };
             // Alt+Enter is the title window's own switch to and from full
             // screen (frameless, the swap chain stretched); DXGI's would make
             // it exclusive full screen, whose buffers nothing resizes.

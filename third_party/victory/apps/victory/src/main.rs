@@ -164,9 +164,20 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
-    /// Probe the signed Streamline runtime and GPU support without a title.
+    /// Check NVIDIA Streamline, DLSS and Frame Generation without loading a title.
+    /// Set VICTORY_STREAMLINE_DIR to the absolute path of the signed runtime.
     #[cfg(windows)]
-    UpscalerCheck,
+    UpscalerCheck {
+        /// The output size, `<width>x<height>`.
+        #[arg(long, default_value = "2560x1440")]
+        output: String,
+        /// Make the host device and run DLSS on it.
+        #[arg(long)]
+        device: bool,
+        /// Run the device check, then present for three seconds with frame generation.
+        #[arg(long)]
+        present: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -251,7 +262,12 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         #[cfg(windows)]
-        Command::UpscalerCheck => victory_gpu::streamline::check().map_err(anyhow::Error::msg),
+        Command::UpscalerCheck { output, device, present } => {
+            let size = output.split_once(['x', 'X'])
+                .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
+                .ok_or_else(|| anyhow::anyhow!("--output {output}: expected <width>x<height>"))?;
+            victory_hle::streamline::check_command(size, device || present, present).map_err(anyhow::Error::msg)
+        }
         Command::Config => show_config(),
     }
 }
