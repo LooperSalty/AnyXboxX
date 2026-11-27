@@ -275,17 +275,17 @@ fn title_memory(bytes: usize) -> u64 {
 }
 
 /// What every timed list shares: the title's objects.
-struct Scene {
-    heap: This,
-    heap_start: u64,
+pub(crate) struct Scene {
+    pub(crate) heap: This,
+    pub(crate) heap_start: u64,
     /// Constant ring (write-watched), index buffer, compute output.
-    ring: u64,
-    index: u64,
+    pub(crate) ring: u64,
+    pub(crate) index: u64,
     out: u64,
-    args: This,
+    pub(crate) args: This,
     args_at: u64,
-    textures: Vec<This>,
-    draw: [This; 2],
+    pub(crate) textures: Vec<This>,
+    pub(crate) draw: [This; 2],
     dispatch: This,
     indexed_signature: This,
     dispatch_signature: This,
@@ -297,7 +297,7 @@ unsafe impl Sync for Scene {}
 const RING_PAGES: usize = 16;
 
 impl Scene {
-    fn new() -> Scene {
+    pub(crate) fn new() -> Scene {
         let null = std::ptr::null();
         let vs_code = compile(
             "float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }",

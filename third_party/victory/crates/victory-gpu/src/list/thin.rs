@@ -41,6 +41,9 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 const CHUNK: usize = 1024;
 
 pub(crate) mod timing;
+pub(crate) mod fast;
+#[cfg(test)]
+mod bench;
 
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
@@ -708,11 +711,17 @@ extern "system" fn copy_texture_region_x(
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
-    if timing::on() {
-        timing::stream(|| translate_stream::<true>(list, stream, left))
-    } else {
-        translate_stream::<false>(list, stream, left)
-    }
+    translate_with(list, stream, left, fast::wanted())
+}
+
+fn translate_with(list: This, stream: &[u64], left: impl Fn() -> bool, fast: bool) -> (u64, bool) {
+    fast::scope(fast, || {
+        if timing::on() {
+            timing::stream(|| translate_stream::<true>(list, stream, left))
+        } else {
+            translate_stream::<false>(list, stream, left)
+        }
+    })
 }
 
 fn translate_stream<const TIMED: bool>(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
