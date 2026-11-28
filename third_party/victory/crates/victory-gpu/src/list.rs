@@ -149,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -158,6 +158,51 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
+}
+
+/// Work of ours at a place in a title list (DLSS in place of the title's
+/// FidelityFX upscaling, `crate::streamline`): it is given the host list
+/// there and says whether it recorded into it; if it did, what the title set
+/// is set again before the title's next draw or dispatch.
+#[cfg(windows)]
+pub(crate) type External = Box<dyn FnOnce(&crate::host::HostList) -> bool + Send>;
+
+/// Runs `work` at this place of title list `this`: now, or, with
+/// `VICTORY_THIN=1`, when the list's calls are translated (in their order).
+/// False if the list records nowhere.
+#[cfg(windows)]
+pub(crate) fn external(this: This, work: External) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // FidelityFX needs the actual recording result on the title thread.
+    // Flush just this prefix of the thin stream; subsequent calls (including
+    // the title's fallback) still record on the same underlying list.
+    let (reply, result) = std::sync::mpsc::channel();
+    let checked: External = Box::new(move |host| {
+        let recorded = work(host);
+        let _ = reply.send(recorded);
+        recorded
+    });
+    let work = match thin::put_external(this, checked) {
+        Ok(()) => return result.recv().unwrap_or(false),
+        Err(work) => work,
+    };
+    if host_list(this).is_none() {
+        return false;
+    }
+    run_external(this, work);
+    result.recv().unwrap_or(false)
+}
+
+/// [`external`]'s work on the list that records `this`'s calls.
+#[cfg(windows)]
+fn run_external(this: This, work: External) {
+    with_state(this, |host, state| {
+        work(host);
+        // Even a failed evaluation may have touched the command list.
+        state.replay(host);
+    });
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -209,6 +254,13 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self.state.tables_done();
     }
+
+    /// Number of dynamic descriptor slots still held by this detached list
+    /// waiting for retirement.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending_dynamic_slots(&self) -> u64 {
+        self.state.pending_dynamic_slots()
+    }
 }
 
 /// The card has run `lists`: the dynamic descriptor slots their tables
@@ -225,7 +277,7 @@ pub(crate) fn ran(lists: &mut [Detached]) {
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -259,20 +311,44 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+#[cfg(windows)]
+fn idle_trim_seconds() -> Option<u64> {
+    static SECONDS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        crate::host::allocator_trim_seconds().map(|fallback| {
+            std::env::var("VICTORY_LIST_POOL_IDLE_S")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|&seconds| seconds > 0)
+                .unwrap_or(fallback)
+        })
+    })
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
+    let (idle, expired) = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut expired = Vec::new();
+        if let Some(seconds) = idle_trim_seconds() {
+            let now = crate::host::now_ms();
+            while idle.0.first().is_some_and(|item| idle_expired(item.2, now, seconds)) {
+                let item = idle.0.remove(0);
+                idle.1 -= item.1;
+                expired.push(item);
+            }
+        }
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
-        taken
+        (taken, expired)
     };
+    drop(expired);
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -285,6 +361,19 @@ fn fresh_list() -> Option<crate::host::HostList> {
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
+    }
+    // Even a full pool must discard expired entries before its capacity
+    // check, otherwise a burst can keep the oldest lists indefinitely.
+    if let Some(seconds) = idle_trim_seconds() {
+        let now = crate::host::now_ms();
+        let gone = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            let count = stale_count(idle.0.iter().map(|item| item.2), now, seconds.saturating_mul(1000));
+            let gone: Vec<_> = idle.0.drain(..count).collect();
+            idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+            gone
+        };
+        drop(gone);
     }
     for (i, Detached { host, _uploads, state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
@@ -299,10 +388,46 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            let now = crate::host::now_ms();
+            idle.0.push(Idle(host, bytes, now));
             idle.1 += bytes;
+            if let Some(seconds) = idle_trim_seconds() {
+                let count = stale_count(idle.0.iter().map(|item| item.2), now, seconds.saturating_mul(1000));
+                let gone: Vec<_> = idle.0.drain(..count).collect();
+                idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+                drop(idle);
+                drop(gone);
+            }
         }
     }
+}
+
+#[cfg(windows)]
+fn idle_expired(added: u64, now: u64, seconds: u64) -> bool {
+    now.saturating_sub(added) > seconds.saturating_mul(1000)
+}
+
+#[cfg(windows)]
+fn stale_count(pushed: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usize {
+    pushed.take_while(|&at| now.saturating_sub(at) > max_age).count()
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn idle_list_age_saturates_and_respects_the_limit() {
+    assert!(!idle_expired(100, 99, 30));
+    assert!(!idle_expired(100, 30_099, 30));
+    assert!(!idle_expired(100, 30_100, 30));
+    assert!(idle_expired(100, 30_101, 30));
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn only_the_oldest_idle_lists_are_stale() {
+    assert_eq!(stale_count([10, 20, 900, 950].into_iter(), 1000, 100), 2);
+    assert_eq!(stale_count([950].into_iter(), 1000, 100), 0);
+    assert_eq!(stale_count(std::iter::empty(), 1000, 100), 0);
+    assert_eq!(stale_count([2000].into_iter(), 1000, 100), 0);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -383,7 +508,7 @@ pub(crate) fn cut_list(this: This) -> bool {
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
+/// and leaves each list a new host list, open, for its next reset, as
 /// [`detach`] does. What comes back is in the order the queue runs it: a
 /// new entry starts at every part that has waits; host lists without
 /// waits join the entry before them. The list's upload memory and draw
@@ -417,15 +542,17 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let Some(fresh) = fresh_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // A new host list is open, and stays so: the title's next call on
+        // its list is a reset, which closes a recording that is discarded
+        // (see `detach`).
+        fresh.left_open();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        host.close_if_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -472,7 +599,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 }
 
 /// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
+/// submission names it) and leaves each list a new host list, open, for
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
@@ -489,9 +616,15 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         let Some(fresh) = fresh_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // A new host list is open, and stays so. The title's next call on its
+        // list is a reset, and `HostList::reset` closes a recording that is
+        // discarded. Closed here, on the thread that prepares the
+        // submissions, an empty list each was 3.8% of that thread's samples
+        // (216 lists a frame in a profile of the Series S prison scene); the
+        // reset runs on the thread that translates the title's calls. A list the title
+        // submits again without a reset gives this one, open: closed when
+        // it is taken (`close_if_open`).
+        fresh.left_open();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -505,6 +638,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
             (host, uploads, state)
         };
+        host.close_if_open();
         order.push(taken.len());
         taken.push((
             this,
@@ -1543,14 +1677,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             with_state(this, |_, state| state.copied());
             return;
         }
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        list.defer_raw_copy(dst as usize, src as usize, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1907,6 +2034,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if crate::drop_report::enabled() {
+                with_state(this, |_, s| s.report_unsupported_mesh_indirect());
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1999,6 +2129,10 @@ extern "system" fn execute_indirect(
     count_draw();
     TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        if crate::drop_report::enabled() {
+            crate::drop_report::record("indirect: unknown signature; shaders=unknown".to_owned());
+        }
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -2015,6 +2149,9 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        if crate::drop_report::enabled() {
+            with_state(this, |_, s| s.report_indirect_layout());
+        }
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -2536,6 +2673,57 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The host lists of a title's list reach execution closed: the one it
+    /// records into after the Reset that follows a submission, and the one
+    /// a second submission with no Reset in between takes. Through the
+    /// title's own calls, with the lists run by a real submission.
+    #[cfg(windows)]
+    #[test]
+    fn host_lists_reach_execution_closed_after_a_reset_and_when_submitted_twice() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping: no D3D12 device");
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let open = |list: This| !host_list(list).expect("a host list").is_closed();
+        // The first recording: closed by the title, taken by a submission.
+        assert_eq!(close(list), S_OK);
+        let first = detach(&[list]);
+        assert!(first.0[0].host().is_closed());
+        assert!(open(list), "the host list given in its place is left open");
+        // The title's next Reset, a command, its Close, and the submission.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(open(list), "open for recording after the Reset");
+        state::stencil_ref(list, 1);
+        assert_eq!(close(list), S_OK);
+        let second = detach(&[list]);
+        assert!(second.0[0].host().is_closed(), "the recording after the Reset");
+        // Submitted again with no Reset in between: the list left open by
+        // the second submission is taken, and closed for it.
+        assert!(open(list));
+        let third = detach(&[list]);
+        assert!(third.0[0].host().is_closed(), "the list taken with no Reset before");
+        // Where lists go to the queue none of them is open, and they run.
+        for (taken, order) in [first, second, third] {
+            assert_eq!(order, [0]);
+            {
+                let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| taken[i].host()).collect();
+                assert_eq!(crate::host::closed_for_execution(&runs), 0);
+                host.execute(&runs);
+            }
+            // SAFETY: a plain query of the device.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+            recycle(taken, &order);
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

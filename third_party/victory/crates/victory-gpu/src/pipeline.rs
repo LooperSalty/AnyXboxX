@@ -78,7 +78,8 @@ impl std::fmt::Debug for Shader {
 }
 
 /// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+type ShaderKey = ([u8; 32], Option<&'static str>);
+static SHADERS: Mutex<Option<HashMap<ShaderKey, Arc<Shader>>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
@@ -105,11 +106,17 @@ pub(crate) fn kept() -> [u64; 7] {
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+    static BY_STAGE: OnceLock<bool> = OnceLock::new();
+    let by_stage = *BY_STAGE.get_or_init(|| std::env::var_os("VICTORY_SHADER_STAGE_CACHE").is_some_and(|v| v == "1"));
+    shader_with_stage_key(stage, bytes, by_stage)
+}
+
+fn shader_with_stage_key(stage: &'static str, bytes: &[u8], by_stage: bool) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry((*full.as_bytes(), by_stage.then_some(stage)))
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -126,6 +133,23 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+#[cfg(test)]
+mod shader_stage_cache_tests {
+    use super::*;
+    #[test]
+    fn identical_containers_keep_their_own_stage_when_enabled() {
+        let bytes = b"synthetic stage cache regression";
+        let vertex = shader_with_stage_key("vertex", bytes, true);
+        let pixel = shader_with_stage_key("pixel", bytes, true);
+        let vertex_again = shader_with_stage_key("vertex", bytes, true);
+        assert_eq!(vertex.stage, "vertex");
+        assert_eq!(pixel.stage, "pixel");
+        assert_eq!(vertex.hash, pixel.hash);
+        assert!(!Arc::ptr_eq(&vertex, &pixel));
+        assert!(Arc::ptr_eq(&vertex, &vertex_again));
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -467,6 +491,19 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Records a failed operation with its pipeline status and shader identities.
+#[cfg(windows)]
+pub(crate) fn report_drop(this: This, operation: &str, reason: &str) {
+    if !crate::drop_report::enabled() { return; }
+    let (status, hashes) = if this.is_null() {
+        ("no pipeline bound".to_owned(), "none".to_owned())
+    } else {
+        let p = pipeline(this);
+        (make::missing(&p.host).unwrap_or_else(|| "ready".to_owned()), make::hashes(&p.host))
+    };
+    crate::drop_report::record(crate::drop_report::key(operation, reason, &status, &hashes));
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -479,8 +516,8 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+#[cfg(windows)]
+pub(super) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -499,20 +536,32 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+#[cfg(windows)]
+pub(super) fn skip_hashes() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(windows)]
+pub(super) fn skipped_in_list<'a>(
+    shaders: &'a [std::sync::Arc<Shader>],
+    hashes: &[String],
+) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    skipped_in_list(&p.shaders, skip_hashes())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -535,6 +584,93 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PrepareFailure {
+    #[default]
+    Unclassified,
+    SkippedPipeline,
+    MissingHostPipeline,
+    PipelineKind,
+    IndexBuffer,
+    DynamicDescriptorTable,
+    ShaderMemoryViews,
+    RootUavBuffer,
+    RootUavHeap,
+    RootUavSlot,
+    RootSrvHeap,
+    RootSrvSlot,
+}
+
+/// A failed direct draw or mesh preparation in a frame operation capture.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn direct_prepare_text(this: This, command: &str, why: PrepareFailure) -> String {
+    if this.is_null() {
+        return format!("DROPPED {command} preparation reason={why:?} recipe_key=none");
+    }
+    let pipeline = pipeline(this);
+    let key = pipeline.host.key();
+    let shaders: Vec<_> = pipeline.shaders.iter().map(|s| (s.stage, s.hash.as_str())).collect();
+    format!("DROPPED {command} preparation reason={why:?} recipe_key={key} guest_shaders={shaders:?}")
+}
+
+/// Keep the first example of each failure per recipe, with room for every
+/// kind even when one compute pipeline repeatedly fails during world load.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn new_indirect_example(
+    seen: &mut Vec<(u32, String, PrepareFailure)>,
+    kind: u32,
+    key: &str,
+    why: PrepareFailure,
+) -> bool {
+    const PER_KIND: usize = 8;
+    if seen.iter().any(|(k, p, r)| *k == kind && p == key && *r == why)
+        || seen.iter().filter(|(k, _, _)| *k == kind).count() >= PER_KIND
+    {
+        return false;
+    }
+    seen.push((kind, key.to_owned(), why));
+    true
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_indirect_prepare(
+    this: This,
+    why: PrepareFailure,
+    (kind, stride, max): (u32, u32, u32),
+    (args, address): (&crate::shadow::Shadow, u64),
+    counter: Option<&(Arc<crate::shadow::Shadow>, u64)>,
+) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_INDIRECT_PREPARE_LOG")) {
+        return;
+    }
+    static SEEN: Mutex<Vec<(u32, String, PrepareFailure)>> = Mutex::new(Vec::new());
+    let pipeline = pipeline(this);
+    let key = pipeline.host.key();
+    if !new_indirect_example(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), kind, key, why) {
+        return;
+    }
+    let shaders: Vec<_> = pipeline.shaders.iter().map(|s| (s.stage, s.hash.as_str())).collect();
+    let command = match kind {
+        0 => "draw",
+        1 => "draw indexed",
+        2 => "dispatch",
+        10 => "dispatch mesh",
+        _ => "unknown",
+    };
+    tracing::info!(
+        frame = crate::frame::current(),
+        kind, command, stride, max, reason = ?why, pipeline = ?this, recipe_key = key, guest_shaders = ?shaders,
+        arguments = format_args!("{address:#x}"), argument_buffer = args.id(),
+        argument_offset = args.offset(address),
+        count_address = counter.map(|(_, at)| *at),
+        count_buffer = counter.map(|(s, _)| s.id()),
+        count_offset = counter.map(|(s, at)| s.offset(*at)),
+        "indirect command preparation failed"
+    );
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -725,10 +861,21 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if size > desc.size - at {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                total = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: `at + size <= desc.size` and shader subobjects have
+            // `size == 24` with their `Bytecode` at +8.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -804,6 +951,37 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn direct_prepare_capture_identifies_an_unset_pipeline() {
+        let line = super::direct_prepare_text(
+            std::ptr::null_mut(),
+            "mesh",
+            super::PrepareFailure::MissingHostPipeline,
+        );
+        assert_eq!(
+            line,
+            "DROPPED mesh preparation reason=MissingHostPipeline recipe_key=none"
+        );
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn indirect_prepare_examples_preserve_each_command_kind() {
+        use PrepareFailure::{DynamicDescriptorTable, IndexBuffer};
+
+        let mut seen = Vec::new();
+        assert!(new_indirect_example(&mut seen, 2, "first", DynamicDescriptorTable));
+        assert!(!new_indirect_example(&mut seen, 2, "first", DynamicDescriptorTable));
+        for key in 1..8 {
+            assert!(new_indirect_example(&mut seen, 2, &key.to_string(), DynamicDescriptorTable));
+        }
+        assert!(!new_indirect_example(&mut seen, 2, "later", DynamicDescriptorTable));
+        assert!(new_indirect_example(&mut seen, 10, "first", DynamicDescriptorTable));
+        assert!(new_indirect_example(&mut seen, 1, "other", DynamicDescriptorTable));
+        assert!(new_indirect_example(&mut seen, 1, "other", IndexBuffer));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
@@ -919,5 +1097,42 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn truncated_pipeline_stream_is_not_read_past_size() {
+        let vs = [1u8, 2, 3, 4];
+        let mut buf = [0u8; 40];
+        let put = |buf: &mut [u8], at: usize, v: u64| buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+        // Vertex shader subobject (kind 1, size 24), truncated to 8 bytes.
+        put(&mut buf, 0, 1);
+        put(&mut buf, 8, vs.as_ptr() as u64);
+        put(&mut buf, 16, vs.len() as u64);
+        let desc = StreamDesc {
+            size: 8,
+            stream: buf.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert!(shaders(p).is_empty());
+        release(p);
+
+        // Render-target formats subobject (kind 15, size 40), truncated to 8 bytes.
+        buf.fill(0);
+        put(&mut buf, 0, 15 | (28u64 << 32));
+        put(&mut buf, 32, 1u64 << 32);
+        let desc = StreamDesc {
+            size: 8,
+            stream: buf.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        #[cfg(windows)]
+        {
+            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            assert_eq!(g.targets.NumRenderTargets, 0);
+        }
+        release(p);
     }
 }

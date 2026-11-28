@@ -20,7 +20,7 @@ struct Reservation {
 
 impl Reservation {
     fn new(device: &ID3D12Device, tiles: u32) -> Self {
-        let (_, index, runs) = take(device, tiles).unwrap();
+        let (_, index, runs) = take(device, tiles, true).unwrap();
         Self { index, runs }
     }
 }
