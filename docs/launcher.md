@@ -29,7 +29,7 @@ Either option works:
 - **Prebuilt**: download `anyxboxx-launcher.exe` from the [launcher releases](https://github.com/LooperSalty/AnyXboxX/releases?q=launcher&expanded=true), check its SHA-256 against `anyxboxx-launcher.exe.sha256` (`Get-FileHash .\anyxboxx-launcher.exe`), and put it **in the `AnyXboxX` folder** you cloned (or any folder inside it).
 - **From source**: `cargo build --release -p anyxboxx-launcher`, then use `target\release\anyxboxx-launcher.exe`.
 
-The launcher finds the repository by walking up from its own folder until it meets `third_party\victory\Cargo.toml`. If you keep the executable somewhere else, set `ANYXBOXX_REPO` to the clone folder (`setx ANYXBOXX_REPO C:\path\to\AnyXboxX`, then open a new window). Without either, PLAY stops with "repository not found".
+The launcher needs your AnyXboxX clone (the folder holding `third_party\victory\Cargo.toml`). It looks, in this order, at: the folder you chose in **Setup → AnyXboxX folder** (saved in `settings.toml`; a folder without `third_party\victory\Cargo.toml` is refused with an explanation), `ANYXBOXX_REPO`, the launcher's own folder and each parent (also the current folder), then a few usual places: the launcher's parent folder and its neighbours named `AnyXboxX*`, `%USERPROFILE%\AnyXboxX`, `Documents\AnyXboxX`, `source\repos\AnyXboxX`, `Desktop\AnyXboxX` and `Downloads\AnyXboxX*`. The Setup page shows the folder in use and where it came from. If the executable is outside the clone (for example in Downloads), either put it inside the clone or choose the clone folder once in Setup. Without a clone, PLAY opens Setup and says "AnyXboxX folder not found".
 
 ### 3. First start
 
@@ -67,7 +67,7 @@ Settings are profiles per host and GPU vendor (`crates/anyxboxx-launcher/profile
 
 ## Troubleshooting
 
-- **"repository not found"**: the executable is outside the clone and `ANYXBOXX_REPO` is not set (step 2).
+- **"AnyXboxX folder not found"**: the executable is outside the clone and none of the usual places holds one. Open Setup → AnyXboxX folder, press Browse and pick your clone (clone https://github.com/LooperSalty/AnyXboxX first if you have none). The choice is remembered. `ANYXBOXX_REPO` also works.
 - **The VIctory build fails**: run `cargo build --release -p victory --manifest-path third_party\victory\Cargo.toml` in a terminal to see cargo's message; usually the MSVC workload is missing.
 - **A game is already running**: the launcher allows one game at a time, because two would share the save folder.
 - **The window closed by itself**: the log says `window closed: suspending the title` when you closed it; a crash is written to `crashes.log` under `%LOCALAPPDATA%\victory\data\`.

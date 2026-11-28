@@ -129,7 +129,7 @@ fn exercise(host: &crate::host::Host, asked: &Asked, output: [u32; 2], present: 
         let hooked = present && asked.present_hook && !framegen;
         for round in 0..if hooked { 120 } else { 3 } {
             if hooked && round > 0 {
-                host.present_planes(&base, 0, None, round).ok_or("synthetic present failed")?;
+                host.present_planes(&base, 0, None, round, None).ok_or("synthetic present failed")?;
             }
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
             let list = match host.new_list() {
@@ -198,7 +198,7 @@ fn exercise(host: &crate::host::Host, asked: &Asked, output: [u32; 2], present: 
                 lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
             }
             latency::mark(|| frame, latency::Phase::Submitted);
-            host.present_planes(&base, 0, None, frame).ok_or("synthetic present failed")?;
+            host.present_planes(&base, 0, None, frame, None).ok_or("synthetic present failed")?;
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         crate::host::settle_for_fence();

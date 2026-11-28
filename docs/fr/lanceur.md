@@ -29,7 +29,7 @@ Au choix :
 - **Précompilé** : téléchargez `anyxboxx-launcher.exe` depuis les [releases du lanceur](https://github.com/LooperSalty/AnyXboxX/releases?q=launcher&expanded=true), comparez son SHA-256 à `anyxboxx-launcher.exe.sha256` (`Get-FileHash .\anyxboxx-launcher.exe`), puis placez-le **dans le dossier `AnyXboxX`** cloné (ou un de ses sous-dossiers).
 - **Depuis les sources** : `cargo build --release -p anyxboxx-launcher`, puis `target\release\anyxboxx-launcher.exe`.
 
-Le lanceur trouve le dépôt en remontant depuis son propre dossier jusqu'à `third_party\victory\Cargo.toml`. S'il est rangé ailleurs, définissez `ANYXBOXX_REPO` sur le dossier cloné (`setx ANYXBOXX_REPO C:\chemin\vers\AnyXboxX`, puis ouvrez une nouvelle fenêtre). Sans l'un ou l'autre, JOUER s'arrête sur « repository not found ».
+Le lanceur a besoin de votre clone AnyXboxX (le dossier qui contient `third_party\victory\Cargo.toml`). Il regarde, dans cet ordre : le dossier choisi dans **Setup → AnyXboxX folder** (enregistré dans `settings.toml` ; un dossier sans `third_party\victory\Cargo.toml` est refusé avec une explication), `ANYXBOXX_REPO`, son propre dossier et chaque parent (ainsi que le dossier courant), puis quelques emplacements usuels : le dossier parent du lanceur et ses voisins nommés `AnyXboxX*`, `%USERPROFILE%\AnyXboxX`, `Documents\AnyXboxX`, `source\repos\AnyXboxX`, `Desktop\AnyXboxX` et `Downloads\AnyXboxX*`. La page Setup montre le dossier utilisé et d'où il vient. Si l'exécutable est hors du clone (par exemple dans Téléchargements), rangez-le dans le clone ou choisissez une fois le dossier du clone dans Setup. Sans clone, JOUER ouvre Setup et affiche « AnyXboxX folder not found ».
 
 ### 3. Premier démarrage
 
@@ -67,7 +67,7 @@ Les réglages sont des profils par système et par fabricant de carte (`crates/a
 
 ## Dépannage
 
-- **« repository not found »** : l'exécutable est hors du dépôt cloné et `ANYXBOXX_REPO` n'est pas défini (étape 2).
+- **« AnyXboxX folder not found »** : l'exécutable est hors du clone et aucun emplacement usuel n'en contient un. Ouvrez Setup → AnyXboxX folder, cliquez sur Browse et choisissez votre clone (clonez d'abord https://github.com/LooperSalty/AnyXboxX si vous n'en avez pas). Le choix est mémorisé. `ANYXBOXX_REPO` fonctionne aussi.
 - **La compilation de VIctory échoue** : lancez `cargo build --release -p victory --manifest-path third_party\victory\Cargo.toml` dans un terminal pour lire le message de cargo ; il manque le plus souvent la charge MSVC.
 - **Un jeu tourne déjà** : le lanceur n'autorise qu'un jeu à la fois, car deux partageraient le dossier des sauvegardes.
 - **La fenêtre s'est fermée seule** : le journal indique `window closed: suspending the title` quand c'est vous qui l'avez fermée ; un plantage est écrit dans `crashes.log` sous `%LOCALAPPDATA%\victory\data\`.

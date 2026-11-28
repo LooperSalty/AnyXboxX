@@ -355,6 +355,10 @@ pub fn execute(
         crate::f16::execute_vop3(wave, name, word, literal)?;
         return Ok(true);
     }
+    if crate::int16::supports(name) {
+        crate::int16::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::wide::execute(
         wave,
         name,

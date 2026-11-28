@@ -18,6 +18,8 @@ use anyxboxx::run::Victory;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub game_dir: String,
+    /// The AnyXboxX clone chosen in Setup, empty for none (then it is searched for).
+    pub repo_dir: String,
     /// The advanced panel: one `KEY=VALUE` per line.
     pub overrides: String,
     /// Path of the user's own `xg_xs.dll`, empty for none.
@@ -39,6 +41,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             game_dir: String::new(),
+            repo_dir: String::new(),
             overrides: String::new(),
             xg_dll: String::new(),
             xg_mode: XgMode::Real,
@@ -63,6 +66,12 @@ impl Settings {
     /// The game folder as a path, when one was typed.
     pub fn game_path(&self) -> Option<PathBuf> {
         let trimmed = self.game_dir.trim().trim_matches('"');
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    }
+
+    /// The AnyXboxX folder chosen in Setup, when one was saved.
+    pub fn repo_path(&self) -> Option<PathBuf> {
+        let trimmed = self.repo_dir.trim().trim_matches('"');
         (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
     }
 

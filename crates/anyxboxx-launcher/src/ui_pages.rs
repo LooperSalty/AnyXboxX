@@ -24,6 +24,8 @@ pub fn setup(app: &mut App, ui: &mut egui::Ui) {
         "Setup",
         "What this PC needs. A check means the launcher found it; an exclamation mark means it cannot tell.",
     );
+    crate::ui_repo::section(app, ui);
+    ui.add_space(tokens::S);
     for item in &app.setup {
         theme::card(ui, |ui| {
             let (status, text) = match &item.state {

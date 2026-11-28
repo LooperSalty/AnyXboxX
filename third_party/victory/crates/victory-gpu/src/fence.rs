@@ -1,12 +1,13 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it. The title and our
+//! queues can both signal them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::E_NOTIMPL;
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -199,6 +200,54 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
+
+// Vice-Tay's unbounded wait; the null-event path keeps our timed `wait_null_event` for now.
+#[cfg(windows)]
+#[allow(dead_code)]
+fn wait_for_value(fence: &Fence, value: u64) -> HRESULT {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::WaitOnAddress;
+
+    // A queued signal can be behind GPU work whose completion has been deferred.
+    if crate::host::late() {
+        crate::queue::before_sync();
+        crate::host::settle_for_fence();
+    }
+    const REPORT_EVERY: Duration = Duration::from_secs(2);
+    let mut next_report = Instant::now() + REPORT_EVERY;
+    loop {
+        let current = fence.value.load(Ordering::Acquire);
+        if current >= value {
+            return S_OK;
+        }
+        let now = Instant::now();
+        if now >= next_report {
+            // SAFETY: querying a live host device for its removal reason.
+            if let Some(host) = crate::host::made_host()
+                && let Err(error) = unsafe { host.device.GetDeviceRemovedReason() }
+            {
+                return error.code().0;
+            }
+            tracing::debug!(current, value, "waiting for a fence value");
+            next_report = now + REPORT_EVERY;
+        }
+        // Raw writes to the fence's GPU address can change it without waking
+        // any waiters, so reread the value even when there is no notification.
+        // SAFETY: both pointers refer to aligned, live u64 values.
+        unsafe {
+            WaitOnAddress(
+                (&raw const fence.value).cast(),
+                (&raw const current).cast(),
+                size_of::<u64>(),
+                10,
+            );
+        }
+        if fence.value.load(Ordering::Acquire) < value {
+            crate::queue::release_held(false);
+        }
+    }
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
@@ -301,6 +350,24 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_event_waits_for_a_signal_past_the_old_timeout() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let pending = FenceRef::hold(f);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                signal(pending.as_this(), 5);
+            });
+            let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+            assert_eq!(wait(f, 5, std::ptr::null_mut()), S_OK);
+        });
+        assert_eq!(completed(f), 5);
+        assert_eq!(release(f), 0);
     }
 
     #[test]

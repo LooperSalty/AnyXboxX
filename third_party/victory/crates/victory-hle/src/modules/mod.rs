@@ -14,6 +14,7 @@ pub mod audio;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
+mod dsp_convolve;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
@@ -78,5 +79,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }

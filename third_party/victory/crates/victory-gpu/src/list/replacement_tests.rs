@@ -42,7 +42,7 @@ fn replacements_preserve_copies_waits_and_submission_fences() {
     assert_eq!(close(b), S_OK);
     let (taken, order) = detach(&[a, b, a]);
     let leave_open = std::env::var_os("VICTORY_LEAVE_OPEN").is_none_or(|v| v != "0");
-    assert_eq!(host_list(a).unwrap().left_open(), leave_open);
+    assert_eq!(!host_list(a).unwrap().is_closed(), leave_open);
     assert_eq!(order, [0, 1, 0]);
     let runs: Vec<_> = order.iter().map(|&i| taken[i].host()).collect();
     let first = host.execute(&runs);
@@ -82,7 +82,7 @@ fn replacements_preserve_copies_waits_and_submission_fences() {
 
     // Both detach paths must install an open replacement with the switch on.
     for list in [a, b] {
-        assert_eq!(host_list(list).unwrap().left_open(), leave_open);
+        assert_eq!(!host_list(list).unwrap().is_closed(), leave_open);
         assert_eq!(list_release(list), 0);
     }
     assert_eq!(allocator_release(allocator), 0);

@@ -44,6 +44,7 @@ pub mod image_desc;
 pub mod image_exec;
 pub mod image_sample;
 pub mod image_texel;
+pub mod int16;
 pub mod interp;
 pub mod memory;
 pub mod mnemonics;
