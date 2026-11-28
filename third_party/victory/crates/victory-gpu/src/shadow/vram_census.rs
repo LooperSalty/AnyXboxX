@@ -121,7 +121,7 @@ fn pool_textures(n: usize) -> Vec<ID3D12Resource> {
     let host = host().unwrap();
     let desc = small_texture();
     // SAFETY: a valid description.
-    (0..n).filter_map(|_| unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }).collect()
+    (0..n).filter_map(|_| unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) }).collect()
 }
 
 /// Host lists as the title's lists use them: indirect arguments clamped

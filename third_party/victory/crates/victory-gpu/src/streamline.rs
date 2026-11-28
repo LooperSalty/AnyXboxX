@@ -68,11 +68,15 @@ static PLAN: OnceLock<Plan> = OnceLock::new();
 /// once, before the host device is made (`crate::host::host`) and before the
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
+///
+/// The first call decides; later ones (`take_over` early in the launch,
+/// `title_mode` once the device can be made) get the same answer.
 pub fn init(asked: &Asked) -> Available {
+    static INIT: OnceLock<Available> = OnceLock::new();
     if !asked.any() {
         return Available::default();
     }
-    match load_and_init(asked, true) {
+    *INIT.get_or_init(|| match load_and_init(asked, true) {
         Ok(available) => available,
         Err(why) => {
             tracing::warn!(
@@ -81,7 +85,37 @@ pub fn init(asked: &Asked) -> Available {
             );
             Available::default()
         }
-    }
+    })
+}
+
+/// Set by [`take_over`] once Streamline is asked for and loaded.
+static TAKEN_OVER: OnceLock<bool> = OnceLock::new();
+
+/// Whether `VICTORY_DLSS=1` or `VICTORY_FRAMEGEN=1` names Streamline.
+fn switches_on() -> bool {
+    ["VICTORY_DLSS", "VICTORY_FRAMEGEN"].iter().any(|key| std::env::var_os(key).is_some_and(|v| v == "1"))
+}
+
+/// Whether Streamline is in charge of upscaling and frame generation: its
+/// switches are on and its library loaded with a feature it supports. Then
+/// the other upscalers of this tree (FidelityFX PC, DLSS through NGX, the
+/// native frame generation) are not set up; where they were asked for, the
+/// caller says so. Loads the library on its first call, which has to come
+/// before the host device is made and the title's imports are bound.
+pub fn take_over() -> bool {
+    *TAKEN_OVER.get_or_init(|| {
+        if !switches_on() {
+            return false;
+        }
+        let Ok(asked) = Asked::from_env() else { return false };
+        let available = init(&asked);
+        available.dlss || available.framegen
+    })
+}
+
+/// [`take_over`]'s answer, without deciding it: false until it has been asked.
+pub fn taken_over() -> bool {
+    TAKEN_OVER.get().copied().unwrap_or(false)
 }
 
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
@@ -301,7 +335,7 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 
 /// Select the title's FidelityFX path only after the host device is ready.
 pub fn title_mode() -> Option<Mode> {
-    if !["VICTORY_DLSS", "VICTORY_FRAMEGEN"].iter().any(|key| std::env::var_os(key).is_some_and(|v| v == "1")) {
+    if !switches_on() {
         return None;
     }
     let asked = Asked::from_env().map_err(|why| tracing::warn!("Streamline: {why}; using the title's upscaler")).ok()?;
@@ -322,4 +356,20 @@ pub(crate) fn tracking_frames() -> bool {
 
 pub(crate) fn checking() -> bool {
     CHECKING.load(Relaxed)
+}
+
+#[cfg(test)]
+mod take_over_tests {
+    use super::*;
+
+    #[test]
+    fn without_its_switches_streamline_does_not_take_over() {
+        if switches_on() {
+            return;
+        }
+        assert!(!take_over());
+        assert!(!taken_over());
+        // Nothing of AMD's frame generation is displaced by it either.
+        assert_eq!(crate::framegen::requested(), std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1"));
+    }
 }
