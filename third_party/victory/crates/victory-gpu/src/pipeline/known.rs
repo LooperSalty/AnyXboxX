@@ -106,7 +106,7 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let mut entry = id.to_vec();
     entry.push(shaders.len() as u8);
     for s in shaders {
-        let hash = *blake3::hash(&s.container).as_bytes();
+        let hash = *s.container.hash().as_bytes();
         let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
         entry.push(stage);
         entry.extend(hash);
@@ -115,7 +115,7 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
             new.push(stage);
             new.extend(hash);
             new.extend((s.container.len() as u32).to_le_bytes());
-            new.extend(&s.container);
+            new.extend_from_slice(s.container.bytes().as_ref());
         }
     }
     entry.push(u8::from(graphics.is_some()));

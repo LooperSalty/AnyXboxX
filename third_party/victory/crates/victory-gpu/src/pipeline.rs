@@ -60,7 +60,10 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(not(windows))]
     container: Vec<u8>,
+    #[cfg(windows)]
+    container: shader_container::Container,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -81,8 +84,8 @@ impl std::fmt::Debug for Shader {
 type ShaderKey = ([u8; 32], Option<&'static str>);
 static SHADERS: Mutex<Option<HashMap<ShaderKey, Arc<Shader>>>> = Mutex::new(None);
 
-/// For the memory lines: containers kept and their bytes, translations
-/// kept and the bytes of their host code. None of them is ever let go.
+/// For the memory lines: containers and translations kept, and the bytes of
+/// their retained guest containers and host code.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
@@ -112,6 +115,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 }
 
 fn shader_with_stage_key(stage: &'static str, bytes: &[u8], by_stage: bool) -> Arc<Shader> {
+    shader_with_mode(stage, bytes, by_stage, cfg!(windows) && crate::ram_trim::enabled())
+}
+
+fn shader_with_mode(
+    stage: &'static str,
+    bytes: &[u8],
+    by_stage: bool,
+    #[cfg_attr(not(windows), allow(unused_variables))] trim: bool,
+) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
@@ -123,7 +135,10 @@ fn shader_with_stage_key(stage: &'static str, bytes: &[u8], by_stage: bool) -> A
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(not(windows))]
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                container: shader_container::Container::new(bytes, full, trim),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
@@ -168,6 +183,8 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
+    /// Present only when RAM trim is enabled; otherwise DXIL stays in `host`.
+    dxil: Option<Box<shader_ram_trim::Dxil>>,
 }
 
 #[cfg(windows)]
@@ -177,9 +194,11 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let container = self.container.bytes();
+                let bytes = container.as_ref();
                 let done = {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
-                    translate(&self.container)
+                    translate(bytes)
                 };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -187,7 +206,7 @@ impl Shader {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), bytes);
                     if let Ok(t) = &done {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
@@ -211,7 +230,12 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
-                done.ok()
+                let mut translated = done.ok()?;
+                if self.container.trimmable() {
+                    let dxil = std::mem::take(&mut translated.host.dxil);
+                    translated.dxil = Some(Box::new(shader_ram_trim::Dxil::new(dxil)));
+                }
+                Some(translated)
             })
             .as_ref()
     }
@@ -222,7 +246,8 @@ impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
-        let c = Container::parse(&self.container).ok()?;
+        let bytes = self.container.bytes();
+        let c = Container::parse(bytes.as_ref()).ok()?;
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
     }
@@ -264,6 +289,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         picks: Default::default(),
+        dxil: None,
     })
 }
 
@@ -317,12 +343,14 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     if shader.stage != "compute" {
         return false;
     }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    shader.container.builder_spilled(|bytes| {
+        let Ok(c) = Container::parse(bytes) else {
+            return false;
+        };
+        c.part(FourCC::DXIL)
+            .and_then(|part| victory_shader::native_programs(part.data).ok())
+            .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    })
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -918,6 +946,12 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod shader_container;
+#[cfg(windows)]
+mod shader_ram_trim;
+#[cfg(windows)]
+pub(crate) use shader_ram_trim::trim_shaders_with;
 #[cfg(all(test, windows))]
 mod list_bench;
 
@@ -999,7 +1033,13 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| {
+                #[cfg(not(windows))]
+                let bytes = s.container.clone();
+                #[cfg(windows)]
+                let bytes = s.container.bytes().as_ref().to_vec();
+                (s.stage, bytes)
+            })
             .collect()
     }
 

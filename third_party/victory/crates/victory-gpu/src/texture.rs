@@ -457,8 +457,45 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let result = f(&mut read[..size]);
+        const CAP_CEILING: usize = 8 * crate::ram_trim::MIB;
+        if read.capacity() > CAP_CEILING
+            && read.capacity() > size.saturating_mul(4)
+            && crate::ram_trim::enabled()
+        {
+            crate::ram_trim::maybe_shrink_scratch_vec(&mut read, size, CAP_CEILING);
+        }
+        result
     })
+}
+
+#[cfg(test)]
+#[test]
+fn ram_trim_read_scratch_keeps_the_legacy_capacity_without_opt_in() {
+    const CHILD: &str = "VICTORY_RAM_TRIM_TEXTURE_TEST";
+    const TEST: &str = "texture::ram_trim_read_scratch_keeps_the_legacy_capacity_without_opt_in";
+    let Ok(mode) = std::env::var(CHILD) else {
+        let exe = std::env::current_exe().unwrap();
+        for enabled in [false, true] {
+            let mut child = std::process::Command::new(&exe);
+            child.args(["--exact", TEST]).env(CHILD, if enabled { "1" } else { "0" });
+            if enabled {
+                child.env("VICTORY_RAM_TRIM", "1");
+            } else {
+                child.env_remove("VICTORY_RAM_TRIM");
+            }
+            assert!(child.status().unwrap().success(), "opt-in={enabled}");
+        }
+        return;
+    };
+
+    let enabled = mode == "1";
+    let large = 9 * crate::ram_trim::MIB;
+    with_read(large, |read| read[0] = 17);
+    let before = READ.with(|read| read.borrow().capacity());
+    assert_eq!(with_read(1, |read| read[0]), 17);
+    let after = READ.with(|read| read.borrow().capacity());
+    assert_eq!(after < before, enabled);
 }
 
 /// Whether a texture all of whose memory is mapped is read through the

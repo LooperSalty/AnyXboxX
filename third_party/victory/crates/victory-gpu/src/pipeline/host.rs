@@ -595,14 +595,21 @@ impl HostPipeline {
             }
         };
         let use_library = samplers.is_empty() || super::library::allows_static_samplers(host);
+        // Borrow the retained bytes in baseline mode; otherwise pin each stage
+        // through library hashing, rectangle generation and D3D12 Load/Create.
+        let mut bytecode = [
+            Some(stages[0].0.pso_bytecode()?),
+            match stages.get(1) {
+                Some((shader, _)) => Some(shader.pso_bytecode()?),
+                None => None,
+            },
+        ];
+        let stage_code = |i: usize| bytecode[i].as_ref().map(|bytes| bytes.as_ref());
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+            stage_code(i).map_or(D3D12_SHADER_BYTECODE::default(), |bytes| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -627,6 +634,9 @@ impl HostPipeline {
                     return None;
                 }
             };
+            for bytes in bytecode.iter_mut().flatten() {
+                bytes.pipeline_created();
+            }
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
@@ -685,6 +695,9 @@ impl HostPipeline {
                     return None;
                 }
             };
+            for bytes in bytecode.iter_mut().flatten() {
+                bytes.pipeline_created();
+            }
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
@@ -709,9 +722,7 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            match victory_shader::emit::rect_list_gs(stage_code(0)?, stage_code(1)) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -796,6 +807,9 @@ impl HostPipeline {
                 return None;
             }
         };
+        for bytes in bytecode.iter_mut().flatten() {
+            bytes.pipeline_created();
+        }
         tracing::info!(?shaders, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
@@ -1021,7 +1035,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();
     }
-    // SAFETY: a translation's own bytes, alive while its shader is.
+    // SAFETY: the caller holds the stage's bytecode through this copy.
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 

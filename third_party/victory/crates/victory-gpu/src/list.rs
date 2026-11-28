@@ -412,6 +412,49 @@ fn stale_count(pushed: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usi
     pushed.take_while(|&at| now.saturating_sub(at) > max_age).count()
 }
 
+/// Trims only lists reset after their submissions finished. Keep the newest
+/// warm entries and drop the D3D12 objects after releasing the pool lock.
+#[cfg(windows)]
+pub(crate) fn trim_idle(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let Some(trim) = policy.thresholds() else { return };
+    let gone = {
+        let Ok(mut idle) = IDLE.try_lock() else { return };
+        let count = ram_trim_idle_count(idle.0.iter().map(|item| item.2), trim, now);
+        let gone: Vec<_> = idle.0.drain(..count).collect();
+        idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+        gone
+    };
+    if !gone.is_empty() {
+        crate::ram_trim::note_lists_trimmed(gone.len() as u64);
+        drop(gone);
+    }
+}
+
+#[cfg(windows)]
+fn ram_trim_idle_count(
+    pushed: impl ExactSizeIterator<Item = u64>,
+    trim: &crate::ram_trim::TrimThresholds,
+    now: u64,
+) -> usize {
+    let excess = pushed.len().saturating_sub(trim.list_idle_warm_count);
+    pushed.take(excess).take_while(|&at| now.saturating_sub(at) >= trim.list_idle_ms).count()
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn ram_trim_idle_lists_keep_recent_and_warm_entries() {
+    use crate::ram_trim::{GIB, TrimPolicy};
+    let policy = TrimPolicy::for_host(true, 16 * GIB, 8 * GIB, 8 * GIB);
+    let trim = policy.thresholds().unwrap();
+    let warm = trim.list_idle_warm_count;
+    let now = trim.list_idle_ms + 1;
+    assert_eq!(ram_trim_idle_count(vec![0; warm].into_iter(), trim, now), 0);
+    assert_eq!(ram_trim_idle_count(vec![0; warm + 2].into_iter(), trim, now), 2);
+    let mut dates = vec![now; warm + 2];
+    dates[0] = 1;
+    assert_eq!(ram_trim_idle_count(dates.into_iter(), trim, now), 1);
+}
+
 #[cfg(all(test, windows))]
 #[test]
 fn idle_list_age_saturates_and_respects_the_limit() {

@@ -1587,6 +1587,10 @@ pub(crate) fn log(frames: f64) {
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
     log_memory();
     #[cfg(feature = "diagnostics")]
+    if crate::ram_trim::enabled() {
+        tracing::info!("  {}", crate::ram_trim::diagnostics_line());
+    }
+    #[cfg(feature = "diagnostics")]
     crate::watch::alone_line(frames);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

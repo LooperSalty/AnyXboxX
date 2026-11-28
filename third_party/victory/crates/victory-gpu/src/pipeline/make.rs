@@ -52,9 +52,9 @@ pub(crate) struct Pending {
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
-    shaders
-        .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+    shaders.iter().any(|s| {
+        s.stage == "compute" && s.container.bytes().as_ref().windows(name.len()).any(|w| w == name)
+    })
 }
 
 fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
@@ -764,7 +764,7 @@ mod tests {
             Arc::new(Shader {
                 stage: "compute",
                 hash: hash.to_owned(),
-                container: Vec::new(),
+                container: super::super::shader_container::Container::Kept(Vec::new()),
                 ambient: None,
                 probe: None,
                 translated: OnceLock::from(None),
