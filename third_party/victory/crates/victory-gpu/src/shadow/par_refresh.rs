@@ -141,6 +141,7 @@ mod tests {
         assert!(!Whole::eligible(&shadow, at, at + title.len() + 1));
         let pending = shadow.pending.get_mut().unwrap();
         pending.push((at + MIN_BYTES, at + MIN_BYTES + 1));
+        shadow.has_pending.store(true, Ordering::Release);
         assert!(Whole::eligible(&shadow, at, at + MIN_BYTES));
         assert!(!Whole::eligible(&shadow, at + 1, at + MIN_BYTES + 1));
     }
@@ -172,6 +173,7 @@ mod tests {
                         .get_mut()
                         .unwrap()
                         .push((at + PIECE - 7, at + PIECE + 9));
+                    shadow.has_pending.store(true, Ordering::Release);
                 }
                 let shadow = Arc::new(shadow);
                 spans.push((shadow.clone(), at + lo, at + hi));

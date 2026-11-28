@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -92,9 +92,14 @@ extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
 }
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+    release_with(this, |_| {})
+}
+
+fn release_with<T>(this: *mut Instance<T>, on_last: impl FnOnce(*mut Instance<T>)) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
+        on_last(this);
         // SAFETY: the last reference; created by `Instance::create`.
         drop(unsafe { Box::from_raw(this) });
     }
@@ -122,7 +127,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -145,31 +150,16 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(
-        Object::new("dstorage file", &FILE_VTABLE),
-        File {
-            files,
-            key: AtomicUsize::new(0),
-        },
-    );
-    let key = file as usize;
-    // SAFETY: `Instance::create` just allocated `Instance<File>`.
-    unsafe { &*file.cast::<Instance<File>>() }
-        .state
-        .key
-        .store(key, Ordering::Relaxed);
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", key));
+        stream_log::line(format_args!("F\t{:x}\t{name}", file as usize));
     }
-    {
-        let mut files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        files.retain(|(k, _)| *k != key);
-        files.push((key, kept));
+    if walls_trace() > 0 {
+        walls_files().insert(file as usize, name);
     }
     put(out, file)
 }
@@ -294,20 +284,6 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
-    /// Address of the owning `Instance<File>` registered in [`WALLS_FILES`].
-    key: AtomicUsize,
-}
-
-impl Drop for File {
-    fn drop(&mut self) {
-        let key = self.key.load(Ordering::Relaxed);
-        if key != 0 {
-            WALLS_FILES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|(k, _)| *k != key);
-        }
-    }
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -487,10 +463,18 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    release_with(this, |file| {
+        if let Some(files) = WALLS_FILES.get() {
+            files.lock().unwrap_or_else(|e| e.into_inner()).remove(&(file as usize));
+        }
+    })
+}
+
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -690,9 +674,12 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+/// Paths of live file objects, by address, tracked only for the walls trace.
+static WALLS_FILES: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+
+fn walls_files() -> MutexGuard<'static, HashMap<usize, String>> {
+    WALLS_FILES.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -703,9 +690,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     let file = if request.options & MEMORY_SOURCE != 0 {
         "memory".to_string()
     } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        walls_files().get(&(request.source as usize)).cloned().unwrap_or_else(|| "?".to_owned())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -1531,10 +1516,16 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
+/// The tables shipped with the repository (`bcpack::BUNDLED_TABLES`, an
+/// exception of the asset policy), unless `VICTORY_BCPACK_TABLES` names a
+/// local copy to read instead.
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    match std::env::var_os("VICTORY_BCPACK_TABLES") {
+        Some(path) => read_bcpack_tables(std::path::Path::new(&path)),
+        None => Tables::parse(bcpack::BUNDLED_TABLES)
+            .map_err(|e| format!("invalid bundled BCPack tables: {e}")),
+    }
 }
 
 /// Tests decode streams made against tables of their own, from this folder.
@@ -1549,8 +1540,12 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
     let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
-    let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
-    Tables::parse(&bytes).map_err(|e| e.to_string())
+    read_bcpack_tables(&dir.join("tables.bin"))
+}
+
+fn read_bcpack_tables(path: &std::path::Path) -> Result<Tables, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read BCPack tables: {e}"))?;
+    Tables::parse(&bytes).map_err(|e| format!("invalid BCPack tables: {e}"))
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
@@ -1825,6 +1820,24 @@ mod tests {
             S_OK
         );
         file
+    }
+
+    #[test]
+    fn walls_trace_forgets_a_file_on_its_final_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream.bin");
+        std::fs::write(&path, b"stream data").unwrap();
+        let open_file = open(&path);
+        let key = open_file as usize;
+        let path = path.to_string_lossy().into_owned();
+        walls_files().insert(key, path.clone());
+        let add_ref = call::<extern "system" fn(*mut c_void) -> u32>(open_file, 0x8);
+        let release = call::<extern "system" fn(*mut c_void) -> u32>(open_file, 0x10);
+        assert_eq!(add_ref(open_file), 2);
+        assert_eq!(release(open_file), 1);
+        assert_eq!(walls_files().get(&key), Some(&path));
+        assert_eq!(release(open_file), 0);
+        assert!(!walls_files().contains_key(&key));
     }
 
     fn status_array(capacity: u32) -> *mut c_void {
@@ -2614,29 +2627,5 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
-    }
-
-    #[test]
-    fn releasing_a_file_removes_it_from_walls_files() {
-        let (_dir, file) = file_with(&pattern(32));
-        let key = file as usize;
-        assert!(
-            WALLS_FILES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .any(|(k, _)| *k == key),
-            "opened file should be registered in WALLS_FILES"
-        );
-        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
-        assert_eq!(release_fn(file), 0);
-        assert!(
-            !WALLS_FILES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .any(|(k, _)| *k == key),
-            "released file should be removed from WALLS_FILES"
-        );
     }
 }
