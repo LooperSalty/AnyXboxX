@@ -116,7 +116,12 @@ pub(crate) fn current() -> u64 {
 /// For tests of what is done once a frame.
 #[cfg(test)]
 pub(crate) fn test_advance() {
-    FRAME.fetch_add(1, Ordering::Relaxed);
+    advance_for_test(1);
+}
+
+#[cfg(test)]
+pub(crate) fn advance_for_test(frames: u64) {
+    FRAME.fetch_add(frames, Ordering::Relaxed);
 }
 
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a

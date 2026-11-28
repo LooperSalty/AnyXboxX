@@ -109,6 +109,8 @@ pub mod replay;
 #[cfg(windows)]
 mod residency;
 pub mod resource;
+#[cfg(windows)]
+pub(crate) use resource::texture_lru;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;

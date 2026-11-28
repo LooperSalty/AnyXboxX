@@ -1874,6 +1874,31 @@ pub(crate) fn make_waiting() {
     }
 }
 
+/// Yields superseded views at an idle submit. The heap table keeps each
+/// heap alive during the walk, not while its displaced references retire.
+#[cfg(windows)]
+pub(crate) fn yield_kept_views() -> usize {
+    if host::keeping_total() == 0 || !host::kept_views_yield() {
+        return 0;
+    }
+    let mut removed = Vec::new();
+    let mut yielded = 0;
+    {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps leave the table under its write lock.
+            let heap = unsafe { &*(at as *const Heap) };
+            if let Some(Some(heap)) = heap.host.get() {
+                yielded += heap.yield_kept_views_into(&mut removed);
+            }
+        }
+    }
+    for old in removed {
+        crate::host::retire_resource(old);
+    }
+    yielded
+}
+
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;

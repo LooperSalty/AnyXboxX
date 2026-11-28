@@ -1204,6 +1204,10 @@ struct Resource {
     host: Hosted,
 }
 
+#[cfg(windows)]
+#[path = "texture_lru.rs"]
+pub(crate) mod texture_lru;
+
 /// A title texture's host copy and the state it is in. The title's barriers
 /// name console states (looser than the host's), so we transition from this
 /// one. Lists that use the texture hold it until they are reset: the title
@@ -1231,7 +1235,7 @@ pub(crate) struct HostTexture {
     /// Made in place of one with fewer levels: the slots that show that one
     /// are made again once this one was filled whole.
     pub(crate) grown: std::sync::atomic::AtomicBool,
-    /// Taken out of its texture's host side for a copy with other levels
+    /// Taken out of its texture's host side for eviction or to change levels
     /// ([`want_level`], [`keep_whole`]), said before the texture's staging
     /// buffer is let go: a staging buffer made for this copy after that (by
     /// a thread that took it before) is not kept as the texture's
@@ -1247,6 +1251,8 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    last_used_frame: std::sync::atomic::AtomicU64,
+    last_fence_value: std::sync::atomic::AtomicU64,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1271,8 +1277,8 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// copy is the card's.
 #[cfg(windows)]
 struct Hosted {
-    /// The host copy (and twin) once made. Taken out again only by
-    /// [`let_go_idle`] and when the title releases the resource.
+    /// The host copy (and twin) once made. Removed on replacement, eviction,
+    /// or when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
     /// The state and clear value the title created the texture with.
     state: u32,
@@ -1758,9 +1764,14 @@ pub(crate) fn host_waits(this: This) -> bool {
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
-    use std::sync::atomic::Ordering::Relaxed;
     #[cfg(test)]
     HOSTED_ASKED.with(|n| n.set(n.get() + 1));
+    hosted_after_eviction(this, make, None)
+}
+
+#[cfg(windows)]
+fn hosted_after_eviction(this: This, make: bool, mut recovery: Option<texture_lru::EvictOutcome>) -> Option<Made> {
+    use std::sync::atomic::Ordering::Relaxed;
     let r = resource(this);
     if r.desc.dimension == BUFFER {
         return None;
@@ -1776,6 +1787,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             return None;
         }
         let first_attempt = retry_at == 0;
+        let can_recover = texture_lru::enabled();
+        if can_recover && recovery.is_none() && fills(&r.desc) && !texture_lru::has_room_lately() {
+            drop(made);
+            let outcome = texture_lru::recover_allocation(texture_lru::allocation_info(this, &r.desc));
+            return hosted_after_eviction(this, make, Some(outcome));
+        }
         let clear = r
             .host
             .clear
@@ -1861,11 +1878,30 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let texture = match created {
             Ok(texture) => texture,
             Err(error) => {
+                if can_recover && recovery.is_none() {
+                    // A scan takes the texture table before the host-copy lock.
+                    drop(made);
+                    let info = texture_lru::allocation_info(this, &r.desc.levels_from(base));
+                    let outcome = texture_lru::recover_allocation(info);
+                    if outcome.evicted_count != 0 {
+                        return hosted_after_eviction(this, make, Some(outcome));
+                    }
+                    made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                    if made.is_some() || r.host.retry_at.load(Relaxed) != retry_at {
+                        drop(made);
+                        return hosted_after_eviction(this, make, Some(outcome));
+                    }
+                    recovery = Some(outcome);
+                }
+                // Preserve the one delayed retry for E_OUTOFMEMORY.
                 let retry = next_texture_retry(error.code(), first_attempt, crate::host::coarse_ms());
                 r.host.retry_at.store(retry, Relaxed);
                 if retry != u64::MAX {
                     crate::residency::allocation_error(&error);
                     crate::residency::note_upload_deferred();
+                } else if let Some(outcome) = recovery {
+                    drop(made);
+                    texture_lru::warn_refused(texture_lru::allocation_info(this, &r.desc.levels_from(base)), outcome);
                 }
                 return None;
             }
@@ -1926,6 +1962,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.host.used.load(Relaxed) != now {
         r.host.used.store(now, Relaxed);
     }
+    if texture_lru::enabled()
+        && let Some((copy, _)) = made.as_ref()
+        && copy.last_used_frame.load(Relaxed) < now >> 32
+    {
+        copy.last_used_frame.fetch_max(now >> 32, Relaxed);
+    }
     made.clone()
 }
 
@@ -1979,6 +2021,9 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    if texture_lru::enabled() {
+        return texture_lru::room(memory);
+    }
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -2431,6 +2476,7 @@ pub(crate) fn let_go_idle() {
 fn let_go(all: &std::collections::BTreeSet<usize>, idle_ms: u64, most: u64) -> (u64, u64, Option<usize>) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    let completed = texture_lru::enabled().then(|| crate::host::host().map_or(0, crate::host::Host::completed_fence));
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2484,6 +2530,7 @@ fn let_go(all: &std::collections::BTreeSet<usize>, idle_ms: u64, most: u64) -> (
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && (most == u64::MAX || host.card_bytes() != 0)
+                    && completed.is_none_or(|fence| host.fence_complete(fence))
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2880,6 +2927,17 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    pub(crate) fn note_submitted(&self, frame: u64, fence: u64) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        self.last_used_frame.fetch_max(frame, Relaxed);
+        self.last_fence_value.fetch_max(fence, Release);
+    }
+
+    fn fence_complete(&self, completed: u64) -> bool {
+        completed != u64::MAX
+            && self.last_fence_value.load(std::sync::atomic::Ordering::Acquire) <= completed
+    }
+
     /// The bytes backed by card memory, counting only mapped tiles for reserved textures.
     fn card_bytes(&self) -> u64 {
         self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)
@@ -2910,6 +2968,8 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: None,
             flags,
+            last_used_frame: Default::default(),
+            last_fence_value: Default::default(),
         }
     }
 
@@ -2937,6 +2997,8 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: None,
             flags,
+            last_used_frame: Default::default(),
+            last_fence_value: Default::default(),
         }
     }
 }
