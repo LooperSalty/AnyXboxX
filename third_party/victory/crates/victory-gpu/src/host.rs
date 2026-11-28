@@ -5140,6 +5140,20 @@ struct RelayBack {
     found: Option<Vec<Vec<(usize, usize)>>>,
 }
 
+fn lazy_landing<'a>(back: &[Declared], plans: impl Iterator<Item = &'a CardPlan>) -> Option<crate::watch::lazy_back::Landing> {
+    let mapped = back.iter().filter(|(s, _)| !s.carded())
+        .flat_map(|(s, ranges)| ranges.iter().map(|&(lo, hi)| {
+            let (base, len) = s.span();
+            (s.id(), lo.max(base as usize), hi.min(base.saturating_add(len) as usize))
+        }));
+    let card = plans.flat_map(|plan| plan.ranges.iter().filter(|r| !r.picked)
+        .map(|r| {
+            let start = r.shadow.span().0 as usize;
+            (r.shadow.id(), start + r.span.from as usize, start + r.span.to as usize)
+        }));
+    crate::watch::lazy_back::completed_landing(mapped.chain(card))
+}
+
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
@@ -5167,6 +5181,28 @@ impl RelayBack {
         // later flight writing, the title's bytes going in) is found now or
         // by that flight's landing, and the merge looks again under the
         // lock.
+        if crate::watch::lazy_back::can_defer() {
+            let mut eager = Vec::new();
+            for (shadow, from, to) in self.work.drain(..) {
+                if !shadow.mapped_on_card() {
+                    eager.push((shadow, from, to));
+                    continue;
+                }
+                let (base, len) = shadow.span();
+                let (mut at, end) = (from.max(base as usize), to.min(base.saturating_add(len) as usize));
+                let mut keep = at;
+                while at < end {
+                    let n = (crate::watch::PAGE - at % crate::watch::PAGE).min(end - at);
+                    if shadow.defer_relay_page(at - base as usize, n) {
+                        if keep < at { eager.push((shadow.clone(), keep, at)); }
+                        keep = at + n;
+                    }
+                    at += n;
+                }
+                if keep < end { eager.push((shadow, keep, end)); }
+            }
+            self.work = eager;
+        }
         self.found = Some(crate::shadow::find_all(&self.work));
         crate::land::spent(stat, scanning);
         #[cfg(feature = "diagnostics")]
@@ -5177,9 +5213,14 @@ impl RelayBack {
     fn merge(mut self) {
         use crate::land;
         self.look(land::stat::SCAN);
-        let Some(found) = self.found else {
+        let Some(mut found) = self.found else {
             return;
         };
+        if crate::watch::lazy_back::can_defer() {
+            for ((shadow, ..), pieces) in self.work.iter().zip(&mut found) {
+                if !shadow.mapped_on_card() { pieces.retain(|&(at, n)| !shadow.defer_relay_page(at, n)); }
+            }
+        }
         let merging = std::time::Instant::now();
         let mut written: Vec<u64> = Vec::new();
         if land::on() {
@@ -5394,6 +5435,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+pub(crate) mod lazy_readback;
 mod mapping_fence;
 mod prelude_pool;
 mod budget_pool;
@@ -6422,6 +6464,7 @@ impl Host {
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        let mut deferred = false;
         if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min()) {
             fetch.had.landing(first);
         }
@@ -6467,6 +6510,14 @@ impl Host {
                                 upcheck::fetched(r.shadow.id(), lo);
                             }
                             seen.insert((copy, lo, hi));
+                            if crate::watch::lazy_back::can_defer() && !torn::on()
+                                && hi - lo == crate::watch::PAGE
+                                && !r.shadow.card_dirty_now().iter().any(|&(a,b)| a < hi && b > lo)
+                                && self.defer_card_page(&r.shadow, lo, false)
+                            {
+                                deferred = true;
+                                continue;
+                            }
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -6512,7 +6563,9 @@ impl Host {
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
-            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
+            // A deferred page has not been fetched; only the landed plans
+            // establish a watermark in this batch.
+            let after = match deferred || fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
                 true => behind,
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
@@ -6709,6 +6762,13 @@ impl Host {
                         }
                     }
                 }
+                // A trailing completed batch can lend its sources to the
+                // pager until the next submission. Never wait for the lock:
+                // its owner can be waiting for this landing.
+                let idle = crate::watch::lazy_back::enabled()
+                    .then(|| self.submitted.try_lock().ok()).flatten()
+                    .filter(|last| flights.last().is_some_and(|f| f.fence == **last));
+                let _lazy = idle.as_ref().and_then(|_| lazy_landing(&back, plans.iter().map(|p| p.0)));
                 let mut hand_back = relay_hand_back(&back);
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
@@ -6859,6 +6919,11 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                    if crate::watch::lazy_back::can_defer() && hi - lo == crate::watch::PAGE
+                        && self.defer_card_page(&r.shadow, lo, true)
+                    {
+                        continue;
+                    }
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -7397,6 +7462,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::lazy_back::retire_sources();
         // Upscalings these lists recorded, in submission order: the next
         // present tags the latest (frame generation).
         if crate::streamline::tracking_frames() {
@@ -7882,12 +7948,13 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let back = crate::picked::with(declared, &picked.written);
+        let _lazy = lazy_landing(&back, card.iter());
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
-        let back = crate::picked::with(declared, &picked.written);
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);
@@ -10915,7 +10982,9 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        if info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS && crate::watch::lazy_back::was_guarded(at as usize, n) {
+            read_pieces(at, to, n);
+        } else if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -11017,6 +11086,8 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// Number of bytes transferred before a failed title-memory access.
 fn read_count(src: *const u8, dst: *mut u8, len: usize) -> usize {
+    crate::watch::lazy_back::materialize(src as usize, len);
+    crate::watch::lazy_back::materialize(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if crate::safecopy::on() {
@@ -11025,6 +11096,9 @@ fn read_count(src: *const u8, dst: *mut u8, len: usize) -> usize {
         // or the same, except for callers with their own ordering contract.
         return unsafe { crate::safecopy::copy_count(dst, src, len) };
     }
+    let Ok(_pin) = crate::watch::lazy_back::physical_write(|| vec![(src as usize, len), (dst as usize, len)]) else {
+        return 0;
+    };
     let mut done = 0;
     // SAFETY: the host side, if any, is valid for `len` bytes. The kernel
     // reports the transfer and any inaccessible source or destination.
@@ -11062,6 +11136,14 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _pin = if crate::safecopy::on() {
+        None
+    } else {
+        match crate::watch::lazy_back::physical_write(|| vec![(dst as usize, len)]) {
+            Ok(pin) => pin,
+            Err(()) => { crate::watch::lost("deferred GPU readback", dst as usize, len); return; }
+        }
+    };
     let direct = direct_writes();
     let since = crate::watch::changes();
     let write = |at: usize, n: usize| {

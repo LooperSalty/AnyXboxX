@@ -4426,13 +4426,13 @@ impl Shadow {
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(self: &Arc<Self>, address: usize, len: usize) -> usize {
         self.copy_back_with(address, len, None)
     }
 
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
-    pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+    pub(crate) fn copy_back_with(self: &Arc<Self>, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -4473,10 +4473,12 @@ impl Shadow {
             // work for small ranges.
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
             for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
+                if crate::watch::lazy_back::can_defer() && n == PAGE && self.defer_mapped_page(at, old) {
+                    continue;
+                }
+                // SAFETY: inside the mapping; only the submitting thread writes it.
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
@@ -4574,6 +4576,42 @@ impl Shadow {
             return 0;
         }
         put_changed(start + at, &was, title)
+    }
+
+    pub(crate) fn mapped_on_card(&self) -> bool { self.mapped }
+
+    /// Only used at the completed tail of the relay under the submit lock.
+    /// No later flight shares the snapshot and copy_back_done returns it to
+    /// the pool before another submit can begin (relay excludes keeps).
+    pub(crate) fn defer_relay_page(self: &Arc<Self>, at: usize, n: usize) -> bool {
+        if n != PAGE || at.checked_add(n).is_none_or(|end| end > self.len as usize) {
+            return false;
+        }
+        let reference = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = reference.as_ref() else { return false };
+        // SAFETY: only the declared offsets of this pooled snapshot are initialized.
+        let baseline = unsafe { std::slice::from_raw_parts(before.as_ptr().add(at), n) };
+        self.defer_mapped_page(at, baseline)
+    }
+
+    fn defer_mapped_page(self: &Arc<Self>, at: usize, baseline: &[u8]) -> bool {
+        let owner = self.clone();
+        let title = self.start as usize + at;
+        if !crate::watch::lazy_back::eligible(self.id(), title) { return false; }
+        let armed = if self.mapped {
+            crate::host::lazy_readback::ready() && crate::watch::lazy_back::arm_gpu(
+                title, |bytes| bytes == baseline, crate::host::lazy_readback::Page::Live(owner, at))
+        } else {
+            crate::watch::lazy_back::arm(title, baseline, move |own| {
+                // SAFETY: owner retains this CPU-visible mapping through the
+                // next submit, which captures its bytes before reusing it.
+                unsafe { std::ptr::copy_nonoverlapping(owner.data.add(at), own, PAGE) };
+                Ok(())
+            })
+        };
+        if !armed { return false; }
+        crate::watch::wrote(title, PAGE);
+        true
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -5447,7 +5485,7 @@ impl Shadow {
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
-    fn card_changed(&self, from: usize, to: usize) {
+    pub(crate) fn card_changed(&self, from: usize, to: usize) {
         self.card_changed_runs(std::iter::once((from, to)));
     }
 
@@ -5762,6 +5800,49 @@ impl Shadow {
             return 0;
         }
         put_changed(start + at, &was, title)
+    }
+}
+
+/// Run the fault-time DMA on a real D3D12 queue, with separate source and
+/// CPU-side buffers and a title page already registered by the test.
+#[cfg(test)]
+pub(crate) fn verify_lazy_card_readback(at: usize) {
+    let host = crate::host::host().expect("D3D12 test device");
+    let (staging, held) = host.shared_buffer(PAGE as u64).unwrap();
+    let (source, data) = host.shared_buffer(PAGE as u64).unwrap();
+    unsafe {
+        std::ptr::write_bytes(at as *mut u8, 0x11, PAGE);
+        std::ptr::write_bytes(held, 0x11, PAGE);
+        std::ptr::write_bytes(data, 0xbd, PAGE);
+    }
+    let owner = build_loose_shadow(at as u64, PAGE as u64, LooseBacking::Shared {
+        buffer: staging, data: held, card: Some(source),
+    });
+    let _landing = crate::watch::lazy_back::completed_landing(std::iter::once((owner.id(), at, at + PAGE)));
+    assert!(host.defer_card_page(&owner, 0, false));
+    unsafe {
+        assert_eq!(held.read_volatile(), 0x11, "GPU source still outstanding");
+        assert_eq!((at as *const u8).read_volatile(), 0xbd);
+        assert_eq!(held.add(PAGE - 1).read_volatile(), 0xbd);
+    }
+    // A GPU-mapped source has no CPU mirror. Use a second mapped D3D12
+    // resource so the same test works on devices without GPU_UPLOAD.
+    let (resource, live) = host.shared_buffer(PAGE as u64).unwrap();
+    unsafe { std::ptr::write_bytes(live, 0x47, PAGE); }
+    let mapped = build_loose_shadow(at as u64, PAGE as u64, LooseBacking::Mapped { buffer: resource, data: live });
+    let _scope = crate::watch::lazy_back::completed_landing(std::iter::once((mapped.id(), at, at + PAGE)));
+    let side = crate::inplace::beside(at, PAGE).unwrap() as *const u8;
+    assert!(mapped.defer_mapped_page(0, &vec![0xbd; PAGE]));
+    crate::watch::lazy_back::retire_sources();
+    unsafe { std::ptr::write_bytes(live, 0x75, PAGE); }
+    // A fresh completed GPU result supersedes even when the old baseline
+    // is different; continuous protection proves the title has not written.
+    assert!(mapped.defer_mapped_page(0, &vec![0x47; PAGE]));
+    unsafe { assert_eq!(side.read_volatile(), 0xbd, "neither version landed in title RAM"); }
+    crate::watch::lazy_back::retire_sources();
+    unsafe {
+        std::ptr::write_bytes(live, 0xa1, PAGE);
+        assert_eq!((at as *const u8).read_volatile(), 0x75, "fault reads the latest immutable GPU version");
     }
 }
 
