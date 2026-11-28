@@ -582,6 +582,12 @@ fn sweep() {
     crate::pool::room(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    if crate::shadow::card_tier::enabled() {
+        demote::reap();
+        if let Some(host) = host {
+            crate::shadow::card_tier::under_pressure(host, memory);
+        }
+    }
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
@@ -3338,6 +3344,14 @@ unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
+/// Serializes direct queue operations while the opt-in readback is active.
+/// Acquire after submission/order locks and never hold across CPU fence waits.
+static QUEUE_SUBMIT: Mutex<()> = Mutex::new(());
+
+pub(crate) fn queue_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    crate::shadow::card_tier::enabled().then(|| QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
 /// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
@@ -3638,6 +3652,41 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+}
+
+/// The fence behind the last group covers the recording, its preludes,
+/// and the following compare. Descriptor indexing can also name buffers
+/// not present in the deferred steps (see the conservative heap stamp).
+fn note_submitted_shadows(runs: &[&HostList], card: Option<&CardPlan>, picked: &crate::picked::Ranges, fence: u64) {
+    if !crate::shadow::card_tier::enabled() {
+        return;
+    }
+    crate::shadow::card_tier::note_descriptors_fence(fence);
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, ..) | Step::GpuWrite(shadow, ..) => shadow.note_gpu_fence(fence),
+                Step::Placed(copy) => {
+                    copy.shadow.note_gpu_fence(fence);
+                    if let Some(source) = &copy.source {
+                        source.note_gpu_fence(fence);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (shadow, ..) in picked.written.iter().chain(&picked.looked) {
+        shadow.note_gpu_fence(fence);
+    }
+    if let Some(plan) = card {
+        for shadow in &plan._synced {
+            shadow.note_gpu_fence(fence);
+        }
+        for range in &plan.ranges {
+            range.shadow.note_gpu_fence(fence);
+        }
+    }
 }
 
 /// Mark preparations only once their lists reached the graphics queue.
@@ -5393,6 +5442,7 @@ mod prelude_pool;
 mod budget_pool;
 mod title_stock;
 mod card_steps;
+mod demote;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -5920,10 +5970,20 @@ impl Host {
         Some(clock)
     }
 
-    /// Lists of ours just went to the queue: the clock's signal goes
-    /// behind them, and an idle stretch of the card, if one was under way,
-    /// ends here ([`CARD_CLOCK_US`]).
-    fn card_sent(&self) {
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain query on the live direct queue fence.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    pub(crate) fn demote_readback(
+        &self, sources: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64)>,
+    ) -> Option<Vec<Vec<u8>>> {
+        demote::run(self, sources)
+    }
+
+    /// Lists of ours just went to the queue: the clock's signal goes behind
+    /// them (while the caller still holds the optional queue lock).
+    fn card_sent_locked(&self) {
         let Some(clock) = self.card_clock() else {
             return;
         };
@@ -6025,7 +6085,7 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool, fence: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -6103,7 +6163,7 @@ impl Host {
                         // the copy queue; the sends come from there.
                         if looks.is_none() && upq::on() {
                             let (memory, used) = own.source();
-                            up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
+                            up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _| {}, |_, _, _| {});
                         }
                         let from = up.as_ref().and_then(upq::Slot::bounce);
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
@@ -6119,7 +6179,13 @@ impl Host {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
-                        up = upq::send(self, &self.queue, &ranges, |i, bounce, at| {
+                        up = upq::send(self, &self.queue, &ranges, |fence, value| {
+                            for (shadow, spans) in &dirty {
+                                if !spans.is_empty() {
+                                    shadow.note_aux_fence(crate::shadow::card_tier::Queue::Upload, fence, value);
+                                }
+                            }
+                        }, |i, bounce, at| {
                             let (card, offset, _, bytes) = ranges[i];
                             list.CopyBufferRegion(card, offset, bounce, at, bytes);
                         });
@@ -6192,7 +6258,13 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let cmd = list.cast()?;
+                    let _queue = queue_lock();
+                    // Covered by the next main signal; the plan pins each copy.
+                    for (shadow, _) in &dirty {
+                        shadow.note_gpu_fence(fence);
+                    }
+                    self.queue.ExecuteCommandLists(&[Some(cmd)]);
                     Ok(())
                 })()
             };
@@ -6539,13 +6611,17 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
+                let copies = check.as_ref().map_or(&pieces, |c| &c.copies);
+                for (shadow, lo, hi, at) in copies {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    for (shadow, ..) in copies {
+                        shadow.note_aux_fence(crate::shadow::card_tier::Queue::RelayCopy, &fence, sent);
+                    }
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
@@ -6557,12 +6633,19 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                let after = {
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    let _queue = queue_lock();
+                    for (shadow, ..) in copies {
+                        shadow.note_aux_fence(crate::shadow::card_tier::Queue::Direct, &fence, sent);
+                    }
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent_locked();
+                    self.queue.Signal(&fence, sent)?;
+                    after
+                };
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
@@ -6879,10 +6962,17 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
-                    *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    let cmd = list.cast()?;
+                    {
+                        let _queue = queue_lock();
+                        *submitted += 1;
+                        for &(i, ..) in &pieces {
+                            plan.ranges[i].shadow.note_gpu_fence(*submitted);
+                        }
+                        self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                        self.card_sent_locked();
+                        self.queue.Signal(&self.fence, *submitted)?;
+                    }
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -7643,7 +7733,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let card = self.card_before(&declared, &picked, flown, *submitted + 1);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -7700,12 +7790,18 @@ impl Host {
             } else {
                 compare_at
             };
+            note_submitted_shadows(runs, card.as_ref(), &picked, *submitted);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                let queue = queue_lock();
                 for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
                     self.queue.ExecuteCommandLists(batch);
                 }
-                self.queue.Signal(&self.fence, *submitted)
+                let result = self.queue.Signal(&self.fence, *submitted);
+                if queue.is_some() {
+                    self.card_sent_locked();
+                }
+                result
             };
             if crate::detile::on() { crate::detile::sent(*submitted); }
             if crate::feedback::on() {
@@ -7714,7 +7810,9 @@ impl Host {
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
+            if !crate::shadow::card_tier::enabled() {
+                self.card_sent_locked();
+            }
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -7769,20 +7867,22 @@ impl Host {
             )
         };
         submitting(2, runs.len());
-        for (_i, &(group, _kind)) in groups.iter().enumerate() {
+        note_submitted_shadows(runs, card.as_ref(), &picked, *submitted + groups.len() as u64);
+        for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                if _i + 1 == groups.len() && !comparison.is_empty() {
-                    self.queue.ExecuteCommandLists(comparison);
-                }
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let signal = {
+                    let _queue = queue_lock();
+                    self.queue.ExecuteCommandLists(group);
+                    if i + 1 == groups.len() && !comparison.is_empty() {
+                        self.queue.ExecuteCommandLists(comparison);
+                    }
+                    self.card_sent_locked();
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                let waited = signal.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
@@ -11616,6 +11716,11 @@ impl Meter {
                         per_frame(5),
                         per_frame(6) / 1e3
                     );
+                    if crate::shadow::card_tier::enabled() {
+                        let [count, bytes, reserved] = crate::shadow::card_tier::STATS.each_ref().map(|s| s.load(Ordering::Relaxed));
+                        tracing::info!(card_demoted_count = count, card_demoted_bytes = bytes,
+                            card_reserved_large_rejects = reserved, "card-buffer tiering totals");
+                    }
                 }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -11785,7 +11890,8 @@ impl Host {
             settle_now(WHY_SYNC);
             if !crate::streamline::resizing() { return None; }
             let resize_buffers = || {
-                // SAFETY: no back buffer is held; every submission was waited for.
+                let _queue = queue_lock();
+                // SAFETY: no back buffer is held; prior submissions were waited for.
                 unsafe {
                     p.swap_chain
                         .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
@@ -12106,6 +12212,7 @@ impl Host {
                 }
                 status
             } else {
+                let _queue = queue_lock();
                 p.swap_chain.Present(0, DXGI_PRESENT(0))
             };
             crate::streamline::present_returned(called);
@@ -12167,6 +12274,10 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            let native_swap_chain = || {
+                let _queue = queue_lock();
+                factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()
+            };
             let fg_desc = DXGI_SWAP_CHAIN_DESC1 { Format: fg_format, ..desc };
             let generated = crate::framegen::requested()
                 .then(|| crate::framegen::swap_chain(hwnd, &fg_desc, &factory, &self.queue, &self.device, frame))
@@ -12194,13 +12305,11 @@ impl Host {
                         }
                         Some(Err(e)) => {
                             crate::streamline::swap_chain_made(false, Some(&e));
-                            factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
+                            native_swap_chain()?
                         }
                         // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
                         // generation: Streamline's proxy of it, for its present hook.)
-                        None => crate::streamline::present_hooked(
-                            factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
-                        ),
+                        None => crate::streamline::present_hooked(native_swap_chain()?),
                     }
                 }
             };

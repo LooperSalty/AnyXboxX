@@ -170,8 +170,12 @@ mod tests {
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
             unsafe {
-                host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
-                host.queue.Signal(&host.fence, *submitted).unwrap();
+                {
+                    let _queue = crate::host::queue_lock();
+                    // Timestamp queries do not name any shadow buffers.
+                    host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
+                    host.queue.Signal(&host.fence, *submitted).unwrap();
+                }
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
                 WaitForSingleObject(host.event, INFINITE);
             }

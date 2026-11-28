@@ -24,6 +24,11 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod card_budget;
+pub(crate) mod card_tier;
+
+use card_budget::remaining_card_room;
+
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so partially-initialized buffers and windows
 /// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
@@ -450,6 +455,8 @@ pub(crate) struct Shadow {
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
+    /// Queue stamps and access order, allocated only by the opt-in policy.
+    card_usage: Option<Box<card_tier::Usage>>,
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
@@ -502,6 +509,8 @@ struct Card {
     has_sent: AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// A device-local title buffer admitted by the opt-in tier policy.
+    tier_local: bool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -721,7 +730,7 @@ pub(crate) fn card_room_kept() -> u64 {
     );
     remaining_card_room(
         buffers,
-        CARD_BYTES[0].load(Ordering::Relaxed),
+        if card_tier::enabled() { card_tier::room_taken() } else { CARD_BYTES[0].load(Ordering::Relaxed) },
         CARD_REFUSED[1].load(Ordering::Relaxed),
         windows,
         WINDOW_CARD_BYTES.load(Ordering::Relaxed),
@@ -735,11 +744,6 @@ fn reservation_limits(buffers: u64, explicit_buffers: bool, windows: u64, reserv
     } else {
         (buffers.min(SEEN), 0)
     }
-}
-
-fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, window_used: u64) -> u64 {
-    buffers.saturating_sub(used.saturating_add(refused))
-        .saturating_add(windows.saturating_sub(window_used))
 }
 
 /// The copies in the card's memory.
@@ -784,8 +788,12 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// host has what it takes (`Host::card_ready`).
 fn card_for(size: u64) -> Option<ID3D12Resource> {
     let there = card_room_for(size);
-    if there.is_some() || !card_all() || size >= 1 << 30 {
-        return there;
+    there.or_else(|| card_in_system_memory(size))
+}
+
+fn card_in_system_memory(size: u64) -> Option<ID3D12Resource> {
+    if !card_all() || size >= 1 << 30 {
+        return None;
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
@@ -3652,6 +3660,9 @@ impl Drop for Shadow {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
+                if card.tier_local {
+                    card_tier::release(card.size, false);
+                }
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
@@ -4154,7 +4165,45 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+fn next_shadow_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Shadow {
+    pub(crate) fn note_gpu_fence(&self, value: u64) {
+        if let Some(usage) = &self.card_usage {
+            usage.last_fence.fetch_max(value, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn note_aux_fence(
+        &self, queue: card_tier::Queue, fence: &windows::Win32::Graphics::Direct3D12::ID3D12Fence, value: u64,
+    ) {
+        if let Some(usage) = &self.card_usage {
+            usage.stamp(queue, fence, value);
+        }
+    }
+
+    pub(crate) fn note_descriptor(&self) {
+        if let Some(usage) = &self.card_usage {
+            usage.descriptor.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn note_gpu_written(&self) {
+        self.note_descriptor();
+        if let Some(usage) = &self.card_usage {
+            usage.gpu_written.store(true, Ordering::Release);
+        }
+    }
+
+    fn note_access(&self) {
+        if let Some(usage) = &self.card_usage {
+            usage.access();
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -4260,10 +4309,8 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id: next_shadow_id(),
+            card_usage: None,
             card: None,
             window: false,
             changes_only: Default::default(),
@@ -5783,6 +5830,7 @@ impl Shadow {
                 sent: Mutex::default(),
                 has_sent: AtomicBool::new(false),
                 size: len.next_multiple_of(PIECE as u64),
+                tier_local: false,
             });
         }
         let shadow = Arc::new(shadow);
@@ -5980,6 +6028,7 @@ mod land_tests {
             sent: Mutex::default(),
             has_sent: AtomicBool::new(false),
             size: len as u64,
+            tier_local: false,
         });
         Some(shadow)
     }
@@ -6329,12 +6378,14 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
+    buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.clone()).inspect(|shadow| shadow.note_access())
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        shadow.note_access();
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -6347,6 +6398,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
                 }
+                shadow.note_access();
                 return Some(shadow.clone());
             }
             Some(_) => {}
@@ -6356,6 +6408,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
     }
+    lookup_slow(address, len, end, any, true)
+}
+
+fn lookup_slow(address: u64, len_for_lookup: u64, end: u64, any: bool, retry: bool) -> Option<Arc<Shadow>> {
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -6365,7 +6421,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len_for_lookup <= 1, any);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -6388,11 +6444,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.title_shared_buffer(size)?;
+        let host = host()?;
+        let (buffer, data) = host.title_shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (on_card, tier_local) = if card_tier::enabled() {
+            match card_tier::place(host, size, retry) {
+                card_tier::Placement::Local(local) => (Some(local), true),
+                card_tier::Placement::System => (card_in_system_memory(size), false),
+                card_tier::Placement::Reclaim(bytes) => {
+                    drop(map);
+                    drop(buffer);
+                    card_tier::reclaim(host, bytes, false);
+                    return lookup_slow(address, len_for_lookup, end, any, false);
+                }
+            }
+        } else {
+            (card_for(size), false)
+        };
+        // Shaders see the second side; the buffer just made is the CPU side.
+        let (buffer, card) = match on_card {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -6408,6 +6478,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     has_sent: AtomicBool::new(false),
                     size,
+                    tier_local,
                 };
                 (on_card, Some(card))
             }
@@ -6429,6 +6500,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        if tier_local {
+            shadow.card_usage = Some(Box::default());
+        }
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
@@ -6436,7 +6510,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    entry.shadow.clone().inspect(|shadow| shadow.note_access())
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -6642,6 +6716,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         sent: Mutex::default(),
         has_sent: AtomicBool::new(false),
         size: len,
+        tier_local: false,
     });
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -6720,6 +6795,7 @@ fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow
                         sent: Mutex::default(),
                         has_sent: AtomicBool::new(false),
                         size: len,
+                        tier_local: false,
                     };
                     (on_card, Some(card))
                 }

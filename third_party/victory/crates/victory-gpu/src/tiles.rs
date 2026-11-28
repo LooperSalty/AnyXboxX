@@ -636,8 +636,9 @@ impl Tiled {
             // subresource. Unmapping is safe because the upload that dropped
             // the level already wrote zeros to it and tier >= 2 reads unmapped
             // tiles as zeros (no fault); `RECLAIM_HYSTERESIS_MS` only avoids
-            // thrashing.
+            // thrashing. Like mapping, this only touches a reserved texture.
             unsafe {
+                let _queue = crate::host::queue_lock();
                 queue.UpdateTileMappings(
                     texture,
                     1,
@@ -845,8 +846,10 @@ impl Tiled {
             // SAFETY: a live reserved texture and a live heap of ours; one
             // region of `tiles` tiles from the subresource's first tile;
             // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
+            // arrays of that length that live through the call. Serialized
+            // with direct `Host::queue` submissions via `host::queue_lock()`.
             unsafe {
+                let _q = crate::host::queue_lock();
                 queue.UpdateTileMappings(
                     texture,
                     1,
