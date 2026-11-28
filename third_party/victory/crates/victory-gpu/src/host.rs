@@ -1180,6 +1180,10 @@ pub(crate) fn removal_context() -> String {
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
+    let driver_events = crate::drvwatch::errors();
+    if driver_events != 0 {
+        let _ = write!(text, "; display-driver events seen by the watcher: {driver_events}");
+    }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
@@ -1421,6 +1425,7 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    crate::drvwatch::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -11513,6 +11518,10 @@ impl Meter {
             });
             if !five {
                 return;
+            }
+            let driver_events = crate::drvwatch::errors();
+            if driver_events != 0 {
+                tracing::warn!(driver_events, "display-driver events seen by the watcher since startup");
             }
             #[cfg(feature = "diagnostics")]
             open_lists_line();
