@@ -5,21 +5,21 @@ use std::ptr::null;
 
 #[test]
 fn closes_coalesce_and_a_pending_close_yields_to_a_request() {
-    let mut r = Rounds::new();
+    let mut r = SyncRounds::default();
     assert!(r.list_closed());
     assert!(!r.list_closed());
     r.asked = 1;
-    assert_eq!(r.take(), Some(Pass::Requested));
+    assert_eq!(r.take_pass(), Some(Pass::Requested));
     assert!(!r.list_closed());
     r.done = 1;
-    assert_eq!(r.take(), None);
+    assert_eq!(r.take_pass(), None);
     assert!(r.list_closed());
-    assert_eq!(r.take(), Some(Pass::Close));
+    assert_eq!(r.take_pass(), Some(Pass::Close));
     assert!(
         !r.list_closed(),
         "abandoned lists cannot keep the worker busy"
     );
-    assert_eq!(r.take(), None);
+    assert_eq!(r.take_pass(), None);
     assert_eq!((r.asked, r.done), (1, 1));
 }
 
@@ -120,7 +120,7 @@ fn check_heap() -> Vec<u8> {
         std::env::var("VICTORY_THIN").unwrap() == "1"
     );
     // Establish the worker so the journal can issue a ticket at enqueue.
-    drop(begin_sync_heaps());
+    drop(begin_sync_heaps_for(None));
     let mirrored = || SYNCED[2].load(Relaxed);
     let before_close = mirrored();
     let mut expected = [[0u8; 16]; SLOTS];
@@ -155,7 +155,7 @@ fn check_heap() -> Vec<u8> {
         assert_ne!(mark, 0);
         drop(begin_sync_heaps_after(mark));
     } else {
-        drop(begin_sync_heaps());
+        drop(begin_sync_heaps_for(None));
     }
     // The required pass mirrors the two late changes or builds all 33 live slots.
     assert_eq!(mirrored() - before_submit, if early { 2 } else { 33 });
@@ -175,4 +175,46 @@ fn check_heap() -> Vec<u8> {
     // SAFETY: the heap using this allocation has been released.
     unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
     bytes
+}
+
+#[cfg(windows)]
+#[test]
+fn sync_rounds_coalesce_queued_submissions_and_early_rounds() {
+    let mut r = super::SyncRounds::default();
+    // Three queued submissions enqueued before any round starts share stamp 1.
+    let s1 = r.stamp();
+    let s2 = r.stamp();
+    let s3 = r.stamp();
+    assert_eq!((s1, s2, s3), (1, 1, 1));
+    assert!(!r.has_asked());
+    // First submission triggers round 1.
+    assert_eq!(r.request(Some(s1)), (Some(1), true));
+    assert!(r.has_asked());
+    // Worker starts round 1; a submission enqueued *during* round 1 gets stamp 2.
+    r.start_round();
+    let s_during = r.stamp();
+    assert_eq!(s_during, 2);
+    // Round 1 finishes: submissions 2 and 3 need no round and no wait.
+    r.finish_round();
+    assert!(!r.has_asked());
+    assert_eq!(r.request(Some(s2)), (None, false));
+    assert_eq!(r.request(Some(s3)), (None, false));
+    // An early round runs before `s_during` is submitted, covering stamp 2.
+    r.start_round();
+    r.finish_round();
+    assert!(!r.has_asked());
+    assert_eq!(r.request(Some(s_during)), (None, false));
+    // Unstamped (synchronous) caller always demands a fresh round after `started`.
+    assert_eq!(r.request(None), (Some(3), true));
+    assert!(r.has_asked());
+    r.start_round();
+    r.finish_round();
+    assert!(!r.has_asked());
+    // Lazily creating a host heap during thin translation raises `floor`
+    // so an earlier-stamped submission cannot skip syncing the new heap.
+    r.note_heap();
+    assert_eq!(r.request(Some(s2)), (Some(4), true));
+    r.start_round();
+    r.finish_round();
+    assert_eq!(r.request(Some(s3)), (None, false));
 }

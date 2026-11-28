@@ -13,6 +13,9 @@ use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+#[cfg(test)]
+pub(super) mod timed;
+
 pub struct Host {
     pub device: ID3D12Device,
 }
@@ -168,6 +171,34 @@ fn an_explicit_adapter_matches_an_index_or_name() {
 }
 
 impl Host {
+    #[cfg(test)]
+    pub(super) fn check_hardware_validation(&self) {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_none() {
+            return;
+        }
+        let queue: ID3D12InfoQueue = self.device.cast().expect("D3D12 debug layer");
+        let (mut errors, mut warnings) = (0, 0);
+        // SAFETY: storage is aligned for the message and sized for its inline text.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                queue.GetMessage(i, None, &mut size).unwrap();
+                let mut storage = vec![0u64; size.div_ceil(8)];
+                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(message), &mut size).unwrap();
+                let message = &*message;
+                if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                    let text = std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                    eprintln!("D3D12 #{}: {}", message.ID.0, String::from_utf8_lossy(text).trim_end_matches('\0'));
+                    if message.Severity == D3D12_MESSAGE_SEVERITY_WARNING { warnings += 1 } else { errors += 1 }
+                }
+            }
+            assert_eq!(queue.GetNumMessagesDiscardedByMessageCountLimit(), 0);
+        }
+        eprintln!("D3D12 hardware validation: {errors} errors, {warnings} warnings");
+        assert_eq!(errors, 0);
+    }
+
     /// The preferred hardware adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
@@ -181,6 +212,10 @@ impl Host {
                     && let Some(debug) = debug
                 {
                     debug.EnableDebugLayer();
+                    #[cfg(test)]
+                    if !warp && std::env::var_os("VICTORY_NVIDIA_HARDWARE_TESTS").is_some_and(|v| v == "1") {
+                        debug.cast::<ID3D12Debug1>().expect("GPU validation interface").SetEnableGPUBasedValidation(true);
+                    }
                 }
             }
             let mut device: Option<ID3D12Device> = None;
@@ -1193,6 +1228,29 @@ impl Host {
         iters: u32,
     ) -> Result<(Vec<Vec<u32>>, Vec<f64>), String> {
         self.dispatch_inner(root, pso, d, warmup, iters)
+    }
+
+    /// `passes` back-to-back dispatches (UAV barriers between them): the
+    /// final UAV readbacks and the mean GPU nanoseconds per dispatch (0.0
+    /// for one pass, which is not timed). (Built on [`Self::dispatch_inner`]'s
+    /// per-dispatch timestamps, summed.)
+    pub(super) fn dispatch_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        passes: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        assert!(passes > 0);
+        let (out, times_ms) = self.dispatch_inner(root, pso, d, 0, passes)?;
+        if passes == 1 {
+            return Ok((out, 0.0));
+        }
+        let total_ms: f64 = times_ms.iter().sum();
+        if total_ms <= 0.0 {
+            return Err("timestamp batch did not advance".into());
+        }
+        Ok((out, total_ms * 1e6 / f64::from(passes)))
     }
 
     fn dispatch_inner(
