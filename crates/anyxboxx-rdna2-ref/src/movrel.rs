@@ -39,7 +39,7 @@ pub fn is_scalar(name: &str) -> bool {
 }
 
 /// (offset of the source, offset of the destination) added to the register numbers.
-fn offsets(name: &str, m0: u32) -> (u32, u32) {
+pub fn offsets(name: &str, m0: u32) -> (u32, u32) {
     if name.ends_with("_2_b32") || name == "v_swaprel_b32" {
         return (m0 & FIELD_MASK, (m0 >> 16) & FIELD_MASK);
     }
@@ -66,7 +66,7 @@ fn refused(message: String) -> Error {
 /// The sum is taken in 64 bits, like the Python's unbounded integers: M0 is a full 32-bit value, so an
 /// offset such as 0xFFFF_FFFD added to register 47 is 0x1_0000_002C, outside the model, and not register
 /// 44 as a wrapping 32-bit sum would make it (nor a panic, in a build that checks overflow).
-fn check(name: &str, register: u32, offset: u32, last: u32, width: u32) -> Result<u32, Error> {
+pub fn check(name: &str, register: u32, offset: u32, last: u32, width: u32) -> Result<u32, Error> {
     let index = u64::from(register) + u64::from(offset);
     if index + u64::from(width) - 1 > u64::from(last) || (width == 2 && index % 2 == 1) {
         return Err(refused(format!(

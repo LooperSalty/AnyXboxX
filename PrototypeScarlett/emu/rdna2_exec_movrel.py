@@ -39,7 +39,7 @@ def _vgpr(name, code):
     return code - VGPR_FIRST
 
 
-def _check(name, index, last, width=1):
+def check(name, index, last, width=1):
     if index + width - 1 > last or (width == 2 and index % 2):
         raise _untranslated(f"{name} : registre indexé {index} hors du modèle")
     return index
@@ -48,12 +48,12 @@ def _check(name, index, last, width=1):
 def vector(wave, name, vdst, src0, literal):
     """Exécute une instruction de VECTOR (VOP1 ou VOP3) sur les lignes actives."""
     source_offset, destination_offset = offsets(name, wave.s[M0])
-    destination = _check(name, vdst + destination_offset, VGPRS - 1)
+    destination = check(name, vdst + destination_offset, VGPRS - 1)
     if name == "v_movreld_b32":
         for lane in wave.active():
             wave.v[destination][lane] = wave.read_lane(src0, lane, literal)
         return
-    source = _check(name, _vgpr(name, src0) + source_offset, VGPRS - 1)
+    source = check(name, _vgpr(name, src0) + source_offset, VGPRS - 1)
     swap = name in ("v_swap_b32", "v_swaprel_b32")
     for lane in wave.active():
         value = wave.v[source][lane]
@@ -74,14 +74,14 @@ def scalar(wave, name, fields, literal):
     else:
         if ssrc0 > LAST_SGPR:
             raise _untranslated(f"{name} : la source indexée doit être un SGPR")
-        index = _check(name, ssrc0 + source_offset, LAST_SGPR, width)
+        index = check(name, ssrc0 + source_offset, LAST_SGPR, width)
         value = wave.s[index] | (wave.s[index + 1] << 32 if width == 2 else 0)
     if name in ("s_movrels_b32", "s_movrels_b64"):
         wave.write_scalar(sdst, value, width)
         return
     if sdst > LAST_SGPR:
         raise _untranslated(f"{name} : la destination indexée doit être un SGPR")
-    target = _check(name, sdst + destination_offset, LAST_SGPR, width)
+    target = check(name, sdst + destination_offset, LAST_SGPR, width)
     wave.s[target] = value & MASK32
     if width == 2:
         wave.s[target + 1] = value >> 32 & MASK32

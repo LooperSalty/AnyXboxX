@@ -234,6 +234,19 @@ def test_unfused_multiply_add_nans_match_the_python_model():
     assert "\nv 4 FFC00000" in run_python(32, False, [], infinity_times_zero)
 
 
+def test_unfused_nan_priority_on_the_first_lane_of_a_fresh_interpreter():
+    # CPython's float addition specializes after a few calls. Exercise the cold path too.
+    code = """
+import sys
+sys.path.insert(0, 'PrototypeScarlett')
+from emu.rdna2_exec_ops import F, _mul_add, float_bits
+for _ in range(32):
+    assert float_bits(_mul_add(1.5, F(0x7FC00B0B), F(0x7FC00C0C))) == 0x7FC00B0B
+"""
+    import sys
+    subprocess.run([sys.executable, "-c", code], cwd=REPO, check=True)
+
+
 def test_a_literal_operand_is_the_second_word_in_both_models():
     exe = binary()
     words = program(sop1("s_mov_b32", 0, 255), 0xDEAD_BEEF, sop2("s_xor_b32", 1, 0, 255), 0x0F0F_0F0F)

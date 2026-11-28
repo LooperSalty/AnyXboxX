@@ -270,7 +270,17 @@ def _mul_add(a, b, c):
     prédicat HasMadMacF32Insts et y associe V_MAD_F32 à `any_fmad`, la multiplication-addition non
     fusionnée (VOP3Instructions.td). Leur arrondi exact n'est pas modélisé ici.
     """
-    return a * b + c
+    # Preserve the model's NaN payload regardless of CPython bytecode specialization.
+    if math.isnan(a):
+        return a
+    if math.isnan(b):
+        return b
+    product = a * b
+    if math.isnan(product):
+        return product
+    if math.isnan(c):
+        return c
+    return product + c
 
 
 _TWO_53 = 2.0 ** 53

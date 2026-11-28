@@ -37,10 +37,48 @@ enum Command {
     JourJ(jour_j::JourJArgs),
     /// Test bench: imports resolved per module; load and init are not run (replaces scarlett.py --banc).
     Banc(banc::BancArgs),
+    /// Translate a raw RDNA 2 shader to HLSL (scarlett.py --rdna2 FILE --hlsl).
+    Rdna2 {
+        shader: std::path::PathBuf,
+        #[arg(long, required_unless_present = "spirv")]
+        hlsl: bool,
+        /// The SPIR-V translator was removed in #262.
+        #[arg(long, num_args = 0..=1, value_name = "STAGE")]
+        spirv: Option<Option<String>>,
+    },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
+        Command::Rdna2 { shader, spirv, .. } => {
+            if spirv.is_some() {
+                eprintln!(
+                    "Erreur : --spirv : le traducteur SPIR-V a été retiré (#262) ; utilisez --hlsl"
+                );
+                return ExitCode::from(2);
+            }
+            let data = match std::fs::read(&shader) {
+                Ok(data) => data,
+                Err(error) => {
+                    eprintln!("Erreur : {}: {error}", shader.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            match anyxboxx_rdna2_hlsl::translate(&data) {
+                Ok(hlsl) => {
+                    // Python's print adds a newline and uses the host's text line ending.
+                    #[cfg(windows)]
+                    print!("{}\r\n", hlsl.replace('\n', "\r\n"));
+                    #[cfg(not(windows))]
+                    println!("{hlsl}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("Arrêt : {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Run(args) => launch(&args),
         Command::Rapport(args) => match rapport::rapport(&args) {
             Ok(text) => {

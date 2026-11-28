@@ -15,7 +15,7 @@ from emu import (rdna2, rdna2_exec_cmp16, rdna2_exec_div, rdna2_exec_pkf16, rdna
                  rdna2_hlsl_div, rdna2_hlsl_dot, rdna2_hlsl_ext, rdna2_hlsl_f16, rdna2_hlsl_format, rdna2_hlsl_image,
                  rdna2_hlsl_int16, rdna2_hlsl_movrel, rdna2_hlsl_pc, rdna2_hlsl_pkf16, rdna2_hlsl_sad,
                  rdna2_hlsl_scalar64, rdna2_hlsl_wide)
-from emu import rdna2_hlsl_gather
+from emu import rdna2_exec_ops, rdna2_exec_vop3, rdna2_hlsl_gather
 from emu.rdna2_exec_cmpf16 import COMPAREF16
 from emu.rdna2_exec_ops import signed
 from emu.rdna2_exec_ops import SIXTEEN_BIT_RESULTS, VECTOR_NO_OPERATION
@@ -23,9 +23,9 @@ from emu.rdna2_exec_vop3 import LITERAL_VOP2, MAD64, Fields, float_inputs, float
 from emu.rdna2_hlsl_clamp import CARRY, carry_write, integer_template, refuse_integer_clamp
 from emu import rdna2_hlsl_f16conv
 from emu.rdna2_hlsl_memory import memory_statements
-from emu.rdna2_hlsl_ops import (BRANCHES, HELPERS as ALU_HELPERS, SCALAR, VECTOR, Untranslatable, source_high,
-                                compare_condition, hexa, is_compare, scalar_statement, scalar_target,
-                                source, NULL)
+from emu.rdna2_hlsl_ops import (BRANCHES, EXACT_UNARY, HELPERS as ALU_HELPERS, SCALAR, VECTOR, Untranslatable, source_high,
+                                compare_condition, hexa, immediate, is_compare, scalar_statement, scalar_target,
+                                source, NULL, unary_output)
 from emu.rdna2_operands import FIELDS
 
 ACTIVE = "((s[126] >> lane) & 1u) != 0"
@@ -109,7 +109,32 @@ def branch_target(data, instruction):
     return instruction.offset + rdna2.DWORD + signed(simm16, 16) * rdna2.DWORD
 
 
-def _vector(name, fields, literal, active=ACTIVE):
+FOLDED_UNARY = {"v_sin_f32", "v_cos_f32", "v_exp_f32", "v_log_f32"}
+
+
+def _fold_unary(name, code, literal, fields=None):
+    bits = immediate(code, literal)
+    if bits is None:
+        raise Untranslatable(f"{name} : opérande inconnu à la traduction")
+    if fields:
+        # The VOP3 reference decodes all three sources, including unused ones.
+        try:
+            for other in fields.sources[1:]:
+                source(other, literal)
+        except Untranslatable as error:
+            raise Untranslatable(f"{name} : {error}") from error
+        if fields.abs & 1:
+            bits &= 0x7FFFFFFF
+        if fields.neg & 1:
+            bits ^= 0x80000000
+    value = rdna2_exec_ops.VECTOR[name](bits, 0, 0, 0, False)
+    return hexa(rdna2_exec_vop3.output(fields, value, True) if fields else value)
+
+
+def _vector(name, fields, literal, active=ACTIVE, m0=None):
+    if name in FOLDED_UNARY:
+        value = _fold_unary(name, fields["src0"], literal)
+        return [f"if ({active}) v[{fields['vdst']}] = {value};"]
     if name in COMPAREF16:
         target = "s[126]" if name.startswith("v_cmpx") else "s[106]"
         condition = rdna2_hlsl_cmpf16.condition(name, *rdna2_hlsl_cmpf16.vopc_sources(name, fields, literal))
@@ -118,13 +143,13 @@ def _vector(name, fields, literal, active=ACTIVE):
     values = {"a": a, "b": f"v[{fields['vsrc1']}]" if "vsrc1" in fields else "0u", "c": "s[106]",
               "d": f"v[{fields.get('vdst', 0)}]", "k": hexa(literal or 0)}
     if name == "v_readfirstlane_b32":
-        return [f"s[{fields['vdst']}] = ReadLane(lane, {a}, firstbitlow(s[126]));"]
+        return [f"s[{fields['vdst']}] = ReadLane(lane, {a}, firstbitlow(s[126] == 0u ? 1u : s[126]));"]
     if name in VECTOR_NO_OPERATION:
         return []
     if name in rdna2_exec_wide.OPERATIONS:
         return rdna2_hlsl_wide.statements(name, (fields["src0"],), fields["vdst"], active)
     if name in rdna2_hlsl_movrel.VECTOR:
-        return rdna2_hlsl_movrel.vector(name, fields["vdst"], fields["src0"], literal, active)
+        return rdna2_hlsl_movrel.vector(name, fields["vdst"], fields["src0"], literal, active, m0)
     if name in CARRY:                       # forme VOP2 : retenue lue et écrite dans VCC
         return _carry(name, a, values["b"], "s[106]", fields["vdst"], "s[106]")
     if is_compare(name):
@@ -171,7 +196,10 @@ def modified(code, index, fields, literal, is_float):
     return operand
 
 
-def _vop3(name, opcode, fields, literal, active=ACTIVE):
+def _vop3(name, opcode, fields, literal, active=ACTIVE, m0=None):
+    if name in FOLDED_UNARY:
+        value = _fold_unary(name, fields.sources[0], literal, fields)
+        return [f"if ({active}) v[{fields.vdst}] = {value};"]
     if name in rdna2_exec_pkf16.PK_FMAC:
         return rdna2_hlsl_pkf16.pk_fmac_vop3(name, fields, literal, active)
     if name in rdna2_hlsl_f16conv.TRANSLATED:
@@ -195,7 +223,7 @@ def _vop3(name, opcode, fields, literal, active=ACTIVE):
     if name == "v_readlane_b32":
         return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, {b});"]
     if name == "v_readfirstlane_b32":
-        return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, firstbitlow(s[126]));"]
+        return [f"{scalar_target(fields.vdst)} = ReadLane(lane, {a}, firstbitlow(s[126] == 0u ? 1u : s[126]));"]
     if name in VECTOR_NO_OPERATION:
         return []
     if name in MAD64:
@@ -208,7 +236,7 @@ def _vop3(name, opcode, fields, literal, active=ACTIVE):
     if name in rdna2_hlsl_movrel.VECTOR:
         if fields.abs or fields.neg or fields.clamp or fields.omod:
             raise Untranslatable(f"non traduite en HLSL : {name} avec modificateurs VOP3")
-        return rdna2_hlsl_movrel.vector(name, fields.vdst, fields.sources[0], literal, active)
+        return rdna2_hlsl_movrel.vector(name, fields.vdst, fields.sources[0], literal, active, m0)
     if name == "v_writelane_b32":
         return [f"if (lane == ({b} & 31u)) v[{fields.vdst}] = {a};"]
     if name in rdna2_hlsl_sad.TRANSLATED:
@@ -221,13 +249,15 @@ def _vop3(name, opcode, fields, literal, active=ACTIVE):
         raise Untranslatable(f"non traduite en HLSL : {name} en VOP3 sans littéral")
     template = VECTOR[name] if is_float else integer_template(name, fields.clamp, VECTOR[name])
     expression = template.format(a=a, b=b, c=c, d=f"v[{fields.vdst}]", k=hexa(literal or 0))
-    if is_float and (fields.clamp or fields.omod):
+    if name in EXACT_UNARY and (fields.clamp or fields.omod):
+        expression = unary_output(expression, fields.omod, fields.clamp)
+    elif is_float and (fields.clamp or fields.omod):
         scaled = f"asfloat({expression}) * {OUTPUT_SCALE.get(fields.omod, '1.0f')}"
         expression = f"asuint({'saturate(' + scaled + ')' if fields.clamp else scaled})"
     return [f"if ({active}) v[{fields.vdst}] = {expression};"]
 
 
-def statements(data, instruction, finish="return;", special=None, active=ACTIVE):
+def statements(data, instruction, finish="return;", special=None, active=ACTIVE, m0=None):
     """Instructions HLSL d'une instruction RDNA 2 (hors branchements).
 
     `finish` : texte de s_endpgm ; `special(famille, nom, mot 64 bits)` traduit les familles
@@ -242,7 +272,7 @@ def statements(data, instruction, finish="return;", special=None, active=ACTIVE)
     if translated is not None:
         return translated
     if family == "SOP1" and name in rdna2_hlsl_movrel.SCALAR:
-        return rdna2_hlsl_movrel.scalar(name, _fields(family, first), _literal(data, instruction, 1))
+        return rdna2_hlsl_movrel.scalar(name, _fields(family, first), _literal(data, instruction, 1), m0)
     if family in SCALAR_FAMILIES:
         if name in rdna2_hlsl_pc.NAMES:
             return rdna2_hlsl_pc.statements(name, _fields(family, first), instruction)
@@ -262,12 +292,12 @@ def statements(data, instruction, finish="return;", special=None, active=ACTIVE)
         if name in rdna2_hlsl_f16.TEMPLATES:        # avant is_ext : les formes SDWA/DPP du f16 sont refusées par rdna2_hlsl_f16
             return rdna2_hlsl_f16.vector(name, fields, lit, active)
         if name in COMPAREF16:                      # before is_ext: SDWA/DPP refused by rdna2_hlsl_cmpf16
-            return _vector(name, fields, lit, active)
+            return _vector(name, fields, lit, active, m0)
         if rdna2_hlsl_ext.is_ext(family, fields.get("src0")):
             return rdna2_hlsl_ext.statements(family, name, fields, lit or 0, active)
-        return _vector(name, fields, lit, active)
+        return _vector(name, fields, lit, active, m0)
     if family == "VOP3":
-        return _vop3(name, opcode, Fields(pair), _literal(data, instruction, 2), active)
+        return _vop3(name, opcode, Fields(pair), _literal(data, instruction, 2), active, m0)
     if family == "VOP3P":
         if name in rdna2_hlsl_int16.TRANSLATED:
             return rdna2_hlsl_int16.packed(name, pair, _literal(data, instruction, 2), active)
@@ -327,13 +357,19 @@ def body(data, sgprs=None, finish="return;", special=None, branches=BRANCHES, tr
     leaders = _leaders(data, instructions)
     lines = [f"  s[{number}] = {hexa(value)};" for number, value in sorted((sgprs or {}).items())]
     names = [rdna2.mnemonic(instruction.family, instruction.opcode) for instruction in instructions]
+    indices = rdna2_hlsl_movrel.incoming(data, instructions, names, (sgprs or {}).get(124, 0) & 0xFFFFFFFF,
+                                          branches, branch_target)
+
+    def emit(inst):
+        return translate_one(data, inst, finish, special, m0=indices.get(inst.offset))
+
     if leaders == [0] and not any(name in branches for name in names):
         for instruction in instructions:
-            lines += [f"  {line}" for line in translate_one(data, instruction, finish, special)]
+            lines += [f"  {line}" for line in emit(instruction)]
         return lines
     # Cible permise : le début d'une instruction, ou la fin du programme (qui le termine).
     end = instructions[-1].offset + instructions[-1].size * rdna2.DWORD if instructions else 0
-    targets = {instruction.offset for instruction in instructions} | {end}
+    valid_targets = {instruction.offset for instruction in instructions} | {end}
     lines += ["  uint pc = 0;", "  [loop] while (pc != END_PC) {"]
     for index, (instruction, name) in enumerate(zip(instructions, names)):
         if instruction.offset in leaders:
@@ -342,11 +378,11 @@ def body(data, sgprs=None, finish="return;", special=None, branches=BRANCHES, tr
             lines.append(f"    if (pc == {instruction.offset}u) {{")
         if name in branches:
             target = branch_target(data, instruction)
-            if target not in targets:
+            if target not in valid_targets:
                 raise Untranslatable(f"cible de branchement invalide : {target}")
             lines.append(f"      if ({branches[name]}) {{ pc = {target}u; continue; }}")
         else:
-            lines += [f"      {line}" for line in translate_one(data, instruction, finish, special)]
+            lines += [f"      {line}" for line in emit(instruction)]
         following = instructions[index + 1].offset if index + 1 < len(instructions) else None
         if following in leaders and name != "s_endpgm":
             lines.append(f"      pc = {following}u; continue;")
@@ -355,7 +391,7 @@ def body(data, sgprs=None, finish="return;", special=None, branches=BRANCHES, tr
 
 def coverage_names():
     """Mnémoniques que le recompilateur sait traduire (hors mémoire, comptée à part)."""
-    return (set(SCALAR) | set(VECTOR) | set(BRANCHES) | set(CARRY) | VECTOR_NO_OPERATION | MAD64
+    return (set(SCALAR) | FOLDED_UNARY | set(VECTOR) | set(BRANCHES) | set(CARRY) | VECTOR_NO_OPERATION | MAD64
             | set(rdna2_hlsl_scalar64.SCALAR64)
             | rdna2_hlsl_wide.TRANSLATED | rdna2_hlsl_div.TRANSLATED | rdna2_hlsl_movrel.TRANSLATED
             | rdna2_hlsl_dot.TRANSLATED | rdna2_hlsl_sad.TRANSLATED | rdna2_hlsl_pc.TRANSLATED

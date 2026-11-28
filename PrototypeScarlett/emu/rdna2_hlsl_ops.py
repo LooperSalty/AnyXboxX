@@ -8,6 +8,8 @@ référence emu/rdna2_exec*, contre lequel la traduction est vérifiée.
 """
 import re
 
+from emu.rdna2_exec import Untranslated
+
 from emu.rdna2_exec_ops import SOPK_NO_EFFECT, SOPP_NO_EFFECT, float_bits, signed
 from emu.rdna2_hlsl_helpers import HELPERS  # noqa: F401  (réexporté : rdna2_hlsl, graphics, wave64)
 
@@ -16,13 +18,25 @@ INLINE_FLOATS = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 
                  248: 0.15915494309189535}
 
 
-class Untranslatable(NotImplementedError):
+class Untranslatable(Untranslated):
     """Instruction que le recompilateur ne sait pas encore traduire en HLSL."""
 
 
 
 def hexa(value):
     return f"0x{value & 0xFFFF_FFFF:X}u"
+
+
+def immediate(code, literal=None):
+    if code == NULL:
+        return 0
+    if 128 <= code <= 192:
+        return code - 128
+    if 193 <= code <= 208:
+        return (192 - code) & 0xFFFFFFFF
+    if code in INLINE_FLOATS:
+        return float_bits(INLINE_FLOATS[code])
+    return literal if code == 255 else None
 
 
 def source(code, literal=None):
@@ -55,6 +69,14 @@ def source_high(code):
     if 193 <= code <= 208:
         return "0xFFFFFFFFu"
     raise Untranslatable(f"opérande 64 bits {code} non traduit")
+
+
+EXACT_UNARY = {"v_rsq_f32", "v_sqrt_f32", "v_rcp_f32", "v_rcp_iflag_f32"}
+
+
+def unary_output(expr, omod, clamp, sdwa=False):
+    scale = ("1.0", "2.0", "4.0", "0.5")[omod]
+    return f"UnaryOutputF32({expr}, {scale}, {str(bool(clamp)).lower()}, {str(sdwa).lower()})"
 
 
 def scalar_target(code):
@@ -177,22 +199,18 @@ VECTOR = {
     "v_subrev_f32": "F32Sub({b}, {a})",
     "v_mul_f32": "F32Mul({a}, {b})",
     "v_mul_legacy_f32": "MulLegacyF32({a}, {b})",
-    "v_min_f32": "asuint(min(asfloat({a}), asfloat({b})))",
-    "v_max_f32": "asuint(max(asfloat({a}), asfloat({b})))",
+    "v_min_f32": "F32MinMax({a}, {b}, false)",
+    "v_max_f32": "F32MinMax({a}, {b}, true)",
     "v_fmac_f32": "FmaF32({a}, {b}, {d})",                 # arrondi unique : emu/rdna2_hlsl_fma.py
-    "v_mac_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({d})))",
+    "v_mac_f32": "MadF32({a}, {b}, {d})",
     "v_fma_f32": "FmaF32({a}, {b}, {c})",
-    "v_mad_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({c})))",
+    "v_mad_f32": "MadF32({a}, {b}, {c})",
     "v_fma_legacy_f32": "FmaLegacyF32({a}, {b}, {c})",
     "v_fmamk_f32": "FmaF32({a}, {k}, {b})",
     "v_fmaak_f32": "FmaF32({a}, {b}, {k})",
-    "v_rcp_f32": "asuint(rcp(asfloat({a})))",
-    "v_rsq_f32": "asuint(rsqrt(asfloat({a})))",
-    "v_sqrt_f32": "asuint(sqrt(asfloat({a})))",
-    "v_exp_f32": "asuint(exp2(asfloat({a})))",
-    "v_log_f32": "asuint(log2(asfloat({a})))",
-    "v_sin_f32": "asuint(sin(asfloat({a}) * 6.283185307179586f))",
-    "v_cos_f32": "asuint(cos(asfloat({a}) * 6.283185307179586f))",
+    "v_rcp_f32": "ReciprocalF32({a})",
+    "v_rsq_f32": "RsqrtF32({a})",
+    "v_sqrt_f32": "SqrtF32({a})",
     "v_floor_f32": "asuint(floor(asfloat({a})))",
     "v_ceil_f32": "asuint(ceil(asfloat({a})))",
     "v_trunc_f32": "asuint(trunc(asfloat({a})))",
@@ -269,13 +287,13 @@ VECTOR = {
     "v_cvt_flr_i32_f32": "FloorToI32({a}, false)",
     "v_cvt_rpi_i32_f32": "FloorToI32({a}, true)",
     "v_cvt_off_f32_i4": "asuint((float)((asint({a}) << 28) >> 28) * 0.0625f)",
-    "v_rcp_iflag_f32": "asuint(rcp(asfloat({a})))",
+    "v_rcp_iflag_f32": "ReciprocalF32({a})",
     "v_ffbh_i32": "LeadingSignsI32({a})",
     "v_frexp_exp_i32_f32": "FrexpExpF32({a})",
     "v_frexp_mant_f32": "FrexpMantF32({a})",
     "v_fmac_legacy_f32": "FmaLegacyF32({a}, {b}, {d})",
-    "v_madmk_f32": "asuint(mad(asfloat({a}), asfloat({k}), asfloat({b})))",
-    "v_madak_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({k})))",
+    "v_madmk_f32": "MadF32({a}, {k}, {b})",
+    "v_madak_f32": "MadF32({a}, {b}, {k})",
     "v_mul_lo_i32": "({a} * {b})",
     "v_sad_u8": "(SadU8({a}, {b}) + {c})",
     "v_sad_hi_u8": "((SadU8({a}, {b}) << 16) + {c})",

@@ -1,0 +1,195 @@
+//! VOPC integer comparisons for wave32.
+use crate::scalar::source;
+
+pub fn statement(name: &str, word: u32, literal: Option<u32>) -> Result<String, String> {
+    let code = word & 0x1ff;
+    if matches!(code, 0xe9 | 0xea | 0xf9 | 0xfa) {
+        return Err(format!("untranslated instruction: {name} with SDWA or DPP"));
+    }
+    let a = if code >= 256 {
+        format!("v[{}]", code - 256)
+    } else {
+        source(code, literal).map_err(|e| format!("{name}: {e}"))?
+    };
+    let b = format!("v[{}]", (word >> 9) & 0xff);
+    let target = if name.starts_with("v_cmpx_") {
+        "s[126]"
+    } else {
+        "s[106]"
+    };
+    let condition = condition(name, code, &a, &b)?;
+    Ok(format!(
+        "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {target} = Ballot(lane, t); }}"
+    ))
+}
+
+pub fn condition(name: &str, code: u32, a: &str, b: &str) -> Result<String, String> {
+    let (prefix, suffix) = name
+        .rsplit_once('_')
+        .ok_or_else(|| format!("untranslated instruction: {name}"))?;
+    let op = prefix
+        .strip_prefix("v_cmpx_")
+        .or_else(|| prefix.strip_prefix("v_cmp_"))
+        .ok_or_else(|| format!("untranslated instruction: {name}"))?;
+    if suffix == "f16" {
+        let ah = half_operand(code, a);
+        let bh = format!("({b} & 0xFFFFu)");
+        return half_condition(name, op, &ah, &bh);
+    }
+    if suffix == "f32" {
+        let condition =
+            float_condition(op, a, b).ok_or_else(|| format!("untranslated instruction: {name}"))?;
+        return Ok(condition);
+    }
+    if !matches!(suffix, "u32" | "i32" | "u16" | "i16") {
+        return Err(format!("untranslated instruction: {name}"));
+    }
+    let condition = match op {
+        "f" => "false".into(),
+        "t" | "tru" => "true".into(),
+        _ => {
+            let symbol = match op {
+                "lt" => "<",
+                "eq" => "==",
+                "le" => "<=",
+                "gt" => ">",
+                "lg" | "ne" | "neq" => "!=",
+                "ge" => ">=",
+                _ => return Err(format!("untranslated instruction: {name}")),
+            };
+            match suffix {
+                "u16" => format!("(({a}) & 0xFFFFu) {symbol} (({b}) & 0xFFFFu)"),
+                "i16" => {
+                    format!("(asint(({a}) << 16u) >> 16) {symbol} (asint(({b}) << 16u) >> 16)")
+                }
+                "i32" => format!("asint({a}) {symbol} asint({b})"),
+                _ => format!("({a}) {symbol} ({b})"),
+            }
+        }
+    };
+    Ok(condition)
+}
+
+fn half_condition(name: &str, op: &str, a: &str, b: &str) -> Result<String, String> {
+    if op == "class" {
+        return Ok(format!("((({b}) >> ClassF16({a})) & 1u) != 0u"));
+    }
+    float_condition(op, &format!("F16ToF32({a})"), &format!("F16ToF32({b})"))
+        .ok_or_else(|| format!("untranslated instruction: {name}"))
+}
+
+pub fn vop3(name: &str, word: u64, literal: Option<u32>, lanes: usize) -> Result<String, String> {
+    let f = anyxboxx_rdna2_ref::vop3::Fields::new(word);
+    let half = name.ends_with("_f16");
+    if (name.ends_with("16") && word >> 11 & 15 != 0)
+        || (half
+            && (f.clamp || f.omod != 0 || (name.contains("_class_") && (f.abs | f.neg) & 2 != 0)))
+    {
+        return Err(format!("{name}: invalid compare source or output modifier"));
+    }
+    let read = |i: usize| -> Result<String, String> {
+        let code = f.sources[i];
+        let mut expr = if code >= 256 {
+            format!("v[{}]", code - 256)
+        } else {
+            source(code, literal).map_err(|e| format!("{name}: {e}"))?
+        };
+        if half {
+            expr = half_operand(code, &expr);
+        }
+        if half || name.ends_with("_f32") {
+            if f.abs & (1 << i) != 0 {
+                expr = format!(
+                    "({expr} & {})",
+                    if half { "0x7FFFu" } else { "0x7FFFFFFFu" }
+                );
+            }
+            if f.neg & (1 << i) != 0 {
+                expr = format!(
+                    "({expr} ^ {})",
+                    if half { "0x8000u" } else { "0x80000000u" }
+                );
+            }
+        }
+        Ok(expr)
+    };
+    let (a, b) = (read(0)?, read(1)?);
+    let condition = if half {
+        let op = name
+            .trim_start_matches("v_cmpx_")
+            .trim_start_matches("v_cmp_")
+            .trim_end_matches("_f16");
+        half_condition(name, op, &a, &b)?
+    } else {
+        condition(name, f.sources[0], &a, &b)?
+    };
+    let d = if name.starts_with("v_cmpx_") {
+        126
+    } else {
+        f.vdst
+    };
+    let target = |code| {
+        if code == 125 || d == 125 {
+            "s_null".into()
+        } else {
+            format!("s[{code}]")
+        }
+    };
+    if d >= 128 || (lanes == 64 && d == 127) {
+        return Err(format!("{name}: invalid destination mask"));
+    }
+    let lo = target(d);
+    Ok(if lanes == 64 {
+        format!(
+            "{{ bool t = (LANE_ON) && ({condition}); uint2 m = Ballot64(lane, t); {lo} = m.x; {} = m.y; }}",
+            target(d + 1)
+        )
+    } else {
+        format!(
+            "{{ bool t = (((s[126] >> lane) & 1u) != 0) && ({condition}); {lo} = Ballot(lane, t); }}"
+        )
+    })
+}
+
+fn float_condition(op: &str, a: &str, b: &str) -> Option<String> {
+    let nan = format!("IsNanF32({a}) || IsNanF32({b})");
+    let ordered = format!("!IsNanF32({a}) && !IsNanF32({b})");
+    let x = format!("asfloat({a})");
+    let y = format!("asfloat({b})");
+    Some(match op {
+        "f" => "false".into(),
+        "t" | "tru" => "true".into(),
+        "o" => format!("({ordered})"),
+        "u" => format!("({nan})"),
+        "nge" => format!("({nan} || !({x} >= {y}))"),
+        "nlg" => format!("({nan} || !({x} < {y} || {x} > {y}))"),
+        "ngt" => format!("({nan} || !({x} > {y}))"),
+        "nle" => format!("({nan} || !({x} <= {y}))"),
+        "nlt" => format!("({nan} || !({x} < {y}))"),
+        "class" => format!("((({b}) >> ClassF32({a})) & 1u) != 0u"),
+        "lg" => format!("({ordered} && ({x} < {y} || {x} > {y}))"),
+        "lt" | "le" | "gt" | "ge" => {
+            let symbol = match op {
+                "lt" => "<",
+                "le" => "<=",
+                "gt" => ">",
+                _ => ">=",
+            };
+            format!("({ordered} && {x} {symbol} {y})")
+        }
+        "eq" => format!("{x} == {y}"),
+        "ne" | "neq" => format!("{x} != {y}"),
+        _ => return None,
+    })
+}
+
+pub(crate) fn half_operand(code: u32, expression: &str) -> String {
+    const INLINE: [u32; 9] = [
+        0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x4400, 0xc400, 0x3118,
+    ];
+    if (240..=248).contains(&code) {
+        format!("0x{:X}u", INLINE[(code - 240) as usize])
+    } else {
+        format!("({expression} & 0xFFFFu)")
+    }
+}

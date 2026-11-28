@@ -206,7 +206,7 @@ def _inputs(wave, fields, lane, literal, modifiers):
     return values
 
 
-def _output(fields, value, is_float):
+def output(fields, value, is_float):
     if not is_float or not (fields.clamp or fields.omod):
         return value & MASK32
     number = bits_float(value) * OUTPUT_SCALE.get(fields.omod, 1.0)
@@ -277,7 +277,7 @@ def execute(wave, name, opcode, word, literal):
             result = VECTOR3[name](a, b, c)
         if fields.clamp and name in SATURATED_U32:
             result = min(max(result, 0), MASK32)
-        destination[lane] = _output(fields, result, is_float)
+        destination[lane] = output(fields, result, is_float)
     return None
 
 

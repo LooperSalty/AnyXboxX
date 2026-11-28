@@ -26,7 +26,12 @@ def _load_lines(target, address, kind, buffer="g_memory.Load"):
     """Chargement de WIDTHS[kind] octets à `address` dans les VGPR à partir de `target`."""
     if kind in BYTE_LOADS:
         mask, sign_bits = BYTE_LOADS[kind]
-        value = f"(({buffer}(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & {mask})"
+        if kind in ("ushort", "sshort", "u16", "i16"):
+            # A halfword at byte offset 3 spans two aligned dwords.
+            value = (f"((({buffer}(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) | "
+                     f"(((({address}) & 3u) == 3u ? {buffer}((({address}) & ~3u) + 4u) : 0u) << 8u)) & {mask})")
+        else:
+            value = f"(({buffer}(({address}) & ~3u) >> ((({address}) & 3u) * 8u)) & {mask})"
         if sign_bits:
             value = f"asuint((asint({value}) << {32 - sign_bits}) >> {32 - sign_bits})"
         return [f"v[{target}] = {value};"]
@@ -41,10 +46,13 @@ def _scalar(name, word):
     extra = "" if soffset == NULL else f" + s[{soffset}]"
     count = WIDTHS[found.group(2)] // 4
     if found.group(1):              # s_buffer_load : base du V#, borne en s[base + 2]
-        inside = f"(o + {4 * count}u <= s[{sbase + 2}])"
-        loads = " ".join(f"s[{sdata + i}] = {inside} ? g_memory.Load(s[{sbase}] + o + {4 * i}u) : 0u;"
-                         for i in range(count))
-        return [f"{{ uint o = {offset}{extra}; {loads} }}"]
+        immediate = signed((word >> 32) & 0x1FFFFF, 21)
+        register = "0u" if soffset == NULL else f"s[{soffset}]"
+        valid = f"{register} >= {-immediate}u" if immediate < 0 else f"{register} <= 0x{0xFFFFFFFF - immediate:X}u"
+        bound = f"s[{sbase + 2}]"
+        loads = " ".join(f"s[{sdata + i}] = ok ? g_memory.Load(a + {4 * i}u) : 0u;" for i in range(count))
+        return [f"{{ uint o = {offset}{extra}; uint a = s[{sbase}] + o; "
+                f"bool ok = {valid} && o <= {bound} && {4 * count}u <= {bound} - o; {loads} }}"]
     loads = " ".join(f"s[{sdata + i}] = g_memory.Load(a + {4 * i}u);" for i in range(count))
     return [f"{{ uint a = s[{sbase}] + {offset}{extra}; {loads} }}"]
 
@@ -67,17 +75,20 @@ def _flat(family, name, word, active):
 
 def _buffer(name, word, active):
     offset, offen, idxen = word & 0xFFF, (word >> 12) & 1, (word >> 13) & 1
-    if idxen:
-        raise Untranslatable(f"non traduite en HLSL : {name} avec idxen")
     vaddr, vdata, resource = (word >> 32) & 0xFF, (word >> 40) & 0xFF, ((word >> 48) & 0x1F) * 4
+    if idxen and offen and vaddr == 255:
+        raise Untranslatable(f"{name} : la paire d’adresse dépasse v255")
     soffset = (word >> 56) & 0xFF
-    extra = "" if soffset in (NULL, 128) else f" + {source(soffset)}"
-    byte_offset = f"({offset}u{f' + v[{vaddr}]' if offen else ''})"
+    if 193 <= soffset <= 208:
+        raise Untranslatable(f"{name} : SOFFSET immédiat négatif hors du modèle 32 bits")
+    index = f"v[{vaddr}]" if idxen else "0u"
+    vector_offset = f"v[{vaddr + idxen}]" if offen else "0u"
     found = VECTOR_PATTERN.match(name)
     size = WIDTHS[found.group(3)] if found else 4
-    inside = f"({byte_offset} + {size}u <= s[{resource + 2}])"
-    address = f"(s[{resource}]{extra} + {byte_offset})"
-    return _vector_access(name, address, vdata, vdata, active, glc=(word >> 14) & 1, inside=inside)
+    setup = (f"uint addr; bool inside = BufferAddress(s[{resource}], s[{resource + 1}], s[{resource + 2}], "
+             f"{source(soffset)}, {index}, {vector_offset}, {offset}u, {size}u, addr);")
+    access, *barrier = _vector_access(name, "addr", vdata, vdata, active, glc=(word >> 14) & 1, inside="inside")
+    return [f"{{ {setup} {access} }}", *barrier]
 
 
 def _vector_access(name, address, data, vdst, active, glc, inside):
@@ -96,9 +107,10 @@ def _vector_access(name, address, data, vdst, active, glc, inside):
             raise Untranslatable(f"non traduite en HLSL : {name} (écriture partielle d'un mot)")
         stores = " ".join(f"g_memory.Store({address} + {4 * i}u, v[{data + i}]);" for i in range(WIDTHS[kind] // 4))
         return [f"if (({active}) && {inside}) {{ {stores} }}", STORE_BARRIER]
-    loads = " ".join(_load_lines(vdst, address, kind))
+    prefix = f"uint a = {address}; " if WIDTHS[kind] > 4 else ""
+    loads = " ".join(_load_lines(vdst, "a" if prefix else address, kind))
     zeros = " ".join(f"v[{vdst + i}] = 0u;" for i in range(max(1, WIDTHS[kind] // 4)))
-    return [f"if ({active}) {{ if ({inside}) {{ {loads} }} else {{ {zeros} }} }}"]
+    return [f"if ({active}) {{ if ({inside}) {{ {prefix}{loads} }} else {{ {zeros} }} }}"]
 
 
 def _lds(name, word, active):
