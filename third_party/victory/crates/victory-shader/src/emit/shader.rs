@@ -1041,7 +1041,11 @@ impl Shader {
 
         self.m.single_latches();
         let bitcode = self.m.write();
-        super::bitcode::census::note(&self.m, &bitcode);
+        super::bitcode::census::note(
+            &self.m,
+            &bitcode,
+            super::bitcode::census::Shape { threads: self.threads, wave_size: self.wave_size },
+        );
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
