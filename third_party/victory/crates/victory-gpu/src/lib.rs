@@ -104,6 +104,7 @@ mod popwatch;
 mod primitive;
 pub mod query;
 pub mod queue;
+pub mod ram_trim;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]
