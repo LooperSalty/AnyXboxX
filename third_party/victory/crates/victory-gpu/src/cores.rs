@@ -295,13 +295,24 @@ fn ask(what: &str, from: u32) {
 /// of the title's own normal-priority threads (simulation, audio, streaming),
 /// which on a smaller or busier processor may cost more than it gives: off
 /// until another processor measures it.
+const HELPER_PRIORITY: &str = "VICTORY_HELPER_PRIORITY";
+
+fn helper_switch(read: impl FnOnce(&str) -> Option<std::ffi::OsString>) -> bool {
+    crate::switch::value_is_on(read(HELPER_PRIORITY).as_deref())
+}
+
 fn helpers_raised() -> bool {
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_HELPER_PRIORITY") {
+    if let Some(on) = crate::ab::pick(HELPER_PRIORITY) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_HELPER_PRIORITY"))
+    *ON.get_or_init(|| helper_switch(|name| std::env::var_os(name)))
+}
+
+fn helper_priority(on: bool) -> i32 {
+    use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
+    if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL }
 }
 
 /// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
@@ -318,19 +329,21 @@ impl Priority {
     }
 
     pub(crate) fn keep(&mut self) {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
-        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
         let on = helpers_raised();
+        if on {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!("submitting helper priority enabled (VICTORY_HELPER_PRIORITY)"));
+        }
         if self.requested == Some(on) {
             return;
         }
-        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        let priority = helper_priority(on);
         // SAFETY: our own thread.
         if unsafe { SetThreadPriority(GetCurrentThread(), priority) } == 0 {
             let error = std::io::Error::last_os_error();
-            static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
                 tracing::warn!(%error, priority, "could not set the submitting helper's priority");
             });
         }
@@ -341,6 +354,18 @@ impl Priority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_switch_selects_priority() {
+        use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
+        for (value, expected) in [(None, THREAD_PRIORITY_NORMAL), (Some("0"), THREAD_PRIORITY_NORMAL), (Some("1"), THREAD_PRIORITY_ABOVE_NORMAL)] {
+            let on = helper_switch(|name| {
+                assert_eq!(name, "VICTORY_HELPER_PRIORITY");
+                value.map(Into::into)
+            });
+            assert_eq!(helper_priority(on), expected);
+        }
+    }
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
