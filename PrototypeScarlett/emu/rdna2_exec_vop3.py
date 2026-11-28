@@ -322,6 +322,9 @@ def _mad64(wave, name, fields, literal):
     if is_signed and fields.sdst != NULL_SGPR:
         from emu.rdna2_exec import Untranslated
         raise Untranslated("v_mad_i64_i32 : retenue signée dans SDST non vérifiée")
+    if fields.vdst + 1 >= len(wave.v):
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"paire VGPR hors bornes (v{fields.vdst})")
     carries = 0
     for lane in wave.active():
         a, b = (wave.read_lane(code, lane, literal) for code in fields.sources[:2])

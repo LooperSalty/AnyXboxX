@@ -82,6 +82,13 @@ def execute(wave, name, fields, literal):
         raise Untranslated(message)
     src0, src1, src2 = fields.sources
     words = 4 if name == "v_mqsad_u32_u8" else 2
+    if name != "v_msad_u8":
+        if fields.vdst + words > len(wave.v):
+            from emu.rdna2_exec import Untranslated
+            raise Untranslated(f"groupe VGPR hors bornes (v{fields.vdst}, {words} registres)")
+        if src2 >= VGPR_FIRST and (src2 - VGPR_FIRST) + words > len(wave.v):
+            from emu.rdna2_exec import Untranslated
+            raise Untranslated(f"groupe VGPR source hors bornes (v{src2 - VGPR_FIRST}, {words} registres)")
     for lane in wave.active():
         b = wave.read_lane(src1, lane, literal)
         if name == "v_msad_u8":

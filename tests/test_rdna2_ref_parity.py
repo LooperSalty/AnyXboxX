@@ -1498,8 +1498,7 @@ def test_a_register_group_past_v255_is_an_operand_error_in_rust():
                          program(*fill_group_sources(), *vop3(name, 8, (V0 + 2, V0 + 1, V0 + fits)))))
     for past, fits in programs:
         assert run_rust(exe, 32, False, [], past) == "error operand\n"
-        with pytest.raises(IndexError):
-            run_python(32, False, [], past)
+        assert run_python(32, False, [], past) == "error untranslated\n"
         state = run_python(32, False, [], fits)
         assert state.startswith("steps")
         assert_same(exe, 32, False, [], fits)

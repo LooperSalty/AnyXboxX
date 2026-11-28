@@ -202,6 +202,8 @@ def _output(value, kind, clamp, omod):
 def execute(wave, name, codes, vdst, literal, abs_bits=0, neg_bits=0, clamp=0, omod=0):
     """Exécute une instruction de OPERATIONS sur les lignes actives."""
     kinds, result_kind, function = OPERATIONS[name]
+    if result_kind in WIDE_SOURCES and vdst + 1 >= len(wave.v):
+        raise _untranslated(f"paire VGPR hors bornes (v{vdst})")
     for lane in wave.active():
         values = []
         for index, kind in enumerate(kinds):

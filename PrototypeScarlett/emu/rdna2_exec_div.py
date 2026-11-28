@@ -206,6 +206,8 @@ def execute(wave, name, fields, literal):
     fmt = OPERATIONS[name]
     if fields.clamp or fields.omod:
         raise _untranslated(f"{name} avec clamp/omod")
+    if fmt.width == 64 and fields.vdst + 1 >= len(wave.v):
+        raise _untranslated(f"paire VGPR hors bornes (v{fields.vdst})")
     is_scale = name.startswith("v_div_scale")
     abs_bits = 0 if is_scale else fields.abs                  # VOP3b : le champ abs porte SDST
     vcc_mask = 0
