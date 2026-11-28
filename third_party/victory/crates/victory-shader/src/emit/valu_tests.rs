@@ -3128,3 +3128,119 @@ fn clamped_u32_add3_saturates_on_either_carry() {
         assert_eq!(got, expected, "{backend}: v_add3_u32 on {a:#x}, {b:#x}, {c:#x}");
     });
 }
+
+/// RDNA 2's `v_max_f32`/`v_min_f32`: a NaN gives the other operand, -0 orders below +0.
+fn rdna_max_min(max: bool, a: u32, b: u32) -> u32 {
+    let (fa, fb) = (f32::from_bits(a), f32::from_bits(b));
+    if fa.is_nan() {
+        return b;
+    }
+    if fb.is_nan() {
+        return a;
+    }
+    if fa == 0.0 && fb == 0.0 {
+        return if max { a & b } else { a | b };
+    }
+    if (fa > fb) == max { a } else { b }
+}
+
+/// RDNA 2's `v_med3_f32` (see `v_med3_f32_matches_rdna2_with_nan`): with a NaN, the least of
+/// the others; else the median, -0 below +0.
+fn rdna_med3(a: u32, b: u32, c: u32) -> u32 {
+    let nan = |x: u32| f32::from_bits(x).is_nan();
+    if nan(a) || nan(b) || nan(c) {
+        return rdna_max_min(false, rdna_max_min(false, a, b), c);
+    }
+    let (lo, hi) = (rdna_max_min(false, a, b), rdna_max_min(true, a, b));
+    rdna_max_min(true, lo, rdna_max_min(false, hi, c))
+}
+
+/// Values a maximum, minimum or median with a constant may meet: both zeros, both
+/// infinities, NaNs of either sign, the constants themselves and around them (no
+/// denormals: hosts flush those).
+const MIN_MAX_INPUTS: [u32; 16] = [
+    0x0000_0000, 0x8000_0000, 0x3F80_0000, 0xBF80_0000, 0x3F00_0000, 0xBF00_0000, 0x4000_0000,
+    0xC000_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0xFFC0_0000, 0x0DA2_4260, 0xF149_F2CA,
+    0x4040_0000, 0x3F7F_FFFF,
+];
+
+/// Max, min and median with a constant operand (an inline constant, or -0 through an SGPR
+/// set from a literal) in every operand place, against RDNA 2's rules, on the hardware
+/// adapter and WARP. The constant forms of the lowering must keep -0 below +0 and NaN's
+/// rules.
+#[test]
+fn max_min_and_med3_with_a_constant_match_rdna2() {
+    const NZ: u16 = 6; // s6 = -0.0
+    let k = |code: u16| -> u32 {
+        match code {
+            128 => 0,
+            240 => 0x3F00_0000,
+            242 => 0x3F80_0000,
+            243 => 0xBF80_0000,
+            245 => 0xC000_0000,
+            NZ => 0x8000_0000,
+            _ => unreachable!(),
+        }
+    };
+    let x = vgpr(1);
+    #[rustfmt::skip]
+    let forms: &[(&str, u16, [u16; 3])] = &[
+        ("v_max_f32", 0x110, [x, 240, 0]), ("v_max_f32", 0x110, [245, x, 0]),
+        ("v_max_f32", 0x110, [x, 128, 0]), ("v_max_f32", 0x110, [128, x, 0]),
+        ("v_max_f32", 0x110, [x, NZ, 0]), ("v_min_f32", 0x10F, [x, 242, 0]),
+        ("v_min_f32", 0x10F, [243, x, 0]), ("v_min_f32", 0x10F, [x, NZ, 0]),
+        ("v_min_f32", 0x10F, [NZ, x, 0]), ("v_min_f32", 0x10F, [x, 128, 0]),
+        ("v_max3_f32", 0x154, [x, 128, 243]), ("v_min3_f32", 0x151, [x, 242, NZ]),
+        ("v_med3_f32", 0x157, [x, 128, 242]), ("v_med3_f32", 0x157, [128, x, 242]),
+        ("v_med3_f32", 0x157, [242, 128, x]), ("v_med3_f32", 0x157, [x, 242, 128]),
+        ("v_med3_f32", 0x157, [x, 243, 242]), ("v_med3_f32", 0x157, [x, NZ, 242]),
+        ("v_med3_f32", 0x157, [x, 243, NZ]), ("v_med3_f32", 0x157, [x, 245, 240]),
+    ];
+    let cases: Vec<[u32; 4]> = MIN_MAX_INPUTS.iter().map(|&v| [v, 0, 0, 0]).collect();
+    for &(name, op, src) in forms {
+        let mut body = vec![s_mov_b32(6, 0xFF), 0x8000_0000];
+        body.extend(vop3(op, 0, src[0], src[1], src[2]));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let val = |s: u16| if s == x { inp[0] } else { k(s) };
+            let want = match name {
+                "v_max_f32" => rdna_max_min(true, val(src[0]), val(src[1])),
+                "v_min_f32" => rdna_max_min(false, val(src[0]), val(src[1])),
+                "v_max3_f32" => rdna_max_min(true, rdna_max_min(true, val(src[0]), val(src[1])), val(src[2])),
+                "v_min3_f32" => rdna_max_min(false, rdna_max_min(false, val(src[0]), val(src[1])), val(src[2])),
+                _ => rdna_med3(val(src[0]), val(src[1]), val(src[2])),
+            };
+            let same = got == want || (f32::from_bits(got).is_nan() && f32::from_bits(want).is_nan());
+            assert!(same, "{backend}: {name} {src:?} of {:#010x} = {got:#010x}, want {want:#010x}", inp[0]);
+        });
+    }
+}
+
+/// A maximum or minimum with a constant that is not a zero cannot meet two zeros, so it is
+/// the host's FMax or FMin alone; with +0 (maximum) or -0 (minimum), one bitwise and or or
+/// sets the zero's sign. A median between two ordered constants is a minimum of a maximum.
+/// None of them writes a select.
+#[test]
+fn max_min_and_med3_with_constants_write_no_select() {
+    const NZ: u16 = 6;
+    let x = vgpr(1);
+    let count = |body: &[u32], kind: &str| {
+        let mut words = vec![s_mov_b32(6, 0xFF), 0x8000_0000];
+        words.extend_from_slice(body);
+        let shader = super::census::with(|| build_valu_cs(&words));
+        let c = super::census::take(&shader.dxil).expect("counted");
+        c.counts[super::census::KINDS.iter().position(|k| *k == kind).expect("kind")]
+    };
+    let base = count(&[vop1(0x001, 0, x)], "select");
+    for (op, src) in [
+        (0x110, [x, 240, 0]),
+        (0x110, [x, 128, 0]),
+        (0x10F, [NZ, x, 0]),
+        (0x10F, [x, 245, 0]),
+        (0x157, [x, 128, 242]),
+        (0x157, [243, x, 242]),
+    ] {
+        let selects = count(&vop3(op, 0, src[0], src[1], src[2]), "select") - base;
+        assert_eq!(selects, 0, "op {op:#x} {src:?} writes {selects} selects");
+    }
+}

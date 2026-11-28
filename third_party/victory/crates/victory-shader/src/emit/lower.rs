@@ -4601,6 +4601,25 @@ impl<'a> Lower<'a> {
         if host_rdna() & super::rdna::MAX_MIN != 0 {
             return r;
         }
+        // A constant operand: not a zero (a NaN included), two zeros never meet; +0 for a
+        // maximum or -0 for a minimum, the result has that zero's sign whenever it is a
+        // zero (and never the other one's), so one bitwise operation sets it.
+        let k = [a, b].map(|x| self.s.m.float_k(x).map(f32::to_bits));
+        if k.iter().flatten().any(|&x| x & 0x7FFF_FFFF != 0) {
+            return r;
+        }
+        let own = if max { 0 } else { 0x8000_0000 };
+        if k.contains(&Some(own)) {
+            let bits = self.as_int(r);
+            let x = if max {
+                let m = self.s.m.i32(0x7FFF_FFFF);
+                self.s.m.bin(c, Bin::And, bits, m)
+            } else {
+                let m = self.s.m.i32(0x8000_0000);
+                self.s.m.bin(c, Bin::Or, bits, m)
+            };
+            return self.as_float(x);
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -4735,23 +4754,28 @@ impl<'a> Lower<'a> {
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         // Between two constants in order: the lower one for a NaN either way.
-        if host_rdna() & super::rdna::MED3 != 0 {
-            let k = [a, b, third].map(|x| self.s.m.float_k(x));
-            let ordered = match k {
-                [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
-                [Some(x), None, Some(y)] => Some((b, a, third, x, y)),
-                [Some(x), Some(y), None] => Some((third, a, b, x, y)),
-                _ => None,
-            };
-            if let Some((v, p, q, x, y)) = ordered
-                && !x.is_nan()
-                && !y.is_nan()
-                && x != y
-            {
-                let (low, high) = if x < y { (p, q) } else { (q, p) };
+        let k = [a, b, third].map(|x| self.s.m.float_k(x));
+        let ordered = match k {
+            [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
+            [Some(x), None, Some(y)] => Some((b, a, third, x, y)),
+            [Some(x), Some(y), None] => Some((third, a, b, x, y)),
+            _ => None,
+        };
+        if let Some((v, p, q, x, y)) = ordered
+            && !x.is_nan()
+            && !y.is_nan()
+            && x != y
+        {
+            let (low, high) = if x < y { (p, q) } else { (q, p) };
+            if host_rdna() & super::rdna::MED3 != 0 {
                 let t = self.binary(35, v, low);
                 return self.binary(36, t, high);
             }
+            // Elsewhere the hardware's maximum and minimum, which with a constant cost
+            // the host's one operation (and a bitwise one for a zero): a NaN gives the
+            // lower constant, and -0 stays below +0.
+            let t = self.max_min(true, v, low);
+            return self.max_min(false, t, high);
         }
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
@@ -5161,7 +5185,8 @@ impl<'a> Lower<'a> {
     fn group_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let barrier = self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.m.tag(barrier, Tag::Meeting);
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -9340,6 +9365,7 @@ impl<'a> Lower<'a> {
                         let kk = self.s.m.i32(u32::from(k));
                         let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                         r = self.s.m.select(c, is, x, r);
+                        self.s.m.tag(r, Tag::Indexed);
                     }
                     r
                 } else {
@@ -9359,6 +9385,7 @@ impl<'a> Lower<'a> {
                     let kk = self.s.m.i32(u32::from(k));
                     let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                     let x = self.s.m.select(c, is, value, old);
+                    self.s.m.tag(x, Tag::Indexed);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
                 }
                 Ok(())
