@@ -50,6 +50,56 @@ def test_oldest_entries_are_pruned(tmp_path):
     assert fresh.get(keys[0]) is None and fresh.get(keys[-1]) == DXIL
 
 
+def test_put_retries_transient_windows_permission_error_and_cleans_tmp(tmp_path, monkeypatch):
+    cache = shader_cache.ShaderCache(tmp_path)
+    key = shader_cache.cache_key("retry", "cs_6_0", None)
+    real_replace = shader_cache.os.replace
+    attempts = 0
+
+    def flaky_replace(src, dst):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(shader_cache.os, "replace", flaky_replace)
+    monkeypatch.setattr(shader_cache.time, "sleep", lambda *_: None)
+    cache.put(key, DXIL)
+    assert attempts == 3
+    assert cache.get(key) == DXIL
+    assert list(tmp_path.glob("*/*.tmp")) == []
+
+
+def test_put_accepts_identical_peer_entry_on_persistent_lock_else_raises(tmp_path, monkeypatch):
+    cache = shader_cache.ShaderCache(tmp_path)
+    key = shader_cache.cache_key("peer", "cs_6_0", None)
+    cache.put(key, DXIL)
+
+    def always_locked(_src, _dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(shader_cache.os, "replace", always_locked)
+    monkeypatch.setattr(shader_cache.time, "sleep", lambda *_: None)
+    # Identical content already written by a racing worker succeeds cleanly.
+    cache.put(key, DXIL)
+    assert list(tmp_path.glob("*/*.tmp")) == []
+
+    # Existing destination with different bytes raises PermissionError, preserves
+    # the existing peer bytes, and leaves no orphan .tmp.
+    other_dxil = b"DXBC" + bytes([1] * 60)
+    with pytest.raises(PermissionError):
+        cache.put(key, other_dxil)
+    assert next(tmp_path.glob("*/*.dxil")).read_bytes() == DXIL
+    assert list(tmp_path.glob("*/*.tmp")) == []
+
+    # Missing destination still raises PermissionError and leaves no orphan .tmp.
+    missing_key = shader_cache.cache_key("missing", "cs_6_0", None)
+    with pytest.raises(PermissionError):
+        cache.put(missing_key, DXIL)
+    assert list(tmp_path.glob("*/*.tmp")) == []
+
+
 @pytest.mark.skipif(rdna2_gpu.find_dxc() is None, reason="dxc absent")
 def test_second_compilation_comes_from_the_cache(tmp_path, monkeypatch):
     cache = shader_cache.ShaderCache(tmp_path)

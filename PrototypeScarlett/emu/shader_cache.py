@@ -9,6 +9,8 @@ une entrée qui n'est pas un conteneur DXIL est écartée ; au-delà de ANYXBOXX
 """
 import hashlib
 import os
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,7 +75,10 @@ class ShaderCache:
             path.unlink(missing_ok=True)
             self.stats.misses += 1
             return None
-        os.utime(path)                      # récemment utilisé : gardé en priorité
+        try:
+            os.utime(path)                  # récemment utilisé : gardé en priorité
+        except OSError:
+            pass
         self.stats.hits += 1
         self.memory[key] = data
         return data
@@ -83,28 +88,65 @@ class ShaderCache:
             raise ValueError("ce n'est pas un conteneur DXIL")
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        temporary = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         temporary.write_bytes(dxil)
-        replaced = path.stat().st_size if path.exists() else 0
-        os.replace(temporary, path)
+        try:
+            replaced = path.stat().st_size
+        except OSError:
+            replaced = 0
+        self._replace_entry(temporary, path, dxil)
         self.memory[key] = dxil
         if self._total is None:
-            self._total = sum(entry.stat().st_size for entry in self.entries())
+            self._total = sum(size for _, size, _ in self._stat_entries())
         else:
             self._total += len(dxil) - replaced
         if self._total > self.limit:
             self.prune()
 
+    @staticmethod
+    def _replace_entry(temporary, path, dxil):
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    temporary.unlink(missing_ok=True)
+                    try:
+                        if path.read_bytes() == dxil:
+                            return
+                    except OSError:
+                        pass
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+
+    def _stat_entries(self):
+        items = []
+        for candidate in self.folder.glob(f"*/*{SUFFIX}"):
+            try:
+                st = candidate.stat()
+            except OSError:
+                continue
+            items.append((st.st_mtime, st.st_size, candidate))
+        items.sort(key=lambda item: item[0])
+        return items
+
     def entries(self):
-        return sorted(self.folder.glob(f"*/*{SUFFIX}"), key=lambda p: p.stat().st_mtime)
+        return [path for _, _, path in self._stat_entries()]
 
     def prune(self):
         """Supprime les entrées les plus anciennes tant que le cache dépasse sa limite."""
-        entries = self.entries()
-        total = sum(p.stat().st_size for p in entries)
-        for path in entries:
+        entries = self._stat_entries()
+        total = sum(size for _, size, _ in entries)
+        for _, size, path in entries:
             if total <= self.limit:
                 break
-            total -= path.stat().st_size
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+                total -= size
+            except PermissionError:
+                pass
         self._total = total
