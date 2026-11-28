@@ -4503,6 +4503,7 @@ fn buffer_srv(
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
     let host = host()?;
+    shadow.note_descriptor();
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4626,6 +4627,7 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    shadow.note_gpu_written();
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4908,6 +4910,7 @@ fn make_twinned(
         View::Constant(_, 0) => None,
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
+            shadow.note_descriptor();
             let gpu = shadow.gpu(address);
             if crate::port_cbv::on() {
                 // Renderer port 5: shaders read constant buffers as raw bytes

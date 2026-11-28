@@ -489,7 +489,7 @@ fn look_for_stale() {
 }
 
 /// Sends `list` (recorded by `f`) and waits for it.
-fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
+fn run<'a>(host: &Host, shadows: impl IntoIterator<Item = &'a Shadow>, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
     let (allocator, list) = host.make_prelude()?;
     // SAFETY: objects of our own, waited for before they go.
     unsafe {
@@ -497,10 +497,18 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
         list.Reset(&allocator, None).ok()?;
         f(&list);
         list.Close().ok()?;
+        let cmd = list.cast().ok()?;
         let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         let event = CreateEventW(None, false, false, None).ok()?;
-        host.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
-        let done = host.queue.Signal(&fence, 1).and_then(|()| fence.SetEventOnCompletion(1, event));
+        let signalled = {
+            let _queue = super::queue_lock();
+            for shadow in shadows {
+                shadow.note_aux_fence(crate::shadow::card_tier::Queue::Direct, &fence, 1);
+            }
+            host.queue.ExecuteCommandLists(&[Some(cmd)]);
+            host.queue.Signal(&fence, 1)
+        };
+        let done = signalled.and_then(|()| fence.SetEventOnCompletion(1, event));
         if done.is_ok() {
             WaitForSingleObject(event, INFINITE);
         }
@@ -533,7 +541,7 @@ fn look(host: &Host) -> Option<u64> {
     let (found, answers) = host.shared_buffer(size)?;
     // SAFETY: a mapping of that size.
     unsafe { std::ptr::write_bytes(answers, 0, size as usize) };
-    run(host, |list| {
+    run(host, pieces.iter().map(|p| p.0.as_ref()), |list| {
         // SAFETY: an open list; live buffers (held by `pieces`).
         unsafe {
             list.SetComputeRootSignature(&pass.root);
@@ -585,7 +593,7 @@ fn look(host: &Host) -> Option<u64> {
     const SHOWN: usize = 64;
     let shown = &differs[..differs.len().min(SHOWN)];
     let (held, data) = host.shared_buffer((SHOWN * PIECE) as u64)?;
-    run(host, |list| {
+    run(host, shown.iter().map(|d| d.shadow.as_ref()), |list| {
         for (i, d) in shown.iter().enumerate() {
             // SAFETY: an open list; live buffers, the ranges in them.
             unsafe { list.CopyBufferRegion(&held, (i * PIECE) as u64, &d.shadow.buffer, d.at as u64, d.len as u64) };
@@ -744,7 +752,7 @@ mod tests {
     fn card(host: &Host, shadow: &Shadow) -> Vec<u8> {
         let (held, data) = host.shared_buffer(LEN as u64).unwrap();
         // SAFETY: an open list; live buffers.
-        run(host, |list| unsafe { list.CopyBufferRegion(&held, 0, &shadow.buffer, 0, LEN as u64) }).unwrap();
+        run(host, [shadow], |list| unsafe { list.CopyBufferRegion(&held, 0, &shadow.buffer, 0, LEN as u64) }).unwrap();
         // SAFETY: the mapping; the copy has run.
         unsafe { std::slice::from_raw_parts(data, LEN) }.to_vec()
     }

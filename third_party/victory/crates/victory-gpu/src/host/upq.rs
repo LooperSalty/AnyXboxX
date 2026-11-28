@@ -137,6 +137,7 @@ pub(super) unsafe fn send(
     host: &super::Host,
     drawing: &ID3D12CommandQueue,
     ranges: &[Range<'_>],
+    stamp: impl FnOnce(&ID3D12Fence, u64),
     mut record: impl FnMut(usize, &ID3D12Resource, u64),
 ) -> Option<Slot> {
     let total: u64 = ranges.iter().map(|r| r.3.next_multiple_of(256)).sum();
@@ -177,9 +178,13 @@ pub(super) unsafe fn send(
                 at += bytes.next_multiple_of(256);
             }
             slot.list.Close()?;
-            q.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list)?)]);
+            let cmd = windows::core::Interface::cast(&slot.list)?;
             q.sent += 1;
-            q.queue.Signal(&q.fence, q.sent)?;
+            stamp(&q.fence, q.sent);
+            q.queue.ExecuteCommandLists(&[Some(cmd)]);
+            if let Err(error) = q.queue.Signal(&q.fence, q.sent) {
+                super::fail(format_args!("the upload copy queue could not be fenced after executing ({error})"));
+            }
             Ok(())
         })()
     };
@@ -190,13 +195,20 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     }
-    // SAFETY: a fence of ours that the copy queue signals.
-    if let Err(e) = unsafe { drawing.Wait(&q.fence, q.sent) } {
+    // SAFETY: a fence of ours that the copy queue signals; serialized with
+    // direct queue submissions via `QUEUE_SUBMIT`.
+    let waited = {
+        let _queue = super::queue_lock();
+        unsafe { drawing.Wait(&q.fence, q.sent) }
+    };
+    if let Err(e) = waited {
         // The drawing queue cannot be made to wait: wait here, so that
         // what follows still finds the bytes.
         tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
         // SAFETY: as above; a null event waits until the value is reached.
-        let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
+        if let Err(error) = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) } {
+            super::fail(format_args!("the upload copy could not be waited for ({error})"));
+        }
     }
     let mut at = 0u64;
     for (i, r) in ranges.iter().enumerate() {
