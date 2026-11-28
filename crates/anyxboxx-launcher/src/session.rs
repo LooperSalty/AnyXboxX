@@ -121,6 +121,7 @@ pub fn make_plan(
         repo: repo.to_path_buf(),
         victory_exe: victory_exe.map(Path::to_path_buf),
         game_dir,
+        console: settings.options.console.to_run_console(),
         env,
         jobs: settings.jobs_limit(),
         game_log,

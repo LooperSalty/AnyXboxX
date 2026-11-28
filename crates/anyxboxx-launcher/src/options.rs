@@ -1,8 +1,7 @@
 //! The Play page's launch options. Display, input and performance settings are mapped here.
 //! Streamline's variables and their dependencies are mapped in `dlss`.
 //!
-//! Not offered, because the Neptune tree of VIctory has nothing behind them: the Series S console
-//! profile. Discord presence stays off (VICTORY_DISCORD=0, set by `anyxboxx run`).
+//! Discord presence stays off (VICTORY_DISCORD=0, set by `anyxboxx run`).
 
 use serde::{Deserialize, Serialize};
 
@@ -280,11 +279,49 @@ impl LogLevel {
     }
 }
 
+/// Console profile passed to VIctory (`victory run --console`): Series X (default) or Series S.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleProfile {
+    #[default]
+    SeriesX,
+    /// Xbox Series S (`--console series-s`): experimental, unverified on the current base (#338).
+    SeriesS,
+}
+
+impl ConsoleProfile {
+    pub const ALL: [ConsoleProfile; 2] = [ConsoleProfile::SeriesX, ConsoleProfile::SeriesS];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ConsoleProfile::SeriesX => "Xbox Series X",
+            ConsoleProfile::SeriesS => "Xbox Series S (experimental)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            ConsoleProfile::SeriesX => "Full Series X console profile (VIctory's default).",
+            ConsoleProfile::SeriesS => {
+                "Series S profile (--console series-s): experimental, unverified on the current base (drew UI over a black scene on Neptune, #338)."
+            }
+        }
+    }
+
+    pub fn to_run_console(self) -> anyxboxx::run::Console {
+        match self {
+            ConsoleProfile::SeriesX => anyxboxx::run::Console::SeriesX,
+            ConsoleProfile::SeriesS => anyxboxx::run::Console::SeriesS,
+        }
+    }
+}
+
 /// What the Play page's cards choose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaunchOptions {
     pub dlss: crate::dlss::DlssOptions,
+    pub console: ConsoleProfile,
     pub preset: Preset,
     pub resolution: Resolution,
     pub custom_width: u32,
@@ -309,6 +346,7 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         LaunchOptions {
             dlss: Default::default(),
+            console: ConsoleProfile::SeriesX,
             preset: Preset::Fast,
             // Full HD by default: the title renders at 1280x720 inside instead of 2560x1440
             // (4K, the size a Series X wrote in its settings). Measured on an RTX 4070 SUPER,

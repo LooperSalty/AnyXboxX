@@ -4,7 +4,7 @@
 use eframe::egui::{self, RichText, Ui};
 
 use crate::app::App;
-use crate::options::{Keyboard, LogLevel, Preset, Resolution, WindowMode};
+use crate::options::{ConsoleProfile, Keyboard, LogLevel, Preset, Resolution, WindowMode};
 use crate::{theme, tokens, widgets};
 
 pub fn cards(app: &mut App, ui: &mut Ui) {
@@ -111,6 +111,18 @@ fn performance_card(app: &mut App, ui: &mut Ui) {
         );
         ui.label(
             RichText::new(settings.options.preset.description())
+                .color(theme::TEXT_MUTED)
+                .size(tokens::CAPTION),
+        );
+        ui.add_space(tokens::S);
+        pills(
+            ui,
+            &mut settings.options.console,
+            &ConsoleProfile::ALL,
+            ConsoleProfile::label,
+        );
+        ui.label(
+            RichText::new(settings.options.console.description())
                 .color(theme::TEXT_MUTED)
                 .size(tokens::CAPTION),
         );

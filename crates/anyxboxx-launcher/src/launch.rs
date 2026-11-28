@@ -5,7 +5,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyxboxx::run::{Env, GAME_EXE, PRECOMPILED_DLLS, RunError, SHADERS, Victory, warm_archives};
+use anyxboxx::run::{
+    Console, Env, GAME_EXE, PRECOMPILED_DLLS, RunError, SHADERS, Victory, warm_archives,
+};
 
 use crate::job::Step;
 use crate::warm_state;
@@ -17,6 +19,8 @@ pub struct Plan {
     /// Prebuilt `victory.exe` (`--victory-exe`); when set, skips `cargo build` and needs no repo.
     pub victory_exe: Option<PathBuf>,
     pub game_dir: PathBuf,
+    /// Console profile passed to `victory run` (`SeriesX` default or `SeriesS`).
+    pub console: Console,
     pub env: Env,
     /// Worker threads of the warm step; `None` lets VIctory use every core.
     pub jobs: Option<usize>,
@@ -100,7 +104,7 @@ pub fn play_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> 
     } else if warm_first {
         steps.push(precompile_step(&victory, plan)?);
     }
-    let command = victory.game_command(&plan.game_dir, &plan.env);
+    let command = victory.game_command_as(&plan.game_dir, &plan.env, plan.console);
     steps.push(match &plan.game_log {
         Some(log) => Step::detached("Running the game", command, log.clone()),
         None => Step::new("Running the game", command),
@@ -250,6 +254,7 @@ mod tests {
             repo: repo.path().to_path_buf(),
             victory_exe: None,
             game_dir: game.path().to_path_buf(),
+            console: Console::SeriesX,
             game_log: None,
             warm: None,
             env: vec![("VICTORY_LATE_WAIT".to_string(), OsString::from("3"))],
@@ -267,6 +272,20 @@ mod tests {
         let game_args = args_of(&steps[1].command);
         assert_eq!(game_args.first().map(String::as_str), Some("run"));
         assert!(game_args.iter().any(|a| a == "--execute"));
+        assert!(!game_args.iter().any(|a| a == "--console"));
+    }
+
+    #[test]
+    fn series_s_plan_passes_console_flag_to_victory_run() {
+        let (_repo, _game, mut plan) = fixture();
+        plan.console = Console::SeriesS;
+        let steps = play_steps(&plan, false).expect("steps");
+        let game_args = args_of(&steps[1].command);
+        let at = game_args
+            .iter()
+            .position(|a| a == "--console")
+            .expect("Series S plan must pass --console");
+        assert_eq!(game_args.get(at + 1).map(String::as_str), Some("series-s"));
     }
 
     /// A warm that looked unneeded before the build is listed, and decides once the build is over:

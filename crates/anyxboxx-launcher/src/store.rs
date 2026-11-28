@@ -96,7 +96,7 @@ pub fn save(path: &Path, stored: &Stored) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{Keyboard, Preset, Resolution, WindowMode};
+    use crate::options::{ConsoleProfile, Keyboard, Preset, Resolution, WindowMode};
 
     fn sample() -> Settings {
         Settings {
@@ -117,6 +117,7 @@ mod tests {
                     hudless: false,
                     streamline_dir: r"D:\Streamline SDK\bin\x64".into(),
                 },
+                console: ConsoleProfile::SeriesS,
                 preset: Preset::Quality,
                 resolution: Resolution::P1080,
                 window: WindowMode::Borderless,
@@ -140,6 +141,7 @@ mod tests {
         assert_eq!(settings.game_dir, "D:\\Game");
         assert_eq!(settings.repo_dir, "D:\\AnyXboxX");
         assert_eq!(settings.xg_mode, XgMode::Compare);
+        assert_eq!(settings.options.console, ConsoleProfile::SeriesS);
         assert_eq!(settings.options.keyboard, Keyboard::Azerty);
         assert!(settings.options.warm_first);
     }

@@ -45,6 +45,7 @@ The first run after a new build or a new setting recompiles hundreds of pipeline
 
 On **Play → NVIDIA DLSS**, choose a Streamline folder, enable Super Resolution and select its quality mode. Frame Generation 2x has its own switch and requires a GeForce RTX 40 or 50 series card with hardware-accelerated GPU scheduling enabled. Both switches start off. [NVIDIA files, setup and measured frame rates](dlss.md).
 
+- Console profile: Xbox Series X (default) or Xbox Series S (`--console series-s`, experimental — unverified on the current base; drew the UI over a black scene on Neptune, #338).
 - Resolution and window mode (windowed or borderless).
 - Keyboard layout: automatic, QWERTY, AZERTY or QWERTZ (`VICTORY_KEYBOARD`).
 - Fast (default, measured set), Quality (better lighting and textures, lower frame rate), 12 GB card or 8 GB card. The Fast profile's reserves on the card (1536 MB of draw-data windows and of buffer copies) were sized on 12 to 16 GB cards; on an RTX 5060 8 GB it stood at 8,010 MB in use against a 6,823 MB budget, Windows moved the rest into the PC's memory and the texture queue was refused. The two card presets cut those reserves (1024 MB, or 512 MB with a 256 MB list pool) and cap the title's textures with `VICTORY_TEXTURE_MAX_SIZE` (2048, or 1024 texels): the levels of a texture over the cap get no memory on the card and its views start at the first level within it, so every texture fits, slightly less sharp up close. The 12 GB preset is not measured on a 12 GB card yet.
