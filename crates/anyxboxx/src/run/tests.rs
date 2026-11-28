@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -445,4 +445,57 @@ fn big_pools_come_after_the_tuned_set_and_before_quality_and_overrides() {
         24,
     );
     assert_eq!(value(&amd, "VICTORY_LAND_THREADS"), None);
+}
+
+fn warm_args(command: &Command) -> Vec<String> {
+    command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn warm_plan(flags: &[&str]) -> Vec<(&'static str, Vec<String>)> {
+    let mut argv = vec!["--GameDir", "G"];
+    argv.extend_from_slice(flags);
+    let args = parse(&argv);
+    let victory = Victory::prebuilt(&std::env::current_exe().unwrap()).unwrap();
+    warm_commands(&args, &victory, &Vec::new())
+        .into_iter()
+        .map(|(label, command)| (label, warm_args(&command)))
+        .collect()
+}
+
+#[test]
+fn warm_translates_the_shaders_then_makes_only_the_used_pipelines() {
+    for flag in ["--warm", "--precompile"] {
+        let plan = warm_plan(&[flag]);
+        assert_eq!(plan.len(), 2, "{flag}");
+        assert_eq!(plan[0].0, "Translating shaders");
+        assert_eq!(plan[0].1, ["shaders", "--if-needed", "G"]);
+        assert_eq!(plan[1].0, "Preparing the pipelines you used");
+        assert_eq!(plan[1].1, ["warm", "--used"]);
+    }
+}
+
+#[test]
+fn warm_all_keeps_the_old_complete_warm() {
+    let plan = warm_plan(&["--warm", "--warm-all"]);
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].1, ["warm"]);
+}
+
+#[test]
+fn no_warm_flag_means_no_warm_command() {
+    assert!(warm_plan(&[]).is_empty());
+    assert!(warm_plan(&["--warm-all"]).is_empty());
+}
+
+#[test]
+fn the_shaders_and_used_warm_commands_pass_the_jobs_limit() {
+    let victory = Victory::prebuilt(&std::env::current_exe().unwrap()).unwrap();
+    let env: Env = Vec::new();
+    let shaders = victory.shaders_command(Path::new("G"), &env, Some(4));
+    assert_eq!(warm_args(&shaders), ["shaders", "--if-needed", "--jobs", "4", "G"]);
+    let used = victory.warm_used_command(&env, Some(4));
+    assert_eq!(warm_args(&used), ["warm", "--used", "--jobs", "4"]);
 }

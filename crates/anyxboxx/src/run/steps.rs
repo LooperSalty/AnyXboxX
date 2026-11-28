@@ -73,28 +73,41 @@ impl Victory {
         Some(command)
     }
 
-    /// `victory warm` with the game's environment (the cache key depends on it). On the Vice-Tay
-    /// base `warm` takes no archives: it makes the host pipelines of every pipeline earlier runs
-    /// noted, so the driver's cache has them before the game asks. `archives` only enter the warm
-    /// fingerprint (`warm_state`), never the command line, which Vice-Tay refuses.
+    /// `victory shaders --if-needed [--jobs N] <game_dir>` with the game's environment: translates
+    /// every shader of the game folder into the shader cache, and does nothing when those paths are
+    /// already translated for this cache key (about 30 minutes once per translator version).
+    pub fn shaders_command(&self, game_dir: &Path, env: &Env, jobs: Option<usize>) -> Command {
+        let mut command = Command::new(&self.exe);
+        command.args(["shaders", "--if-needed"]);
+        if let Some(jobs) = jobs {
+            command.arg("--jobs").arg(jobs.to_string());
+        }
+        command.arg(game_dir);
+        apply_env(&mut command, env);
+        command
+    }
+
+    /// `victory warm --used [--jobs N]`: makes only the host pipelines earlier runs drew with
+    /// (fast, seconds once the shaders are translated).
+    pub fn warm_used_command(&self, env: &Env, jobs: Option<usize>) -> Command {
+        let mut command = Command::new(&self.exe);
+        command.args(["warm", "--used"]);
+        if let Some(jobs) = jobs {
+            command.arg("--jobs").arg(jobs.to_string());
+        }
+        apply_env(&mut command, env);
+        command
+    }
+
+    /// The old complete warm (`--warm-all`): `victory warm` makes the host pipelines of EVERY
+    /// pipeline ever created, about 6 a second on the Vice-Tay base, several hours. `archives`
+    /// only enter the warm fingerprint (`warm_state`), never the command line.
     pub fn warm_command(&self, archives: &[PathBuf], env: &Env) -> Command {
         let _ = archives;
         let mut command = Command::new(&self.exe);
         command.arg("warm");
         apply_env(&mut command, env);
         command
-    }
-
-    /// The warm before a first launch (`--precompile`): checks that shaders.rpf, the game and its
-    /// two DLLs are there, then runs `victory warm` with the game's environment.
-    pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
-        validate_precompile_inputs(game_dir)?;
-        // Vice-Tay's `warm` reads no files: the inputs are checked so a broken game folder still
-        // fails here, as before, and the command is the plain warm.
-        let mut command = Command::new(&self.exe);
-        command.arg("warm");
-        apply_env(&mut command, env);
-        Ok(command)
     }
 
     /// `victory run <game> --execute` with the game's environment, as a Series X.

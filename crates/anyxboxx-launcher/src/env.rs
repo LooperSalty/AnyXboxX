@@ -99,6 +99,7 @@ pub fn build_env_with_cpus(
         dred: false,
         warm: false,
         precompile: false,
+        warm_all: false,
         xg_dll: xg.map(|x| x.dll.clone()),
         xg_mode: xg.map_or(XgMode::Real, |x| x.mode),
         batch_card_rehash: false,
