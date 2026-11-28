@@ -45,6 +45,8 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice, of the title's texture.
     mips: u32,
+    /// Host dimensions for the opt-in cache check; footprints may round to blocks.
+    clamp_host_size: Option<(u64, u32)>,
     /// The first of them that is read and uploaded
     /// (`crate::resource::held_only`), the one the host copy begins at, and
     /// the bytes of title memory read.
@@ -1905,12 +1907,16 @@ fn route(
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    drop(take_staged(resource));
+}
+
+/// Removes the cached staging and its recorded first mip under one lock.
+/// The caller can drop the returned staging after leaving other locks.
+pub(crate) fn take_staged(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut()
-        && map.remove(&(resource as usize)).is_some()
-    {
-        crate::resource::set_staged_first(resource, u32::MAX);
-    }
+    let staged = map.as_mut()?.remove(&(resource as usize))?;
+    crate::resource::set_staged_first(resource, u32::MAX);
+    Some(staged)
 }
 
 /// Where a staged title texture's memory is: address and bytes.
@@ -2241,11 +2247,21 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     // per-view `first` trimming when `held_only()` is active.
     let on_demand = copy.tiled.is_some();
     let first = if on_demand { 0 } else { first };
+    let clamp_desc = crate::texture_mip_clamp::enabled().then(|| {
+        // SAFETY: a live resource. Only the opt-in cache check needs its shape before a miss.
+        unsafe { texture.GetDesc() }
+    });
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
+        && clamp_desc.is_none_or(|d| {
+            s.on_demand == on_demand
+                && s.level0 == copy.base
+                && s.mips == copy.base + u32::from(d.MipLevels)
+                && s.clamp_host_size == Some((d.Width, d.Height))
+        })
     {
         return Some(s.clone());
     }
@@ -2264,7 +2280,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     }
     let host = host()?;
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let d = clamp_desc.unwrap_or_else(|| unsafe { texture.GetDesc() });
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
@@ -2306,6 +2322,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         rows,
         layout,
         mips,
+        clamp_host_size: clamp_desc.map(|d| (d.Width, d.Height)),
         first,
         level0,
         read,
@@ -2332,11 +2349,39 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     if copy.replaced.load(std::sync::atomic::Ordering::Relaxed) {
         return Some(s);
     }
+    if clamp_desc.is_some()
+        && map.get(&(resource as usize)).is_some_and(|old| {
+            old.serial > copy.serial
+                || (old.serial == copy.serial
+                    && (old.mips - old.level0 > mips - level0 || old.first < first))
+        })
+    {
+        return Some(s);
+    }
     map.insert(resource as usize, s.clone());
     crate::resource::set_staged_first(resource, s.first);
     Some(s)
 }
 
+#[cfg(test)]
+pub(crate) fn staging_shape_for_test(
+    resource: This,
+    copy: &crate::resource::HostTexture,
+) -> Option<(u32, u32, u64, u32)> {
+    let s = staging(resource, copy, 0)?;
+    let (width, height) = s.clamp_host_size?;
+    Some((s.mips - s.level0, s.level0, width, height))
+}
+
+#[cfg(test)]
+pub(crate) fn cached_staging_mips_for_test(resource: This) -> Option<u32> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let s = map.as_ref()?.get(&(resource as usize))?;
+    Some(s.mips - s.level0)
+}
+
+#[cfg(test)]
+mod staging_tests;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 

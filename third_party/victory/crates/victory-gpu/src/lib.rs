@@ -144,6 +144,8 @@ mod ab;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+use resource::texture_mip_clamp;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;

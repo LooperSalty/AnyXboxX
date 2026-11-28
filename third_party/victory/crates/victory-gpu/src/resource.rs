@@ -1216,6 +1216,10 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
+    /// Budget floor for this allocation, independent of the first viewed mip.
+    clamp_floor: u32,
+    /// Additional bytes saved when the budget floor raised the host base.
+    pub(crate) clamp_saved_bytes: Option<u64>,
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
@@ -1308,13 +1312,17 @@ struct Hosted {
     /// its memory: 1 + the change count of its memory's bucket
     /// ([`TARGET_CHANGES`]) when it was found; 0 while none is kept.
     no_target: std::sync::atomic::AtomicU32,
-    /// The host copy is made with every level whatever the size cap says
-    /// ([`keep_whole`]): the card copies into or out of it.
+    /// Lifts the size cap for copies and resolves ([`keep_whole`]). With
+    /// budget clamping enabled, this also bypasses the other mip floors.
     whole: std::sync::atomic::AtomicBool,
     /// The host copy begins at a later level than its views ask for, because
     /// of the size cap ([`cap_base`]).
     capped: std::sync::atomic::AtomicBool,
 }
+
+#[cfg(windows)]
+#[path = "texture_mip_clamp.rs"]
+pub(crate) mod texture_mip_clamp;
 
 /// Whether a texture the title places in memory is read, kept and uploaded
 /// from the first level its views show on (`VICTORY_HELD_LEVELS=0`: whole,
@@ -1467,7 +1475,9 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first).max(cap_base(r)) {
+    if host.base == 0
+        || host.base <= base_level(&r.desc, first).max(cap_base(r)).max(host.clamp_floor)
+    {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1832,7 +1842,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // as those under `tiles::floor()`).
         let mut base = 0;
         let mut prefill = None;
-        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        let explicit = r.host.whole.load(Relaxed) && texture_mip_clamp::enabled();
+        if texture.is_none()
+            && !explicit
+            && shape_fits
+            && r.host.placed.load(Relaxed)
+            && held_only()
+            && alias_of(this).is_none()
+        {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -1854,8 +1871,26 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             r.host.capped.store(capped > base, Relaxed);
             base = base.max(capped);
         }
+        let baseline = base;
+        let mut clamp = 0;
         let created = texture.map_or_else(
-            || host_texture_as(&r.desc.levels_from(base), r.host.state, clear, false, first_attempt),
+            || {
+                clamp = texture_mip_clamp::mip_clamp_for(this, r);
+                if clamp > baseline {
+                    let mut desc = r.desc;
+                    desc.mip_levels = mip_count(&desc) as u16;
+                    if let Ok(texture) = host_texture_as(
+                        &desc.levels_from(clamp), r.host.state, clear, false, first_attempt,
+                    ) {
+                        base = clamp;
+                        prefill = None;
+                        return Ok(texture);
+                    }
+                    // A failed clamp attempt leaves the original allocation and retry policy intact.
+                    clamp = 0;
+                }
+                host_texture_as(&r.desc.levels_from(baseline), r.host.state, clear, false, first_attempt)
+            },
             Ok,
         );
         let texture = match created {
@@ -1889,9 +1924,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        host.clamp_floor = clamp;
+        if base > baseline {
+            host.clamp_saved_bytes = Some(texture_mip_clamp::record_allocation(
+                &host.texture,
+                &r.desc.levels_from(baseline),
+                host.bytes,
+            ));
+        }
         host.prefill = prefill.map(crate::texture::Prefill::new);
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
-        if base > 0 {
+        if baseline > 0 {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
@@ -1980,11 +2023,7 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
+    let limit = texture_mip_clamp::budget_override_bytes();
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
@@ -2900,6 +2939,8 @@ impl HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
+            clamp_floor: 0,
+            clamp_saved_bytes: None,
             filled: false,
             tiled: None,
             base: 0,
@@ -2927,6 +2968,8 @@ impl HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
+            clamp_floor: 0,
+            clamp_saved_bytes: None,
             filled: false,
             tiled: Some(tiled),
             base: 0,
@@ -2947,6 +2990,9 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        if let Some(saved) = self.clamp_saved_bytes {
+            texture_mip_clamp::record_release(saved);
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
