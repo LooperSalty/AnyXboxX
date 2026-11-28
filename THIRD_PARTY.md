@@ -65,6 +65,7 @@ Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : l
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
 | [JMAN730/victory](https://github.com/JMAN730/victory) (JMAN730 ; commit `b975c652` de fever308) | GPL-3.0 | Non (hors base Neptune) | Idée seule, non portée : copies volumineuses en morceaux sur les fils conservés (`VICTORY_WIDE_COPY`, version réduite écrite contre notre `copy_mapped`) |
 | [Skyfrye/AnyXboxX](https://github.com/Skyfrye/AnyXboxX) (`nb3/ports`) | GPL-3.0 | | Préparation anticipée des textures indexées après copie de descripteurs (`e9ea380`, `VICTORY_COPIED_AT_ONCE` et `VICTORY_TABLED_ORPHANS`) |
+| [JMAN730/victory](https://github.com/JMAN730/victory) (fever308, PR #802) | GPL-3.0 | Non (hors base Neptune) | Relecture GPU à la demande des pages de 64 Kio, garde mémoire et préparation des E/S, adaptés à notre ordre de soumission. Énumération sans plafond des vues d'une section |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 

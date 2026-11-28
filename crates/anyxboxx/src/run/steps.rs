@@ -230,3 +230,42 @@ pub fn status(command: &mut Command, name: &str) -> Result<i32, RunError> {
         .map_err(|e| RunError::Spawn(name.to_string(), e))?;
     Ok(status.code().unwrap_or(1))
 }
+
+/// Run the CLI warm outside the caller's console. Files and pipes (including PowerShell's
+/// output pipeline) can be inherited directly. Console output handles belong to the caller's
+/// console, so forward those streams while the child is running.
+#[cfg(windows)]
+pub(super) fn warm_status(command: &mut Command) -> Result<i32, RunError> {
+    use std::io::{self, IsTerminal};
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null());
+    if io::stdout().is_terminal() {
+        command.stdout(Stdio::piped());
+    }
+    if io::stderr().is_terminal() {
+        command.stderr(Stdio::piped());
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| RunError::Spawn("victory".into(), e))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    std::thread::scope(|scope| {
+        let out =
+            stdout.map(|mut pipe| scope.spawn(move || io::copy(&mut pipe, &mut io::stdout())));
+        let err =
+            stderr.map(|mut pipe| scope.spawn(move || io::copy(&mut pipe, &mut io::stderr())));
+        let code = child.wait().map_err(RunError::WarmIo)?.code().unwrap_or(1);
+        for thread in [out, err].into_iter().flatten() {
+            let copied = thread.join().expect("warm output thread panicked");
+            if code == 0 {
+                copied.map_err(RunError::WarmIo)?;
+            }
+        }
+        Ok(code)
+    })
+}
