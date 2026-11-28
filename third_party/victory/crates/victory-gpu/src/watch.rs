@@ -3832,11 +3832,11 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     let first = at / BLOCK;
-    let freed_end = if len != 0 {
-        at.saturating_add(len).div_ceil(BLOCK)
-    } else {
-        allocation_end(at, at).div_ceil(BLOCK).max(first + 1)
-    };
+    let end = if len != 0 { at.saturating_add(len) } else { allocation_end(at, at) };
+    let freed_end = end.div_ceil(BLOCK).max(first + usize::from(len == 0));
+    if crate::ram_trim::enabled() {
+        crate::shadow::title_memory_remapped(at as u64, end.saturating_sub(at) as u64);
+    }
     forget_views(first, freed_end);
     forget_placeholders(first, freed_end);
     let mut g = guards();
@@ -3910,6 +3910,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    if crate::ram_trim::enabled() {
+        crate::shadow::title_memory_remapped(at as u64, len as u64);
+    }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();

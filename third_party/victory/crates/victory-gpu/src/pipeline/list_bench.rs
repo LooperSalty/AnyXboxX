@@ -99,6 +99,8 @@ fn preset(
             stores: true,
             stores_by_address: false,
             picks: Default::default(),
+            // Preset host DXBC is not a guest container the cache can reload.
+            dxil: None,
         })
     });
     shader
@@ -154,16 +156,18 @@ fn graphics_pipeline(vs: &Arc<Shader>, ps: &Arc<Shader>) -> This {
         topology: [u32; 2],
         dsv: [u32; 2],
     }
+    let vs_bytes = vs.container.bytes();
+    let ps_bytes = ps.container.bytes();
     let stream = Stream {
         vs_kind: 1,
         vs: Bytecode {
-            code: vs.container.as_ptr(),
-            size: vs.container.len(),
+            code: vs_bytes.as_ref().as_ptr(),
+            size: vs_bytes.as_ref().len(),
         },
         ps_kind: 2,
         ps: Bytecode {
-            code: ps.container.as_ptr(),
-            size: ps.container.len(),
+            code: ps_bytes.as_ref().as_ptr(),
+            size: ps_bytes.as_ref().len(),
         },
         depth: Depth1(
             21,
@@ -191,11 +195,12 @@ fn graphics_pipeline(vs: &Arc<Shader>, ps: &Arc<Shader>) -> This {
 }
 
 fn compute_pipeline(cs: &Arc<Shader>) -> This {
+    let cs_bytes = cs.container.bytes();
     let head = ComputeHead {
         root: std::ptr::null(),
         stage: Bytecode {
-            code: cs.container.as_ptr(),
-            size: cs.container.len(),
+            code: cs_bytes.as_ref().as_ptr(),
+            size: cs_bytes.as_ref().len(),
         },
     };
     let mut pso = std::ptr::null();

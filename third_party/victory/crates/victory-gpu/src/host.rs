@@ -581,7 +581,14 @@ fn sweep() {
     if let Some(host) = host { host.trim_title_stock(memory); }
     crate::pool::room(memory);
     crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
+    if crate::ram_trim::enabled() {
+        let policy = crate::ram_trim::TrimPolicy::cached();
+        crate::pipeline::trim_shaders_with(&policy, now);
+        crate::shadow::let_go_idle_with(&policy, now);
+        crate::list::trim_idle(&policy, now);
+    } else {
+        crate::shadow::let_go_idle();
+    }
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
@@ -1423,8 +1430,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        // Tests honor the adapter and validation switches without requiring
+        // the rest of the diagnostics feature.
+        let debug = cfg!(any(feature = "diagnostics", test)) && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -1473,7 +1481,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        if cfg!(any(feature = "diagnostics", test)) && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");

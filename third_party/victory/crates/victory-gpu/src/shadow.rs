@@ -22,7 +22,13 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
+use crate::ram_trim::{self, TrimPolicy, TrimThresholds};
 use crate::watch::PAGE;
+
+mod snapshot;
+mod snapshot_pool;
+mod snapshot_reclaim;
+use snapshot::{Snapshot, SnapshotPin};
 
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so partially-initialized buffers and windows
@@ -425,7 +431,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: Mutex<Option<Snapshot>>,
     /// Held shared while pieces of the copy are landed (`crate::land`), each
     /// its own bytes of it on several threads, and alone while title bytes
     /// go in under shader writes ([`Shadow::merge_under_writes`]), which
@@ -1748,13 +1754,15 @@ struct SnapshotPool {
     bytes: usize,
 }
 
+fn snapshot_fit<T>(buffers: &[T], n: usize, size: impl Fn(&T) -> usize) -> Option<usize> {
+    let most = n.saturating_mul(4).max(1 << 20);
+    let i = buffers.partition_point(|v| size(v) >= n).checked_sub(1)?;
+    (size(&buffers[i]) <= most).then_some(i)
+}
+
 impl SnapshotPool {
     fn take(&mut self, n: usize) -> Option<Vec<u8>> {
-        let most = n.saturating_mul(4).max(1 << 20);
-        let i = self.buffers.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
-        if self.buffers[i].capacity() > most {
-            return None;
-        }
+        let i = snapshot_fit(&self.buffers, n, Vec::capacity)?;
         let v = self.buffers.remove(i);
         self.bytes -= v.capacity();
         Some(v)
@@ -2427,18 +2435,25 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
 const WIDE_JOB: usize = 1 << 20;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
-/// (from, to, bytes), taken by [`take_snapshots`].
-static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// (from, to, bytes), taken by [`take_snapshots`]. Opt-in VM backing remains
+/// pinned until every queued worker is done.
+#[derive(Default)]
+struct PendingSnapshots {
+    copies: Vec<(usize, usize, usize)>,
+    pins: Vec<SnapshotPin>,
+}
+
+static SNAPS: Mutex<PendingSnapshots> = Mutex::new(PendingSnapshots { copies: Vec::new(), pins: Vec::new() });
 
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
 pub(crate) fn take_snapshots() {
-    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
-    if snaps.is_empty() {
-        return;
+    let PendingSnapshots { copies, pins } = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    if !copies.is_empty() {
+        wide(copy_jobs(copies));
     }
-    wide(copy_jobs(snaps));
+    drop(pins);
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -2481,19 +2496,29 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    let mut pins = Vec::new();
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
-            // The snapshot's memory stays until the range is done with
-            // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
+            // `copy_back_done` follows this scan. Independently pin VM backing
+            // for the worker threads after releasing the before-image lock.
+            let mut guard = shadow.before.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_mut() {
+                Some(before) => {
+                    pins.extend(before.pin());
+                    // SAFETY: `writing` captured the declared range; the pin and
+                    // submission ordering keep the backing alive until the workers join.
+                    let ptr = unsafe { before.read_ptr(from, to) };
+                    (shadow.data as usize, ptr as usize, shadow.start as usize, from, to)
+                }
                 None => (0, 0, 0, 0, 0),
             }
         })
         .collect();
-    find_pieces(scans)
+    let found = find_pieces(scans);
+    drop(pins);
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -4040,14 +4065,32 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
     // Before the windows: their table may be empty while the pool is not.
     let_go_idle_snapshots();
+    let_go_idle_windows(None);
+}
+
+/// Applies the opt-in pool and reference policy without changing the legacy sweep.
+pub(crate) fn let_go_idle_with(policy: &TrimPolicy, now: u64) {
+    let Some(trim) = policy.thresholds().filter(|_| ram_trim::enabled()) else {
+        let_go_idle();
+        return;
+    };
+    snapshot_pool::sweep(trim, now);
+    let_go_idle_windows(Some(trim));
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| weak.strong_count() != 0);
+    if let Some(cold_ms) = trim.decommit_cold_reference_ms {
+        snapshot_reclaim::sweep(cold_ms, trim.critical_memory, now);
+    }
+}
+
+fn let_go_idle_windows(trim: Option<&TrimThresholds>) {
+    const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
     // Without a budget (or in Calm) copies idle this long go; under a
     // budget they still do, and others idle for less go to meet it.
     let due_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    let mut idle_ms = due_ms;
+    let mut idle_ms = trim.filter(|trim| trim.low_memory).map_or(due_ms, |trim| due_ms.min(trim.pool_idle_ms));
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
@@ -4077,6 +4120,7 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
+                    && (trim.is_none() || s.pending.try_lock().is_ok_and(|pending| pending.is_empty()))
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
@@ -4118,9 +4162,17 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Title memory was freed or remapped. Reclaim only unused copies and private,
+/// idle before-images; callers notify us outside the write-watch guard lock.
+pub(crate) fn title_memory_remapped(at: u64, len: u64) {
+    if ram_trim::enabled() {
+        snapshot_reclaim::remapped(at, len);
+    }
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
-/// buffers kept for reuse and the bytes they reserve.
+/// buffers kept for reuse and their committed bytes (legacy Vec capacity).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
@@ -4134,7 +4186,9 @@ pub(crate) fn memory() -> [u64; 6] {
             .sum();
         (seen.len() as u64, bytes)
     };
-    let (kept, kept_bytes) = {
+    let (kept, kept_bytes) = if ram_trim::enabled() {
+        snapshot_pool::memory()
+    } else {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         (pool.buffers.len() as u64, pool.bytes as u64)
     };
@@ -4362,7 +4416,7 @@ impl Shadow {
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
+        let snapshot = before.get_or_insert_with(|| Snapshot::take(total));
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -4387,7 +4441,8 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        let dst = snapshot.write_ptr(lo, hi).add(lo);
+                        std::ptr::copy_nonoverlapping(self.data.add(lo), dst, hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -4401,8 +4456,16 @@ impl Shadow {
             // then. The snapshot's memory stays where it is until the
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
-            snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
+            if parts.iter().any(|&(from, to)| from < to) {
+                snaps.pins.extend(snapshot.pin());
+            }
+            for (from, to) in parts.into_iter().filter(|&(from, to)| from < to) {
+                // SAFETY: the pending ranges do not overlap, and remain alive
+                // until the workers join and the submission runs. The VM pin
+                // also prevents a discard or reuse with the worker outstanding.
+                let dst = unsafe { snapshot.write_ptr(from, to) } as usize;
+                snaps.copies.push((self.data as usize + from, dst + from, to - from));
+            }
             return;
         }
         for (from, to) in parts {
@@ -4410,7 +4473,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data.add(from), snapshot.write_ptr(from, to).add(from), to - from);
                 }
             }
         }
@@ -4436,17 +4499,17 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if let Some(before) = snapshot.as_mut()
             && from < to
         {
             // SAFETY: `writing` set the snapshot's bytes of every declared
-            // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            // range at the copy's offsets; the guard stays held for the read.
+            let before = unsafe { std::slice::from_raw_parts(before.read_ptr(from, to).add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -4555,7 +4618,7 @@ impl Shadow {
         // (`writing`), and these offsets are in a range declared and not
         // done with, whose bytes it holds; nothing else touches them
         // without the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
+        let held = unsafe { std::slice::from_raw_parts_mut(before.write_ptr(at, at + n).add(at), n) };
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
@@ -4663,6 +4726,12 @@ impl Shadow {
                 }
             }
             if kept.1 {
+                drop(kept);
+                if ram_trim::enabled()
+                    && let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+                {
+                    snapshot.mark_settled(crate::host::now_ms());
+                }
                 return;
             }
             // Given back: nothing of it is current next time. (The lock
@@ -4670,8 +4739,14 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            give_back(bytes);
+        if ram_trim::enabled() {
+            let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(pending);
+            if let Some(snapshot) = snapshot {
+                snapshot.recycle();
+            }
+        } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            snapshot.recycle();
         }
     }
 
@@ -4835,11 +4910,29 @@ impl Shadow {
             // such a merge and compared after it would take the card's
             // bytes for the title's.
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+            // A landing may finish while we ask the journal. Before using an
+            // opt-in reference, recheck that this range is still live: an
+            // intervening idle reclaim may have discarded its old bytes.
+            let pending = if self.card.is_none() && ram_trim::enabled() {
+                let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if !snapshot::pending_covers(&pending, a, e) {
+                    note_stale(3);
+                    return true;
+                }
+                Some(pending)
+            } else {
+                None
+            };
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            drop(pending);
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
-                before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
+                before.as_mut().map_or(0, |snapshot| {
+                    // SAFETY: the range was declared; the before and merging
+                    // locks cover all the per-page jobs below.
+                    unsafe { snapshot.write_ptr(a - start, e - start) as usize }
+                })
             };
             if held == 0 {
                 note_stale(3);
@@ -5496,8 +5589,9 @@ impl Shadow {
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            // SAFETY: the snapshot's allocation holds the copy's length.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
+            // SAFETY: the snapshot's allocation holds the copy's length, and
+            // no landing or title merge may touch it under these locks.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.write_ptr(from, to).add(from), bytes.len()) };
         }
         self.changed(from, to);
     }
@@ -5917,10 +6011,13 @@ impl Shadow {
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
-        // The snapshot's memory stays where it is until the range is done
-        // with (`copy_back_done`), which comes after this.
-        let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Vec::as_mut_ptr) else {
-            return 0;
+        // The submission ordering keeps these bytes live through the landing.
+        // Keep a VM pin as well because the before-image lock is released.
+        let (held, _pin) = {
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(snapshot) = before.as_mut() else { return 0 };
+            // SAFETY: the range was declared and no other landing uses its bytes.
+            (unsafe { snapshot.write_ptr(at, at + n) }, snapshot.pin())
         };
         // SAFETY: inside the copy's mapping (checked above), which only the
         // card writes there, and inside the snapshot's allocation, which

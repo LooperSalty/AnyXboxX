@@ -40,8 +40,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// Asked once a second. The opt-in host policy can also age out idle uploads.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    let policy = crate::ram_trim::TrimPolicy::cached();
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
@@ -51,7 +52,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
-    if let Ok(mut pool) = STAGING.try_lock() {
+    let gone = if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
@@ -59,8 +60,26 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else {
             limit
         };
-        pool.reclaim(tick, staging_limit, true);
+        sweep_staging(&mut pool, tick, staging_limit, &policy)
+    } else {
+        Vec::new()
+    };
+    let bytes = gone.len() as u64 * BLOCK;
+    drop(gone);
+    if bytes != 0 {
+        crate::ram_trim::note_pool_trimmed(bytes);
     }
+}
+
+fn sweep_staging<B: Clone>(
+    pool: &mut Pool<B>,
+    tick: u64,
+    limit: usize,
+    policy: &crate::ram_trim::TrimPolicy,
+) -> Vec<Block<B>> {
+    pool.reclaim(tick, limit, true);
+    let Some(trim) = policy.thresholds() else { return Vec::new() };
+    pool.reclaim_aged(tick, limit.min(trim.staging_pool_warm_blocks), trim.pool_idle_ms, trim.critical_memory)
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -192,6 +211,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// When the last piece finished resting, or when a new block was made.
+    idle_since: u64,
 }
 
 struct Pool<B> {
@@ -298,7 +319,8 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        let since = now();
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since, idle_since: since });
         i
     }
 
@@ -320,7 +342,10 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(BLOCK) {
+                    block.idle_since = ready;
+                    any = true;
+                }
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -337,6 +362,23 @@ impl<B: Clone> Pool<B> {
                 }
             }
         }
+    }
+
+    /// Call after `reclaim`, which makes rested pieces visible. Live and
+    /// resting pieces still occupy their ranges, so those blocks cannot go.
+    fn reclaim_aged(&mut self, tick: u64, warm: usize, idle_ms: u64, critical: bool) -> Vec<Block<B>> {
+        let mut empty: Vec<_> = self.blocks.iter().enumerate().filter_map(|(i, slot)| {
+            let block = slot.as_ref()?;
+            block.free.whole(BLOCK).then_some((std::cmp::Reverse(block.idle_since), i))
+        }).collect();
+        empty.sort_unstable();
+        empty.into_iter().skip(warm).filter_map(|(std::cmp::Reverse(since), i)| {
+            if critical || tick.saturating_sub(since) >= idle_ms {
+                self.blocks[i].take()
+            } else {
+                None
+            }
+        }).collect()
     }
 
     fn blocks(&self) -> usize {
@@ -734,6 +776,9 @@ pub(crate) unsafe fn texture(
         }
     }
 }
+
+#[cfg(test)]
+mod ram_trim_tests;
 
 #[cfg(test)]
 mod tests {
