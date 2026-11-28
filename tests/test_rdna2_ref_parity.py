@@ -22,7 +22,7 @@ from emu.rdna2_exec import VOP2_CARRY, Wave
 from emu.rdna2_exec_cmp64 import COMPARE64
 from emu.rdna2_exec_dot import OPERATIONS as DOT_OPERATIONS
 from emu.rdna2_exec_f16 import OPERATIONS as F16_OPERATIONS
-from emu.rdna2_exec_int16 import PACKED
+from emu.rdna2_exec_int16 import PACKED, VOP3 as INT16_VOP3
 from emu.rdna2_exec_pkf16 import PACKED_F16, VOP3P as PKF16_VOP3P
 from emu.rdna2_exec_memory import PAGE
 from emu.rdna2_exec_movrel import SCALAR as MOVREL_SCALAR, VECTOR as MOVREL_VECTOR
@@ -342,6 +342,7 @@ def random_program(rng):
             or name in WIDE_GENERIC
             or name in MOVREL_VECTOR
             or name in F16_ARITH_NAMES
+            or name in INT16_VOP3
         ):
             names[family].append((opcode, name))
         if family == "VOP1" and (name in WIDE_GENERIC or name in MOVREL_VECTOR):
@@ -450,8 +451,10 @@ def vop3_words(rng, opcode, name):
     if name in COMPARE64 and not name.endswith("class_f32"):
         pool = [code for code in OPERANDS if code != LITERAL] + list(range(256, 511))
     sources = [rng.choice(OPERANDS + pool) for _ in range(3)]
-    # The SAD and f16 forms refuse unsupported modifiers: most of them get none, so the executed path is covered too.
-    plain = (name in SAD_NAMES or name in MOVREL_VECTOR or name in F16_ARITH_NAMES) and rng.random() < 0.7
+    # The SAD, f16 and 16-bit integer forms refuse unsupported modifiers: most of them get none, so the executed
+    # path is covered too.
+    plain = (name in SAD_NAMES or name in MOVREL_VECTOR or name in F16_ARITH_NAMES or name in INT16_VOP3) and (
+        rng.random() < 0.7)
     if name in MOVREL_VECTOR:
         sources[0] = rng.randrange(256, 511)
     abs_bits = 0 if plain else rng.randrange(8)
