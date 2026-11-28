@@ -26,7 +26,9 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 16;
+/// Version 17: main's version 16 plus constant `v_cmp_f`/`v_cmp_tru` float compares and DPP
+/// source lanes off in EXEC (#456).
+pub const TRANSLATOR_VERSION: u32 = 17;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
