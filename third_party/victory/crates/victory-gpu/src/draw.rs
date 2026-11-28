@@ -383,9 +383,13 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+///
+/// An opted-in driver watcher disables windows for the rest of the run
+/// after the first matching event. Batches and per-call clamps are unchanged.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+        && !crate::drvwatch::tripped()
 }
 
 /// Whether indirect executions whose arguments or count lie in title memory
