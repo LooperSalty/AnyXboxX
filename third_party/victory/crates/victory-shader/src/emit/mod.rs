@@ -1,7 +1,6 @@
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
-//! Paired compute waves use half the console thread count. Other compute
-//! shaders keep the console's thread-group size; one that depends
+//! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
 //!
@@ -125,7 +124,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_raw, raw_views, set_raw_views, bindless_feedback, feedback_slot, set_bindless_feedback, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -157,6 +156,14 @@ pub fn loop_limit() -> u32 {
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether pixel shaders that request early depth testing can use the host's
+/// early depth-stencil test. Off unless `VICTORY_EARLY_DEPTH=1`; the shader
+/// cache keys on this setting.
+pub fn early_depth_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -221,8 +228,18 @@ pub fn builder_bounds() -> bool {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.get() {
+        return passes;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`shader_opt`].
+    pub(super) static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -299,9 +316,12 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
+    // (Neptune) Bindless usage feedback changes every shader that takes a texture from the heap.
+    if shader::bindless_feedback() { out.extend_from_slice(b"bindless-feedback-v1"); }
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(wave_pairs_on()));
     out
 }
 
@@ -462,8 +482,13 @@ pub fn emit_with_retries(
     }
 }
 
-/// A nonempty list scopes the explicit wave64 fallback to shader log hashes.
-fn wave_wide_hash_matches(list: Option<&std::ffi::OsStr>, input: &[u8]) -> bool {
+thread_local! {
+    /// [`with_wave_pairs`]'s choice, for this thread's translations.
+    static WAVE_PAIRS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a nonempty list of shader log hashes names this container (`VICTORY_WAVE_PAIRS_ONLY`).
+fn container_listed(list: Option<&std::ffi::OsStr>, input: &[u8]) -> bool {
     let Some(list) = list.filter(|s| !s.is_empty()) else {
         return true;
     };
@@ -472,6 +497,156 @@ fn wave_wide_hash_matches(list: Option<&std::ffi::OsStr>, input: &[u8]) -> bool 
     };
     let hash = blake3::hash(input).to_hex();
     list.split(',').any(|name| name.trim().eq_ignore_ascii_case(&hash[..16]))
+}
+
+/// Shaders whose wave-wide form was exercised by the NVIDIA launcher profile.
+const DEFAULT_WAVE_WIDE_HASHES: [&str; 4] = [
+    "6f225b641c5b0708",
+    "5dc3b25986622949",
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+];
+
+fn wave_wide_hash_matches(list: &std::ffi::OsStr, hash: &str) -> bool {
+    list.to_str().is_some_and(|list| {
+        list.split(',').any(|name| name.trim().eq_ignore_ascii_case(hash))
+    })
+}
+
+/// Per-container override of the global wave-wide setting.
+fn wave_wide_override(
+    setting: Option<&std::ffi::OsStr>,
+    list: Option<&std::ffi::OsStr>,
+    input: &[u8],
+) -> Option<bool> {
+    let list = list.filter(|list| !list.is_empty());
+    match setting {
+        None => {
+            let digest = blake3::hash(input).to_hex();
+            let hash = &digest[..16];
+            (DEFAULT_WAVE_WIDE_HASHES.contains(&hash)
+                || list.is_some_and(|list| wave_wide_hash_matches(list, hash)))
+            .then_some(true)
+        }
+        Some(value) if value == "1" => {
+            let list = list?;
+            let digest = blake3::hash(input).to_hex();
+            (!wave_wide_hash_matches(list, &digest[..16])).then_some(false)
+        }
+        Some(_) => None,
+    }
+}
+
+/// Changes the cache key only where the container's wave-wide policy differs
+/// from the global setting. The fallback is only used on a 32-lane host.
+pub fn wave_wide_cache_override(input: &[u8]) -> Option<bool> {
+    if lower::host_max_wave() != 32 {
+        return None;
+    }
+    wave_wide_override(
+        std::env::var_os("VICTORY_WAVE_WIDE").as_deref(),
+        std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(),
+        input,
+    )
+}
+
+/// Returns whether the wave-wide path and the driver loop are allowed, respectively.
+fn wave_wide_routes(
+    setting: Option<&std::ffi::OsStr>,
+    list: Option<&std::ffi::OsStr>,
+    input: &[u8],
+    scene_kernel: bool,
+) -> (bool, bool) {
+    let picked = wave_wide_override(setting, list, input);
+    match setting {
+        None => (picked.unwrap_or(scene_kernel), picked.is_none()),
+        Some(value) if value == "1" => {
+            let enabled = picked.unwrap_or(true);
+            (enabled, !enabled)
+        }
+        Some(_) => (false, false),
+    }
+}
+
+/// Whether `VICTORY_WAVE_PAIRS_ONLY` (16-hex-digit shader hashes as the log names them, comma
+/// separated; unset or empty: none) names this container: it is tried in the paired wave64
+/// form first (fxceless/victory-fork #1397; for 5dc3b25986622949 and 6f225b641c5b0708).
+fn wave_pairs_listed(input: &[u8]) -> bool {
+    match std::env::var_os("VICTORY_WAVE_PAIRS_ONLY") {
+        Some(list) if list == "none" || list == "0" => false,
+        Some(list) if !list.is_empty() => container_listed(Some(&list), input),
+        _ => paired_by_default(input),
+    }
+}
+
+/// The compute programs that take the paired wave64 form unless `VICTORY_WAVE_PAIRS_ONLY`
+/// names others (`none`: no program). On hosts of 32-lane waves these programs' wave-wide
+/// sums, first-lane reads and LDS shared within a console wave are exact only in the paired
+/// form; the other forms left the picture visibly wrong, each checked in game:
+/// - the shadow mask, `CS_ShadowRenderTiled*` (18 programs): whole 16x16 tiles black or lit
+///   (stair-stepped shadows on the ground and squares on characters);
+/// - the water's transmission volumetrics, `CS_TransmissionVolumetrics_Tiled`,
+///   `_Tiled_LocalLights`, `_GenerateTiles` and `_Submerged`: dark blocks on open water and a broken view under
+///   water;
+/// - the atmospheric diffusion and its depth scan, `CS_GatherDiffusion`, `CS_ScanMip0..3`, with
+///   `CS_DeferredFallbacksAlpha_SkyProbe` and `CS_TemporalResolve2_Opaque_FrameStatistics`: a
+///   halo around dark silhouettes against the sky.
+///
+/// A timing run on an RTX 4090 measured about 0.1 ms per frame for the first 28 programs.
+const DEFAULT_WAVE_PAIRS_HASHES: [&str; 29] = [
+    // shadow mask
+    "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
+    "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
+    "804b342cb4b9d1e9", "922e1d0ee1e19a85", "ab5455fc6abb804f", "abd7a22106898c66",
+    "b4b0427232707598", "be6ce5d849d51127", "ce79e9eba7ae0348", "d7db57731ada919b",
+    "f133e35efed2a48a", "fa0bd10a35bfef3c",
+    // water
+    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6", "1aa247ed3653b616",
+    // diffusion / sky
+    "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
+    "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
+];
+
+/// Whether `input` is one of [`DEFAULT_WAVE_PAIRS_HASHES`].
+fn paired_by_default(input: &[u8]) -> bool {
+    let digest = blake3::hash(input).to_hex();
+    DEFAULT_WAVE_PAIRS_HASHES.contains(&&digest[..16])
+}
+
+thread_local! {
+    /// The program being translated is paired by default ([`paired_by_default`]): its FP32
+    /// reductions replay with the confirmed guest mode unless `VICTORY_WAVE_PAIRS_FP32` says
+    /// otherwise (`lower::paired_fp32`).
+    static PAIRED_BY_DEFAULT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`PAIRED_BY_DEFAULT_HERE`].
+pub(crate) fn paired_by_default_here() -> bool {
+    PAIRED_BY_DEFAULT_HERE.get()
+}
+
+/// Translations inside `f` on this thread try the paired wave64 form first when `on`.
+pub fn with_wave_pairs<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAVE_PAIRS_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WAVE_PAIRS_HERE.replace(on));
+    f()
+}
+
+#[cfg(test)]
+#[test]
+fn listed_wave_pairs_scope_is_restored() {
+    assert!(!WAVE_PAIRS_HERE.get());
+    with_wave_pairs(true, || {
+        assert!(WAVE_PAIRS_HERE.get());
+        with_wave_pairs(false, || assert!(!WAVE_PAIRS_HERE.get()));
+        assert!(WAVE_PAIRS_HERE.get());
+    });
+    assert!(!WAVE_PAIRS_HERE.get());
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -483,31 +658,27 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let fallbacks = WaveFallbacks {
-        loose_lds: std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0"),
-        paired: std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"),
-    };
-    emit_forms(c, native, p, st, io, res, fallbacks)
-}
-
-struct WaveFallbacks {
-    loose_lds: bool,
-    paired: bool,
-}
-
-fn emit_forms(
-    c: &Container,
-    native: &NativeProgram,
-    p: &ir::Program,
-    st: &structure::Structured,
-    io: &io::Io,
-    res: &resource::Resources,
-    fallbacks: WaveFallbacks,
-) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    let wave32_compute =
+        native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    let listed = WAVE_PAIRS_HERE.get() || wave_pairs_listed(c.input);
+    if listed && wave32_compute {
+        let by_default = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY").is_none() && paired_by_default(c.input);
+        let was = PAIRED_BY_DEFAULT_HERE.replace(by_default);
+        let tried = paired(c, native, p);
+        PAIRED_BY_DEFAULT_HERE.set(was);
+        match tried {
+            Ok((shader, Some(32))) => {
+                eprintln!("WAVE64-PAIRS-ONLY translated with paired Wave64");
+                return Ok(shader);
+            }
+            Ok((_, wave)) => eprintln!("WAVE64-PAIRS-ONLY unexpected wave {wave:?}; falling back"),
+            Err(e) => eprintln!("WAVE64-PAIRS-ONLY refused: {e}; falling back"),
+        }
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
-    let mut retry_failure = None;
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -516,19 +687,34 @@ fn emit_forms(
     let stuck = match &original {
         Ok((_, wave)) => *wave == Some(64),
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
-        Err(ShaderError::Wave64Lowering(_)) => true,
         Err(_) => false,
     };
+    let pairs_on = wave_pairs_on() && !listed;
+    if wave32_compute
+        && pairs_on
+        && !stuck
+        && (matches!(native.io, crate::native::StageIo::Cs(cs) if cs.lds_bytes() > 0)
+            || lower::crosses_halves(p, st)
+                && (original.is_err() || lower::wave_local(p, st).is_err()))
+    {
+        let again = paired(c, native, p);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired Wave64: {e}"),
+            }
+        }
+        if let Ok((shader, Some(32))) = again {
+            return Ok(shader);
+        }
+    }
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if stuck && wave32_compute {
         // `VICTORY_WAVE_WHY` must stay diagnostic-only (excluded from shader cache key in build.rs).
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-        let mut report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
-            if let Err(e) = r && !matches!(e, ShaderError::Wave64Lowering(_)) {
-                retry_failure = Some(format!("{what}: {e}"));
-            }
+        let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
                     Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
@@ -606,12 +792,12 @@ fn emit_forms(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
+        // The full fallback is restricted to selected shaders by default: this form
+        // puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        // A supplied VICTORY_WAVE_WIDE_ONLY scopes the explicit opt-in to those containers.
+        // VICTORY_WAVE_WIDE_ONLY selects additional containers, or limits an explicit opt-in.
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
@@ -621,14 +807,16 @@ fn emit_forms(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| {
-            v == "1"
-                && wave_wide_hash_matches(std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(), c.input)
-        });
+        let (wide_on, driver_loop_allowed) = wave_wide_routes(
+            wide_option.as_deref(),
+            std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(),
+            c.input,
+            scene_kernel,
+        );
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
-        let driver_loop = wide_option.is_none()
+        let driver_loop = driver_loop_allowed
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
@@ -637,6 +825,13 @@ fn emit_forms(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
+                if pairs_on {
+                    let again = paired(c, native, p);
+                    report("paired Wave64", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
@@ -718,7 +913,8 @@ fn emit_forms(
         // one lane-branch region, ordered between the two host waves only where the region
         // is entered and left (`loose_lds::with`, approximate). A 32-lane host refuses
         // the 64-lane form outright, which drops every dispatch of the program.
-        if fallbacks.loose_lds && !strict {
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
+        if loose_on && !strict {
             let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
             for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
                 if let Some((p, st, io, res)) = f {
@@ -755,42 +951,37 @@ fn emit_forms(
             // `VICTORY_WAVE_WHY` must stay diagnostic-only (excluded from shader cache key in build.rs).
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
-                Ok(_) | Err(ShaderError::Wave64Lowering(_)) => again,
+                Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if wave == Some(64) && lower::host_max_wave() == 32 {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "no wave32 lowering for this wave64 program",
+            })
+        } else {
+            Ok(shader)
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
-    if !matches!(original, Err(ShaderError::Unsupported { .. } | ShaderError::Wave64Lowering(_))) {
+    if !matches!(original, Err(ShaderError::Unsupported { .. })) {
         return original;
     }
     let edges = threading::constant_edges(p, st);
-    let result = if edges.is_empty() {
-        original
-    } else {
-        let threaded = ir::thread_edges(p, &edges)?;
-        let st = structure::structure(&threaded)?;
-        let io = io::raise(&threaded, native)?;
-        let res = resource::track(&threaded, &native.layout, native.stage, Some(&st))?;
-        emit_program(c, native, &threaded, &st, &io, &res).map(|(shader, _)| shader)
-    };
-    // Keep every successful translation. Only a compute program still requiring
-    // 64 host lanes can opt into two console lanes per host thread.
-    if let Err(ShaderError::Wave64Lowering(mut reason)) = result {
-        if let Some(retry) = retry_failure {
-            reason.push_str(&format!("; {retry}"));
-        }
-        if native.stage == HwStage::Cs && native.wave64 && fallbacks.paired {
-            return paired(c, native, p, io, res)
-                .map(|(shader, _)| shader)
-                .map_err(|e| ShaderError::Wave64Lowering(format!("{reason}; paired lanes: {e}")));
-        }
-        return Err(ShaderError::Wave64Lowering(reason));
+    if edges.is_empty() {
+        return original;
     }
-    result
+    let p = ir::thread_edges(p, &edges)?;
+    let st = structure::structure(&p)?;
+    let io = io::raise(&p, native)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -835,7 +1026,7 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Err(ShaderError::Wave64Lowering(_))) && !needs.is_empty();
+            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
             if why {
                 let order = ir::reverse_postorder(&p.blocks);
@@ -857,7 +1048,7 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        let more: Vec<usize> = lower::branches_around_with_loop_exits(&st, &needs, native.wave64 && lower::host_max_wave() == 32 && lower::loop_exits_on())
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))
@@ -896,25 +1087,15 @@ fn widen(
     }
 }
 
-/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form
-/// ([`lower::with_paired_lanes`]): each console wave run by one host wave of 32 lanes, each
-/// thread two of its lanes, with every per-lane branch taken by the whole wave as the console
-/// takes it ([`structure::structure_wide`]), so that a host wave's threads go the same way and
-/// EXEC stays each lane's guard. The program's barriers are reached by whole host waves where
-/// the console's waves reach them; the only barriers added are on entry, before the program,
-/// where a group of several console waves numbers its waves (`Lower::wave_base`). A thread
-/// group whose console waves are not full would need the lanes past its end kept out of every
-/// effect: refused.
-/// Descriptors and addresses stay those traced on the lanes' own paths (`res`, as for every
-/// other form): the per-lane form rests on a lane that reads a scalar after a join having
-/// come the way the wave did, and knowing less of a lane's way the wave-wide form would miss
-/// some of them (a sampler set in a skip that only a wave with no lane left for it skips).
+fn wave_pairs_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
+}
+
+// Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
 fn paired(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
-    io: &io::Io,
-    res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let crate::native::StageIo::Cs(cs) = native.io else {
         return Err(ShaderError::Unsupported {
@@ -922,13 +1103,52 @@ fn paired(
             what: "paired lanes outside compute",
         });
     };
-    if cs.lds_bytes() > 32 * 1024 {
-        return Err(ShaderError::Unsupported { offset: 0, what: "paired lanes with more than 32 KiB of LDS" });
+    if crate::spill::is_spilled(native) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 for spilled DispatchX programs is not validated",
+        });
     }
-    if cs.threads.contains(&0) || !cs.threads.iter().product::<u32>().is_multiple_of(64) {
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || threads % 64 != 0 {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 requires a single-entry wave prologue",
+        });
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 exceeds the compute group shared-memory limit",
+        });
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    if accesses_lds
+        && (lds == 0 || insts().filter(|i| lower::accesses_lds(i)).any(|i| {
+            !lower::supports_paired_lds(i.name())
+        }))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an LDS operation not supported by paired Wave64",
+        });
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // Independently progressing waves cannot rendezvous after a divergent exit.
+    if (threads > 64 && p.blocks.len() > 1 && waits)
+        || (group_sync() == 0 && (threads > 64 || waits))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 would require an unavailable group rendezvous",
         });
     }
     // every per-lane branch the wave's; again while that leaves another branch per lane
@@ -947,7 +1167,9 @@ fn paired(
         }
         wide.extend(lanes);
     };
-    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -1033,12 +1255,6 @@ fn emit_program(
         prims,
         mesh_stride,
     })?;
-    if l.wave_size == Some(64) && lower::host_max_wave() == 32 {
-        let reason = l.wave64_refusal.unwrap_or_else(|| format!(
-            "{:?} requires WaveSize(64) on a host limited to 32 lanes", native.stage
-        ));
-        return Err(ShaderError::Wave64Lowering(reason));
-    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1232,11 +1448,40 @@ mod tests {
         let other = b"another compute container";
         let hash = blake3::hash(water).to_hex();
         let list = format!("invalid, {}", hash[..16].to_ascii_uppercase());
-        assert!(super::wave_wide_hash_matches(Some(OsStr::new(&list)), water));
-        assert!(!super::wave_wide_hash_matches(Some(OsStr::new(&list)), other));
-        assert!(!super::wave_wide_hash_matches(Some(OsStr::new("invalid")), water));
-        assert!(super::wave_wide_hash_matches(None, other));
-        assert!(super::wave_wide_hash_matches(Some(OsStr::new("")), other));
+        assert!(super::wave_wide_hash_matches(OsStr::new(&list), &hash[..16]));
+        let hash = blake3::hash(other).to_hex();
+        assert!(!super::wave_wide_hash_matches(OsStr::new(&list), &hash[..16]));
+        assert!(!super::wave_wide_hash_matches(OsStr::new("invalid"), &hash[..16]));
+    }
+
+    #[test]
+    fn wave_wide_allowlist_keeps_the_default_driver_loop_for_unlisted_shaders() {
+        use std::ffi::OsStr;
+
+        let listed = b"listed shader";
+        let unlisted = b"unlisted shader";
+        let hash = blake3::hash(listed).to_hex();
+        let allowlist = Some(OsStr::new(&hash[..16]));
+        let on = Some(OsStr::new("1"));
+        let off = Some(OsStr::new("0"));
+        let routes = super::wave_wide_routes;
+
+        assert_eq!(routes(None, allowlist, unlisted, false), (false, true));
+        assert_eq!(routes(None, allowlist, listed, false), (true, false));
+        assert_eq!(routes(None, allowlist, unlisted, true), (true, true));
+        assert_eq!(routes(on, allowlist, listed, false), (true, false));
+        assert_eq!(routes(on, allowlist, unlisted, false), (false, true));
+        assert_eq!(routes(on, None, unlisted, false), (true, false));
+        assert_eq!(routes(on, Some(OsStr::new("")), unlisted, false), (true, false));
+        assert_eq!(routes(off, allowlist, unlisted, false), (false, false));
+        assert_eq!(routes(off, allowlist, listed, true), (false, false));
+
+        let key = super::wave_wide_override;
+        assert_eq!(key(None, allowlist, listed), Some(true));
+        assert_eq!(key(None, allowlist, unlisted), key(None, None, unlisted));
+        assert_eq!(key(on, allowlist, listed), key(on, None, listed));
+        assert_eq!(key(on, allowlist, unlisted), Some(false));
+        assert_eq!(key(off, allowlist, listed), key(off, None, listed));
     }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
@@ -3450,3 +3695,6 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 }
+
+#[cfg(all(test, windows))]
+mod feedback_tests;
