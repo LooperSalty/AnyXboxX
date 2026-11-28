@@ -15,6 +15,12 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Opt-in switches accept only these explicit affirmative values.
+#[cfg(windows)]
+pub(crate) fn opt_in(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "on"))
+}
+
 /// A switch that is on unless its variable is `0`, read once; with
 /// `VICTORY_AB` naming it (diagnostics builds, `crate::ab`), on and off while
 /// the title runs.
