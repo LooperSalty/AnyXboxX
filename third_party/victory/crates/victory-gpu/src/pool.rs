@@ -39,18 +39,37 @@ const STAGING_KEPT: usize = 8;
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// below the line ([`line_percent`], [`crate::host::keep_freed`]) those
+/// there and what fits under it ([`spares`]), else [`SPARE`]. Asked once a
+/// second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
-    SPARES.store(limit, Ordering::Relaxed);
+    let keep = crate::host::keep_freed() && !pressure;
+    let line = line_percent();
     let tick = now();
-    // A full pool can become idle while another subsystem needs the VRAM.
-    // A busy allocator observes the new limit on its next allocation or tick.
-    if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
-    }
+    // The count is made from the blocks that are empty now, under the pool's
+    // lock. With the lock busy below the line this look changes nothing: the
+    // count stays what the last look said, and the next one (a second on)
+    // makes it. (The count must not be taken for the empty blocks: fed back,
+    // it climbed by the room under the line at every busy look, up to
+    // [`SPARE_KEPT`].) Over the line or under pressure the count is SPARE
+    // whatever the pool holds, so a busy look still brings it down
+    // (akimfomin, #550); the allocator lets the blocks past it go at its next
+    // piece taken.
+    let limit = match TEXTURES.try_lock() {
+        Ok(mut pool) => {
+            let limit = spares_for(memory, keep, pool.empty(), line);
+            SPARES.store(limit, Ordering::Relaxed);
+            // A full pool can become idle while another subsystem needs the VRAM.
+            pool.reclaim(tick, limit, true);
+            limit
+        }
+        Err(_) if !below_line(memory, keep, line) => {
+            SPARES.store(SPARE, Ordering::Relaxed);
+            SPARE
+        }
+        Err(_) => SPARES.load(Ordering::Relaxed),
+    };
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
@@ -63,13 +82,44 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
 }
 
-fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    spares_for(memory, keep, crate::resource::room_percent().saturating_sub(5))
+/// The share of the card's budget, in percent, under which empty blocks past
+/// [`SPARE`] are kept: five under the texture queue's
+/// ([`crate::resource::room_percent`]; 80 with the 8 GB preset's 85).
+fn line_percent() -> u64 {
+    crate::resource::room_percent().saturating_sub(5)
 }
 
-fn spares_for(memory: Option<[u64; 4]>, keep: bool, target_pct: u64) -> usize {
+/// Whether `memory`'s use is under `line_pct` percent of its budget and
+/// empty blocks may be kept (`keep`, [`room`]'s).
+fn below_line(memory: Option<[u64; 4]>, keep: bool, line_pct: u64) -> bool {
+    matches!(memory, Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * u128::from(line_pct))
+}
+
+/// [`spares_for`] at [`line_percent`].
+#[cfg(test)]
+fn spares(memory: Option<[u64; 4]>, keep: bool, empty: usize) -> usize {
+    spares_for(memory, keep, empty, line_percent())
+}
+
+/// [`room`]'s count of empty blocks kept, with `empty` of them there now
+/// (in `memory`'s use already): below `line_pct` percent of the budget those
+/// and as many more as fit under that line, between [`SPARE`] and
+/// [`SPARE_KEPT`]; else [`SPARE`].
+///
+/// It was [`SPARE_KEPT`] (4 GiB) whatever the room under the line, and the
+/// blocks made ahead ([`ahead`], 12) take it at once: on an RTX 4060 Laptop
+/// (budget 7,188 MB) with the card at 80 % (5,772 MB) and the line then at
+/// 85 % (6,109 MB) they took it to 6,604 MB (91 %) within 16 textures
+/// (`tests::blocks_made_ahead_stay_under_the_line`); the next look let 10
+/// of them go again (5,964 MB), the one after made them anew (6,604 MB), and
+/// so on, 640 MB made and let go every two seconds.
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, empty: usize, line_pct: u64) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * u128::from(target_pct) => SPARE_KEPT,
+        Some([budget, used, ..]) if below_line(memory, keep, line_pct) => {
+            let line = (u128::from(budget) * u128::from(line_pct) / 100) as u64;
+            let fit = (line - used) / BLOCK;
+            (empty as u64 + fit).clamp(SPARE as u64, SPARE_KEPT as u64) as usize
+        }
         _ => SPARE,
     }
 }
@@ -341,6 +391,11 @@ impl<B: Clone> Pool<B> {
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+
+    /// Blocks with nothing in them.
+    fn empty(&self) -> usize {
+        self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
     }
 }
 
@@ -755,10 +810,11 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
-        assert_eq!(spares(None, true), SPARE);
+        const GB: u64 = 1 << 30;
+        assert_eq!(spares(Some([100 * GB, 10 * GB, 0, 0]), true, 0), SPARE_KEPT);
+        assert_eq!(spares(Some([100 * GB, line_percent() * GB, 0, 0]), true, 0), SPARE);
+        assert_eq!(spares(Some([100 * GB, 10 * GB, 0, 0]), false, 0), SPARE);
+        assert_eq!(spares(None, true, 0), SPARE);
     }
 
     #[test]
@@ -946,10 +1002,192 @@ mod tests {
     #[test]
     fn spares_scales_with_room_target() {
         let gib = 1 << 30;
-        assert_eq!(spares_for(Some([100 * gib, 84 * gib, 0, 0]), true, 85), SPARE_KEPT);
-        assert_eq!(spares_for(Some([100 * gib, 85 * gib, 0, 0]), true, 85), SPARE);
-        assert_eq!(spares_for(Some([100 * gib, 74 * gib, 0, 0]), true, 75), SPARE_KEPT);
-        assert_eq!(spares_for(Some([100 * gib, 75 * gib, 0, 0]), true, 75), SPARE);
-        assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), false, 85), SPARE);
+        // Far under the line: all of them; 1 GiB under it: the 16 blocks
+        // that fit; at the line: SPARE.
+        assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), true, 0, 85), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100 * gib, 84 * gib, 0, 0]), true, 0, 85), 16);
+        assert_eq!(spares_for(Some([100 * gib, 85 * gib, 0, 0]), true, 0, 85), SPARE);
+        assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), true, 0, 75), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100 * gib, 74 * gib, 0, 0]), true, 0, 75), 16);
+        assert_eq!(spares_for(Some([100 * gib, 75 * gib, 0, 0]), true, 0, 75), SPARE);
+        assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), false, 0, 85), SPARE);
+    }
+
+    const MB: u64 = 1 << 20;
+    /// The 8 GB card's budget (RTX 4060 Laptop).
+    const BUDGET_8GB: u64 = 7188 * MB;
+
+    /// `memory` on `budget` with `blocks` whole blocks (and half of one) under
+    /// the line this test process has ([`line_percent`]), or `blocks` over
+    /// it with a negative count.
+    fn by_the_line(budget: u64, blocks: i64) -> Option<[u64; 4]> {
+        let line = budget * line_percent() / 100;
+        let used = if blocks >= 0 { line - blocks as u64 * BLOCK - BLOCK / 2 } else { line + (-blocks) as u64 * BLOCK };
+        Some([budget, used, 0, 0])
+    }
+
+    /// Below the line, the empty blocks kept are those there and what fits
+    /// under it, not the 64 that were kept (and 12 made ahead).
+    #[test]
+    fn empty_blocks_kept_fit_under_the_line() {
+        let four_under = by_the_line(BUDGET_8GB, 4);
+        let [_, used, ..] = four_under.unwrap();
+        assert_eq!(spares(four_under, true, 0), 4);
+        assert_eq!(spares(four_under, true, 3), 7, "those there stay");
+        assert_eq!(spares(by_the_line(BUDGET_8GB, 0), true, 0), SPARE, "never under SPARE");
+        assert_eq!(spares(by_the_line(BUDGET_8GB, -1), true, 40), SPARE, "over the line");
+        assert!(spares(four_under, true, 0) as u64 * BLOCK + used <= BUDGET_8GB * line_percent() / 100);
+    }
+
+    /// What a look keeps below the line on this machine: the last count, or
+    /// [`SPARE`] when the PC's memory is short ([`crate::residency::pressured`])
+    /// or freed memory is not kept.
+    fn kept_below_line(last: usize) -> usize {
+        if crate::host::keep_freed() && !crate::residency::pressured() { last } else { SPARE }
+    }
+
+    /// Looks at `memory` with the pool's lock held (busy), the count 4 before
+    /// them: the count after each.
+    fn busy_looks(looks: &[Option<[u64; 4]>]) -> Vec<usize> {
+        let held = lock(&TEXTURES);
+        SPARES.store(4, Ordering::Relaxed);
+        let seen = looks
+            .iter()
+            .map(|&memory| {
+                room(memory);
+                SPARES.load(Ordering::Relaxed)
+            })
+            .collect();
+        drop(held);
+        seen
+    }
+
+    /// A look that finds the pool busy below the line changes nothing: the
+    /// count stays what the last look made it. (It took its own count for
+    /// the empty blocks, and added the room under the line again at every
+    /// busy look: 4, 8, 12, ... up to 64.)
+    #[test]
+    fn a_busy_pool_keeps_the_last_count() {
+        let seen = busy_looks(&[by_the_line(BUDGET_8GB, 4); 16]);
+        assert_eq!(seen, [kept_below_line(4); 16], "the count at each busy look");
+    }
+
+    /// A busy look over the line still brings the count down to [`SPARE`]:
+    /// that needs nothing of the pool (akimfomin, #550). Below the line 4, 4,
+    /// 4, 4, 4; after the card crosses it, 2, 2, 2, 2, 2.
+    #[test]
+    fn a_busy_pool_over_the_line_comes_down_to_spare() {
+        let (below, over) = (by_the_line(BUDGET_8GB, 4), by_the_line(BUDGET_8GB, -1));
+        let seen = busy_looks(&[below, below, below, below, below, over, over, over, over, over]);
+        let kept = kept_below_line(4);
+        assert_eq!(seen, [kept, kept, kept, kept, kept, SPARE, SPARE, SPARE, SPARE, SPARE], "the count at each busy look");
+    }
+
+    /// A 12 GB card, simulated (its budget as the system gave it in the
+    /// world on such a card, about 11,000 MB; no such card was at hand): what
+    /// the pool does below the line is what it did before (64 kept, 12 made
+    /// ahead) except within 768 MB of the line, where fewer blocks are made
+    /// ahead. The count itself is the old one while 4 GiB fit under the line;
+    /// closer than that it is smaller, but never under the empty blocks
+    /// there are, so no empty block is let go below the line that the old
+    /// count kept.
+    #[test]
+    fn a_12_gb_card_keeps_its_blocks_below_the_line() {
+        const AHEAD: usize = 12;
+        let budget = 11_000 * MB;
+        let pct = line_percent();
+        let line = budget * pct / 100;
+        // The rule before #550.
+        let old = |used: u64| if used * 100 < budget * pct { SPARE_KEPT } else { SPARE };
+        let mut first_count = None;
+        let mut first_ahead = None;
+        for used in (0..line).step_by(16 << 20) {
+            let fit = (line - used) / BLOCK;
+            for empty in [0usize, 3, 12, 40, 64] {
+                if used + empty as u64 * BLOCK > line {
+                    continue;
+                }
+                let new = spares(Some([budget, used, 0, 0]), true, empty);
+                assert!(new >= empty.min(old(used)), "{} MB in use, {empty} empty: {new}", used / MB);
+                if fit >= SPARE_KEPT as u64 {
+                    assert_eq!(new, old(used), "{} MB in use, {empty} empty", used / MB);
+                } else if empty == 0 {
+                    first_count.get_or_insert(used);
+                }
+                if fit >= AHEAD as u64 {
+                    assert_eq!(new.min(AHEAD), old(used).min(AHEAD), "{} MB in use, {empty} empty", used / MB);
+                } else if empty == 0 {
+                    first_ahead.get_or_insert(used);
+                }
+            }
+        }
+        println!(
+            "12 GB card (simulated, budget 11,000 MB, line {pct} % = {} MB): the count differs from {} MB in use, the blocks made ahead from {} MB",
+            line / MB,
+            first_count.unwrap_or(line) / MB,
+            first_ahead.unwrap_or(line) / MB
+        );
+    }
+
+    /// On the card: filled to 5 blocks under the line ([`line_percent`]) with
+    /// buffers of ours, the pool told the room as the host does once a second
+    /// and asked for 16 textures after each of four looks, the card stays
+    /// under the line, give or take a block. Before, the 12 blocks made ahead
+    /// took it well over.
+    /// `cargo test -p victory-gpu --lib --release -- --ignored --exact pool::tests::blocks_made_ahead_stay_under_the_line --nocapture`
+    #[test]
+    #[ignore = "fills the card to near the line: run alone"]
+    fn blocks_made_ahead_stay_under_the_line() {
+        let Some(host) = crate::host::host() else { return };
+        let Some([budget, start, ..]) = host.video_memory() else { return };
+        let line = budget * line_percent() / 100;
+        let target = line - 5 * BLOCK;
+        let mut filler = Vec::new();
+        while host.video_memory().unwrap()[1] + 64 * MB <= target {
+            filler.push(host.uav_buffer(64 * MB).expect("filler"));
+        }
+        let [_, filled, ..] = host.video_memory().unwrap();
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut textures = Vec::new();
+        let mut peak = 0;
+        for look in 0..4 {
+            room(host.video_memory());
+            let [_, told, ..] = host.video_memory().unwrap();
+            for _ in 0..16 {
+                // SAFETY: a valid description.
+                textures.extend(unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) });
+                peak = peak.max(host.video_memory().unwrap()[1]);
+            }
+            let [_, now, ..] = host.video_memory().unwrap();
+            println!(
+                "look {look}: {} MB in use when told, {} MB after 16 textures, {} empty blocks kept",
+                told / MB,
+                now / MB,
+                SPARES.load(Ordering::Relaxed)
+            );
+        }
+        println!(
+            "budget {} MB, at the start {} MB, filled to {} MB ({} %), with {} textures of 1 MiB the peak {} MB ({} %), {} MB in empty blocks, the line {} % = {} MB",
+            budget / MB,
+            start / MB,
+            filled / MB,
+            filled * 100 / budget,
+            textures.len(),
+            peak / MB,
+            peak * 100 / budget,
+            texture_room() / MB,
+            line_percent(),
+            line / MB
+        );
+        assert!(peak <= line + BLOCK, "{} MB over the line", (peak - line) / MB);
     }
 }
