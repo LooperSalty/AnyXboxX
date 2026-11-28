@@ -270,6 +270,34 @@ fn a_prebuilt_victory_has_nothing_to_build() {
     assert!(victory.build_command().is_none());
 }
 
+#[cfg(windows)]
+#[test]
+fn warm_runs_outside_the_callers_console_with_empty_stdin() {
+    use std::io::Read;
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+
+    const PROBE: &str = "ANYXBOXX_TEST_WARM_CHILD";
+    if std::env::var_os(PROBE).is_some() {
+        let mut pid = 0;
+        // SAFETY: pid provides one writable slot. A shared console returns a count above one.
+        assert!(unsafe { GetConsoleProcessList(&mut pid, 1) } <= 1);
+        assert_eq!(std::io::stdin().read(&mut [0]).unwrap(), 0);
+        // A distinctive exit code also checks that the child ran this exact test.
+        std::process::exit(23);
+    }
+
+    // Run this assertion in a harmless console executable in place of VIctory.
+    let mut probe = Command::new(std::env::current_exe().unwrap());
+    probe
+        .args(["--exact", std::thread::current().name().unwrap()])
+        .env(PROBE, "1")
+        .stdin(std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap());
+    assert!(matches!(
+        warm_or_fail(&mut probe),
+        Err(RunError::WarmFailed(23))
+    ));
+}
+
 #[test]
 fn a_located_victory_is_built_in_release_by_default_and_in_diag_on_request() {
     let repo = std::env::temp_dir().join(format!("anyxboxx-run-located-{}", std::process::id()));

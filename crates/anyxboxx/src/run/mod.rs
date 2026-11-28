@@ -167,6 +167,8 @@ pub enum RunError {
     NoArchive(String),
     #[error("victory warm failed (exit code {0}).")]
     WarmFailed(i32),
+    #[error("I/O error during victory warm: {0}")]
+    WarmIo(std::io::Error),
     #[error("cannot start {0}: {1}")]
     Spawn(String, std::io::Error),
 }
@@ -210,7 +212,11 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
 }
 
 fn warm_or_fail(command: &mut Command) -> Result<(), RunError> {
-    match status(command, "victory")? {
+    #[cfg(windows)]
+    let code = steps::warm_status(command)?;
+    #[cfg(not(windows))]
+    let code = status(command, "victory")?;
+    match code {
         0 => Ok(()),
         code => Err(RunError::WarmFailed(code)),
     }
