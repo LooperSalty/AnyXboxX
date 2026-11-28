@@ -27,5 +27,8 @@ victory-pe.workspace = true
 # GetLocalTime: the local-time stamp of the jour-j report folder, as Python's time.strftime.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 [lints]
 workspace = true
