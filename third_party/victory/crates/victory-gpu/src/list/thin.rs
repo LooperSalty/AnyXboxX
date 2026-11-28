@@ -40,6 +40,8 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
 
+pub(crate) mod timing;
+
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
 pub(crate) fn on() -> bool {
@@ -187,6 +189,7 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    submitted_at: AtomicU64,
 }
 
 #[derive(Default)]
@@ -212,6 +215,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            submitted_at: AtomicU64::new(0),
         }
     }
 
@@ -258,6 +262,12 @@ impl Recording {
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
+                if crate::framebook::on() {
+                    let at = self.submitted_at.load(Acquire);
+                    if at != 0 {
+                        crate::framebook::translated_after(crate::framebook::now_us().saturating_sub(at));
+                    }
+                }
                 self.done.store(true, Release);
                 self.moved.notify_all();
                 drop(inner);
@@ -348,11 +358,19 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .filter_map(|&l| {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+            if crate::framebook::on() && let Some(recording) = &front.recording {
+                // Keep the first submission if the title submits a list again.
+                let _ = recording.submitted_at.compare_exchange(0, crate::framebook::now_us().max(1), Release, Relaxed);
+            }
             front.close();
             front.submitted = true;
             front.recording.clone()
         })
         .collect()
+}
+
+pub(crate) fn translated_us() -> u64 {
+    STATS[1].load(Relaxed)
 }
 
 /// For the frame-rate line.
@@ -361,7 +379,9 @@ pub(crate) fn line(frames: f64) {
         crate::overlay::set_pool_off(crate::overlay::Pool::Thin);
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let s = crate::framebook::for_line(&STATS, &LAST).map(|n| n as f64 / frames);
+    timing::line(frames);
     // The overlay: the work of all threads over the frame's time.
     crate::overlay::set_pool(crate::overlay::Pool::Thin, s[1] / 1000.0, crate::overlay::frame_ms(), THREADS.load(Relaxed));
     tracing::info!(
@@ -738,6 +758,14 @@ extern "system" fn copy_texture_region_x(
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+    if timing::on() {
+        timing::stream(|| translate_stream::<true>(list, stream, left))
+    } else {
+        translate_stream::<false>(list, stream, left)
+    }
+}
+
+fn translate_stream<const TIMED: bool>(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
     while i < stream.len() {
@@ -751,6 +779,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && !matches!(op, CLOSE | RESET | UPLOAD | EXTERNAL) {
             continue;
         }
+        let _call = TIMED.then(|| timing::call(op));
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };

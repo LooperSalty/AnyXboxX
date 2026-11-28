@@ -37,7 +37,7 @@ struct Fence {
     value: AtomicU64,
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    waiters: Mutex<Vec<(u64, usize, Option<std::time::Instant>)>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -133,7 +133,7 @@ const NULL_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 fn wait_null_event(
     fence: &Fence,
     value: u64,
-    mut waiters: std::sync::MutexGuard<'_, Vec<(u64, usize)>>,
+    mut waiters: std::sync::MutexGuard<'_, Vec<(u64, usize, Option<std::time::Instant>)>>,
     timeout: std::time::Duration,
 ) -> HRESULT {
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -144,7 +144,7 @@ fn wait_null_event(
         Ok(handle) => handle,
         Err(error) => return error.code().0,
     };
-    waiters.push((value, handle.0 as usize));
+    waiters.push((value, handle.0 as usize, None));
     drop(waiters);
     // A queued signal may follow work that has not been submitted or settled yet.
     crate::queue::before_sync();
@@ -174,7 +174,7 @@ fn wait_null_event(
         }
     };
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    waiters.retain(|&(_, pending)| pending != handle.0 as usize);
+    waiters.retain(|&(_, pending, _)| pending != handle.0 as usize);
     // SAFETY: no signal can still use this event after unregistering it.
     let _ = unsafe { CloseHandle(handle) };
     result
@@ -197,7 +197,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(not(windows))]
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    #[cfg(windows)]
+    let asked = crate::framebook::on().then(std::time::Instant::now);
+    #[cfg(not(windows))]
+    let asked = None;
+    waiters.push((value, event as usize, asked));
     S_OK
 }
 
@@ -255,10 +259,14 @@ pub(crate) fn set(this: This, value: u64) {
     crate::timeline::told("a fence set", this as usize, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, _asked)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            #[cfg(windows)]
+            if let Some(asked) = _asked {
+                crate::framebook::title_event_waited(asked.elapsed().as_micros() as u64);
+            }
         }
         !reached
     });

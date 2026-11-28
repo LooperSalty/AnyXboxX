@@ -109,6 +109,14 @@ pub(super) trait Work: Send {
     /// Told just before [`Work::go`] of a submission: the highest mark of
     /// what it is made of and of the waits its queue went past.
     fn marked(&mut self, _mark: u64) {}
+    /// For the book of frames: what met `ask`, if it is met now.
+    fn met_by(_: &Self::Ask) -> Option<crate::framebook::Part> {
+        None
+    }
+    /// For the book of frames: `ask` in words.
+    fn said(_: &Self::Ask) -> String {
+        String::new()
+    }
 }
 
 struct Entry<W> {
@@ -266,27 +274,92 @@ impl<W: Work> Lane<W> {
         }
     }
 
+    /// What each queue has first, oldest first: what it asks (`None`: it is
+    /// free to run).
+    fn heads(state: &State<W>) -> Vec<Option<W::Ask>> {
+        let mut seen: Vec<usize> = Vec::new();
+        let mut heads = Vec::new();
+        for e in &state.items {
+            if !seen.contains(&e.queue) {
+                seen.push(e.queue);
+                heads.push(e.what.ask());
+            }
+        }
+        heads
+    }
+
+    /// For the book of frames: what ended a stretch of waiting with `heads`
+    /// first in the queues, if it has ended: the oldest of them that is met
+    /// now (lists translated, a memory value written or known to be, a
+    /// fence), or something free to run that came in.
+    fn ended_by(heads: &[Option<W::Ask>]) -> Option<crate::framebook::Part> {
+        heads.iter().find_map(|head| match head {
+            None => Some(crate::framebook::Part::Standing),
+            Some(ask) => W::met_by(ask),
+        })
+    }
+
     /// Looks at the line for as long as the process runs.
     fn serve(&self) -> ! {
+        use crate::framebook::{Part, add, on};
+        // For the book of frames: the waiting with entries in the line since
+        // the last look that found something to do, counted once what ended
+        // it is known ([`Lane::ended_by`]).
+        let book = on();
+        let mut waiting = Duration::ZERO;
+        // Long waits said in the log (the first few).
+        let mut said = 0;
         loop {
-            let (asked, limit) = {
+            let (asked, limit, heads) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    // For the book of frames: what it waits for.
+                    let waited = book.then(Instant::now);
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        if let Some(start) = waited {
+                            add(Part::Idle, start.elapsed().as_micros() as u64);
+                        }
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        if let Some(start) = waited {
+                            waiting += start.elapsed();
+                        }
                         if out.timed_out() {
                             break;
                         }
                     }
                 }
-                (state.asked, state.next)
+                let heads = if !waiting.is_zero() { Self::heads(&state) } else { Vec::new() };
+                (state.asked, state.next, heads)
             };
+            if !waiting.is_zero()
+                && let Some(part) = Self::ended_by(&heads)
+            {
+                add(part, waiting.as_micros() as u64);
+                if waiting >= Duration::from_millis(4) && said < 80 {
+                    said += 1;
+                    let what: Vec<String> =
+                        heads.iter().map(|h| h.as_ref().map_or_else(|| "free to run".to_string(), W::said)).collect();
+                    tracing::info!(
+                        "a wait of the line of {:.1} ms, ended by {} (VICTORY_FRAME_BOOK); the queues had first: {}",
+                        waiting.as_secs_f64() * 1e3,
+                        match part {
+                            Part::StandMemory => "a memory value written",
+                            Part::StandFlight => "a memory value a submission sent writes",
+                            Part::Translating => "lists translated",
+                            Part::Standing => "something free to run that came in, or a fence",
+                            _ => "?",
+                        },
+                        what.join("; ")
+                    );
+                }
+                waiting = Duration::ZERO;
+            }
             self.look(limit);
             let mut state = self.lock();
             state.served = state.served.max(asked);
@@ -468,6 +541,7 @@ enum Job {
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         super::Shown,
+        Option<(Instant, std::sync::mpsc::Receiver<u64>)>,
     ),
 }
 
@@ -555,6 +629,31 @@ impl Work for Job {
                 Job::Run(.., stamp) | Job::Joined(.., stamp) if *stamp > 0 => *stamp = (*stamp).max(mark),
                 _ => {}
             }
+        }
+    }
+
+    fn met_by(ask: &Ask) -> Option<crate::framebook::Part> {
+        use crate::framebook::Part;
+        match ask {
+            Ask::Value(wait) => {
+                if wait.met() {
+                    Some(Part::StandMemory)
+                } else if crate::host::late() && crate::host::late_met_known(wait) == Some(true) {
+                    Some(Part::StandFlight)
+                } else {
+                    None
+                }
+            }
+            Ask::Wait(fence, value) => (crate::fence::completed(fence.as_this()) >= *value).then_some(Part::Standing),
+            Ask::Lists(recordings) => recordings.iter().all(|r| r.done()).then_some(Part::Translating),
+        }
+    }
+
+    fn said(ask: &Ask) -> String {
+        match ask {
+            Ask::Value(wait) => format!("a memory value, {}", wait.said()),
+            Ask::Wait(fence, value) => format!("a fence {:p} for {value}", fence.as_this()),
+            Ask::Lists(recordings) => format!("{} lists being translated", recordings.len()),
         }
     }
 
@@ -657,6 +756,12 @@ impl Work for Job {
 
     fn go(self, forced: bool) {
         let began = Instant::now();
+        let part = match self {
+            Job::Run(..) | Job::Joined(..) => crate::framebook::Part::Send,
+            Job::Present(..) => crate::framebook::Part::Show,
+            _ => crate::framebook::Part::Other,
+        };
+        let mut presented = None;
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
             Job::Joined(..) => "the line: submissions joined",
@@ -683,6 +788,7 @@ impl Work for Job {
                     None => drop(lists),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
+                crate::framebook::add(crate::framebook::Part::Runs, 1);
             }
             Job::Joined(queue, lists, order, parts, signals, stamp) => {
                 let _ = queue;
@@ -696,6 +802,7 @@ impl Work for Job {
                 }
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
+                crate::framebook::add(crate::framebook::Part::Runs, 1 + parts.len() as u64);
                 for (fence, value) in signals {
                     if !crate::host::late_signal(fence.as_this(), value) {
                         crate::fence::set(fence.as_this(), value);
@@ -707,7 +814,7 @@ impl Work for Job {
                     crate::fence::set(fence.as_this(), value);
                 }
             }
-            Job::Present(texture, overlay, shown) => {
+            Job::Present(texture, overlay, shown, book) => {
                 if let Some((texture, state)) = texture {
                     // All title submissions in front of this present have been sent.
                     crate::streamline::latency::mark(|| shown.token.unwrap_or(0), crate::streamline::latency::Phase::Submitted);
@@ -718,14 +825,21 @@ impl Work for Job {
                         let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
                         (&ov.texture, st)
                     });
-                    super::show_planes(&texture.texture, state, over, shown);
+                    if super::show_planes(&texture.texture, state, over, shown) {
+                        presented = book;
+                    }
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
         }
         // (The mark was this submission's alone.)
         crate::port_journal::set_mark(0);
-        STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        let us = began.elapsed().as_micros() as u64;
+        STATS[BUSY].fetch_add(us, Relaxed);
+        crate::framebook::add(part, us);
+        if let Some((called, waited)) = presented {
+            crate::framebook::presented(called, Some(waited));
+        }
     }
 }
 
@@ -1009,17 +1123,27 @@ pub(super) fn present(
     texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     shown: super::Shown,
+    called: Option<Instant>,
 ) {
     // A display-only frame can reach PresentX without ExecuteCommandLists.
     // This is its first submission; simulation still ends on the title thread.
     crate::streamline::latency::mark(|| shown.token.unwrap_or(0), crate::streamline::latency::Phase::RenderSubmit);
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
+    let (book, timing) = called.map(|called| {
+        let (to, from) = std::sync::mpsc::channel();
+        ((called, from), to)
+    }).unzip();
+    LANE.push(this as usize, [Job::Present(texture, overlay, shown, book)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
-    STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    let us = began.elapsed().as_micros() as u64;
+    STATS[AT_PRESENT].fetch_add(us, Relaxed);
+    if let Some(to) = timing {
+        // A skipped or failed present drops its receiver.
+        let _ = to.send(us);
+    }
 }
 
 /// For the frame-rate line.
@@ -1097,6 +1221,10 @@ mod tests {
                 _ => None,
             }
         }
+        fn met_by(ask: &(usize, u64)) -> Option<crate::framebook::Part> {
+            Self::met(ask).then_some(crate::framebook::Part::Standing)
+        }
+
         fn met(ask: &(usize, u64)) -> bool {
             crate::fence::completed(ask.0 as This) >= ask.1
         }
@@ -1231,6 +1359,25 @@ mod tests {
     fn look(lane: &Lane<T>) {
         let limit = lane.lock().next;
         lane.look(limit);
+    }
+
+    /// The book of frames: a stretch of waiting ends with the oldest of the
+    /// queues' first entries that is met, or with one free to run.
+    #[test]
+    fn a_wait_ends_with_the_oldest_first_entry_met() {
+        let f = fence();
+        let lane = Lane::new();
+        lane.push(1, [T::Wait(f, 1)]);
+        lane.push(2, [T::Run("r", Default::default())]);
+        lane.push(1, [T::Run("behind", Default::default())]);
+        let heads = Lane::heads(&lane.lock());
+        // One per queue, oldest first; the run behind the wait is not first.
+        assert_eq!(heads, [Some((f, 1)), None]);
+        // The run (no ask here) is free; the wait is not met yet.
+        assert_eq!(Lane::<T>::ended_by(&heads[..1]), None);
+        crate::fence::set(f as This, 1);
+        assert!(Lane::<T>::ended_by(&heads[..1]).is_some());
+        assert!(Lane::<T>::ended_by(&[None]).is_some());
     }
 
     /// A queue's order is kept, a wait for another queue's signal holds only

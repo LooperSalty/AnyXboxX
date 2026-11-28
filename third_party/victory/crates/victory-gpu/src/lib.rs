@@ -44,6 +44,8 @@ mod faultbook;
 #[cfg(windows)]
 mod cores;
 #[cfg(windows)]
+mod framebook;
+#[cfg(windows)]
 mod cpucores;
 pub mod descriptor;
 #[cfg(windows)]
