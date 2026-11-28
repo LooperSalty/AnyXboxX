@@ -418,6 +418,14 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        Self::new_with_sampler_policy(shaders, g, super::library::allows_static_samplers)
+    }
+
+    pub(super) fn new_with_sampler_policy(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        allows_static_samplers: impl FnOnce(&crate::host::Host) -> bool,
+    ) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -587,6 +595,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        let samplers_settled = super::sampler_order::before(&host.device, &samplers);
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -594,7 +603,8 @@ impl HostPipeline {
                 return None;
             }
         };
-        let use_library = samplers.is_empty() || super::library::allows_static_samplers(host);
+        // A clean replay lets this pipeline use the library even on NVIDIA.
+        let use_library = samplers.is_empty() || allows_static_samplers(host) || samplers_settled;
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
