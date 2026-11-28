@@ -1,6 +1,5 @@
-﻿//! Two presented planes as one image: the console's display puts the second
-//! (the interface) over the first (the scene), each scaled to the screen.
-//! Grand Theft Auto VI presents so on Series S.
+//! Two presented planes as one image: the interface goes over the scene,
+//! with each plane scaled to the screen.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -205,6 +204,7 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
             return Err(e);
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        crate::pipeline::sampler_order::before(device, std::slice::from_ref(&sampler));
         device.CreateRootSignature(
             0,
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),

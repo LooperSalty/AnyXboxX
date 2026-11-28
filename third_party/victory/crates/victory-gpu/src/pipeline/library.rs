@@ -721,14 +721,27 @@ pub(crate) fn save(now: bool) {
             return;
         }
     }
-    tracing::info!(
-        bytes,
-        early = used.len(),
-        made = MADE.load(Ordering::Relaxed),
-        loaded = LOADED.load(Ordering::Relaxed),
-        started_early = EARLY.load(Ordering::Relaxed),
-        "host pipeline library saved"
-    );
+    if super::sampler_order::enabled() {
+        tracing::info!(
+            bytes,
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            loaded = LOADED.load(Ordering::Relaxed),
+            started_early = EARLY.load(Ordering::Relaxed),
+            slow_this_run = SLOW_NOW.load(Ordering::Relaxed),
+            new_static_samplers = super::sampler_order::NEW.load(Ordering::Relaxed),
+            "host pipeline library saved"
+        );
+    } else {
+        tracing::info!(
+            bytes,
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            loaded = LOADED.load(Ordering::Relaxed),
+            started_early = EARLY.load(Ordering::Relaxed),
+            "host pipeline library saved"
+        );
+    }
 }
 
 /// Publish a snapshot before clearing the number of unsaved pipelines.
@@ -826,6 +839,8 @@ const SLOW_FILE: &str = "slow-pipelines.txt";
 /// A pipeline that takes this long is one ([`slow`]).
 pub(crate) const SLOW_MS: u64 = 1000;
 static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+/// Pipeline builds taking at least [`SLOW_MS`] in this run, when sampler ordering is enabled.
+pub(super) static SLOW_NOW: AtomicU64 = AtomicU64::new(0);
 
 fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
@@ -852,6 +867,9 @@ pub(crate) fn slow(key: &str) -> bool {
 pub(crate) fn note_time(key: &str, ms: u64) {
     if ms < SLOW_MS {
         return;
+    }
+    if super::sampler_order::enabled() {
+        SLOW_NOW.fetch_add(1, Ordering::Relaxed);
     }
     let mut slow = slow_ones();
     let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
