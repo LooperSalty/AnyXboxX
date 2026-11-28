@@ -14,6 +14,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+#[path = "host_heap_evict.rs"]
+mod host_heap_evict;
+
 /// Distinguishes host heaps even when a title heap address is reused.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -178,6 +181,8 @@ pub(crate) struct HostHeap {
     /// Slots still showing a superseded record, changed under `made`'s lock.
     keeping: Mutex<std::collections::HashMap<u32, u64>>,
     keeping_slots: Slots,
+    /// Empty unless shader-heap eviction is enabled for this view heap.
+    last_used_frame: Box<[AtomicU64]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1054,6 +1059,8 @@ struct Waiting {
     /// Which write of the queue put it here: the pass hands it back with
     /// what it did, so a slot written again meanwhile stays as written.
     write: u64,
+    /// A cold view was unmade: fresh writes get their turn before refills.
+    eviction_retry: bool,
     /// Looks in a row that found nothing to upload (its memory not mapped,
     /// or no more of it than at the last upload).
     looks: u8,
@@ -1152,9 +1159,9 @@ impl Queued {
     }
 }
 
-/// Slots due of a [`TextureQueue`], of those looked at before and of the
-/// others: the frame each was written in, the slot and its write's number.
-type Due = [Vec<(u64, u32, u64)>; 2];
+/// Due slots: looked at before, fresh writes, then eviction refills. For
+/// each slot: the frame written, the index and the write's number.
+type Due = [Vec<(u64, u32, u64)>; 3];
 
 impl TextureQueue {
     fn next_revision(&mut self) -> u64 {
@@ -1200,7 +1207,7 @@ impl TextureQueue {
         }
         let write = self.next_revision();
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, eviction_retry: false, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
     }
 
     /// What a slot written again keeps of its wait.
@@ -1253,7 +1260,8 @@ impl TextureQueue {
                 counts[1] += 1;
                 counts[4] = counts[4].max(frame.saturating_sub(w.written));
                 if collect_slots {
-                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+                    let bucket = if w.looks != 0 || w.mapped != 0 { 0 } else { 1 + usize::from(w.eviction_retry) };
+                    due[bucket].push((w.written, index, w.write));
                 }
             }
         }
@@ -1262,11 +1270,12 @@ impl TextureQueue {
 
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
-    fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
+    fn in_order([mut again, mut fresh, mut refills]: Due, max: usize) -> Vec<(u32, u64)> {
+        use std::cmp::Reverse;
+        let newest_first = |&(_, _, write): &(u64, u32, u64)| Reverse(write);
+        again.sort_unstable_by_key(newest_first);
+        fresh.sort_unstable_by_key(newest_first);
+        refills.sort_unstable_by_key(|&(_, _, write)| write);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
@@ -1277,6 +1286,7 @@ impl TextureQueue {
                 order.push((fresh[old].1, fresh[old].2));
             }
         }
+        order.extend(refills.into_iter().take(max.saturating_sub(order.len())).map(|(_, index, write)| (index, write)));
         order.truncate(max);
         order
     }
@@ -1395,7 +1405,7 @@ impl TextureQueue {
         let write = self.next_revision();
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, eviction_retry: false, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1938,6 +1948,11 @@ impl HostHeap {
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             keeping: Mutex::default(),
             keeping_slots: Slots::new(if sampler || !kept_views_yield() { 0 } else { count as usize }),
+            last_used_frame: if !sampler && crate::texture_heap_evict::enabled() {
+                (0..count + extra).map(|_| AtomicU64::new(0)).collect()
+            } else {
+                Box::default()
+            },
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3138,6 +3153,7 @@ impl HostHeap {
         let Some(stamp) = self.tabled.get(index as usize) else {
             return;
         };
+        self.note_slot_used(index, frame, true);
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         let old = stamp.load(Relaxed);
         if !read {
@@ -3524,6 +3540,9 @@ impl HostHeap {
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if resource.is_some() && !self.last_used_frame.is_empty() {
+                self.note_slot_used(index, crate::frame::current(), false);
+            }
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
@@ -3890,6 +3909,9 @@ impl HostHeap {
                 );
             }
             return None;
+        }
+        if for_draw && !self.last_used_frame.is_empty() {
+            self.note_slot_used(index, crate::frame::current(), true);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -5823,6 +5845,10 @@ mod alpha_view_tests;
 #[cfg(test)]
 #[path = "kept_yield_tests.rs"]
 mod kept_yield_tests;
+
+#[cfg(test)]
+#[path = "heap_evict_tests.rs"]
+pub(crate) mod heap_evict_tests;
 
 #[cfg(test)]
 mod tests {

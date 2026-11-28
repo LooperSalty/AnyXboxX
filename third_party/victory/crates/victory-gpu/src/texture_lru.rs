@@ -1,13 +1,13 @@
-//! Pressure recovery for reloadable host textures. Live descriptors and lists
-//! keep their references; only superseded views can yield at an idle submit.
+//! Pressure recovery for reloadable host textures. Idle submits may opt in
+//! to yielding superseded views or unmaking cold shader-heap aliases.
 
-use super::{
-    HostTexture, KINDS, Resource, ResourceDesc, card_use, fills, footprint, room_percent,
-    texture_floor_bytes, textures,
-};
-use crate::{descriptor, frame, host, object::This, texture, tiles};
-use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock};
+use super::{KINDS, Resource, ResourceDesc, card_use, footprint, room_percent, texture_floor_bytes, textures};
+use crate::{descriptor, frame, host, object::This, texture_heap_evict, tiles};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
+
+#[path = "texture_evict_scan.rs"]
+pub(crate) mod scan;
 
 const ROOM_TARGET: u64 = 32 << 20;
 const SUBMIT_TARGET: u64 = 64 << 20;
@@ -193,7 +193,7 @@ pub(crate) fn evict_if_pressured(h: &host::Host) {
     let yielded = descriptor::yield_kept_views();
     let target = pending.map_or(SUBMIT_TARGET, |request| request.bytes.max(SUBMIT_TARGET));
     let outcome = if lru {
-        evict_lru_textures(target, completed, EvictPolicy::default())
+        scan::evict(target, completed, EvictPolicy::default(), texture_heap_evict::enabled())
     } else {
         EvictOutcome::default()
     };
@@ -297,95 +297,9 @@ pub(super) struct EvictOutcome {
     texture: Option<TextureInfo>,
 }
 
-/// Two passes, with the current copy and every guard rechecked before taking it.
-/// Evicted bytes are detached bytes, not a claim that retirement or DXGI's
-/// accounting has already caught up.
+/// Opportunistic LRU must never rewrite a shader heap, even with Tier 3 enabled.
 fn evict_lru_textures(target: u64, completed: u64, policy: EvictPolicy) -> EvictOutcome {
-    if target == 0 || policy.max_victims == 0 || completed == u64::MAX {
-        return EvictOutcome::default();
-    }
-    let mut outcome = EvictOutcome::default();
-    let mut candidates = Vec::new();
-    {
-        let all = textures();
-        for &at in all.iter() {
-            // SAFETY: a resource leaves the table under this lock before being freed.
-            let r = unsafe { &*(at as *const Resource) };
-            if !fills(&r.desc) || r.host.host_written.load(Acquire) {
-                continue;
-            }
-            // Allocation can request LRU under a descriptor slot lock. Do not
-            // wait on another texture being made during an opportunistic scan.
-            let Ok(made) = r.host.made.try_lock() else { continue };
-            let Some((copy, _)) = made.as_ref() else { continue };
-            let bytes = copy.card_bytes();
-            outcome.texture.get_or_insert_with(|| TextureInfo::new(at, &r.desc, Some(bytes)));
-            if !copy.fence_complete(completed) || Arc::strong_count(copy) != 1 {
-                outcome.skipped_in_flight += 1;
-            } else if bytes != 0 && idle(r, copy, policy) && host::references(&copy.texture) == 1 {
-                let frame = copy.last_used_frame.load(Relaxed);
-                let used = r.host.used.load(Relaxed) & 0xffff_ffff;
-                candidates.push((frame, used, std::cmp::Reverse(bytes), at, copy.serial));
-            }
-        }
-    }
-    candidates.sort_unstable();
-    let mut retired = Vec::new();
-    let mut staged = Vec::new();
-    {
-        let all = textures();
-        for (_, _, _, at, serial) in candidates {
-            if outcome.evicted_count as usize == policy.max_victims || outcome.evicted_bytes >= target {
-                break;
-            }
-            if !all.contains(&at) {
-                continue;
-            }
-            // SAFETY: checked live under the table lock; serial guards address reuse.
-            let r = unsafe { &*(at as *const Resource) };
-            let Ok(mut made) = r.host.made.try_lock() else { continue };
-            let Some((copy, _)) = made.as_ref() else { continue };
-            if copy.serial != serial
-                || r.host.host_written.load(Acquire)
-                || !copy.fence_complete(completed)
-                || Arc::strong_count(copy) != 1
-                || !idle(r, copy, policy)
-                || host::references(&copy.texture) != 1
-            {
-                continue;
-            }
-            let bytes = copy.card_bytes();
-            if bytes == 0 {
-                continue;
-            }
-            copy.replaced.store(true, Relaxed);
-            r.host.wanted.store(u32::MAX, Relaxed);
-            r.host.gone.store(true, Relaxed);
-            retired.push(made.take().unwrap());
-            drop(made);
-            staged.extend(texture::take_staged(at as This, serial));
-            if outcome.evicted_count == 0 {
-                outcome.texture = Some(TextureInfo::new(at, &r.desc, Some(bytes)));
-            }
-            outcome.evicted_count += 1;
-            outcome.evicted_bytes += bytes;
-        }
-    }
-    drop(staged);
-    for made in retired {
-        host::retire(made);
-    }
-    KINDS[2].fetch_add(outcome.evicted_count, Relaxed);
-    KINDS[3].fetch_add(outcome.evicted_bytes, Relaxed);
-    STATS[0].fetch_add(outcome.evicted_count, Relaxed);
-    STATS[1].fetch_add(outcome.evicted_bytes, Relaxed);
-    STATS[2].fetch_add(outcome.skipped_in_flight, Relaxed);
-    outcome
-}
-
-fn idle(r: &Resource, copy: &HostTexture, policy: EvictPolicy) -> bool {
-    frame::current().saturating_sub(copy.last_used_frame.load(Relaxed)) >= policy.min_idle_frames
-        && host::long_ago(r.host.used.load(Relaxed), policy.min_idle_ms, policy.min_idle_frames)
+    scan::evict(target, completed, policy, false)
 }
 
 pub(super) fn allocation_info(this: This, desc: &ResourceDesc) -> TextureInfo {

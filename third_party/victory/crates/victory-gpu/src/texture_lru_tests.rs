@@ -4,8 +4,12 @@
 use super::*;
 use crate::object::S_OK;
 use crate::resource::{HeapProperties, RESOURCE_IIDS, create_committed, host_copy, resource, resource_release, staged_first};
+use crate::switch::opt_in;
+use crate::texture;
 use std::collections::BTreeMap;
 use std::ptr::null;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Acquire;
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
@@ -100,9 +104,36 @@ impl Drop for EvictionMode {
     }
 }
 
+pub(crate) struct HeapMode(Option<bool>);
+
+impl HeapMode {
+    pub(crate) fn set(enabled: bool) -> Self {
+        Self(texture_heap_evict::TEST_ENABLED.replace(Some(enabled)))
+    }
+}
+
+impl Drop for HeapMode {
+    fn drop(&mut self) {
+        texture_heap_evict::TEST_ENABLED.set(self.0);
+    }
+}
+
+struct HeapIdle(Option<u64>);
+
+impl HeapIdle {
+    fn set(frames: u64) -> Self {
+        Self(texture_heap_evict::TEST_IDLE_FRAMES.replace(Some(frames)))
+    }
+}
+
+impl Drop for HeapIdle {
+    fn drop(&mut self) {
+        texture_heap_evict::TEST_IDLE_FRAMES.set(self.0);
+    }
+}
+
 #[test]
 fn lru_requires_an_explicit_opt_in() {
-    use crate::switch::opt_in;
     for value in [None, Some("0"), Some("false"), Some("off"), Some(""), Some("yes"), Some(" 1 ")] {
         assert!(!opt_in(value), "{value:?}");
     }
@@ -280,6 +311,88 @@ fn oldest_completed_texture_evicts_under_cap_and_uploads_again_on_reuse() {
         readback.Unmap(0, None);
         assert!(all_match, "rewritten bytes must reach the new host copy");
     }
+}
+
+#[test]
+fn heap_eviction_options_require_explicit_opt_in() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("yes"), Some(" 1 ")] {
+        assert!(!opt_in(value), "{value:?}");
+    }
+    for value in ["1", "true", "on"] {
+        assert!(opt_in(Some(value)), "{value:?}");
+    }
+    use texture_heap_evict::parse_idle_frames;
+    assert_eq!(parse_idle_frames(None), 120);
+    assert_eq!(parse_idle_frames(Some("invalid")), 120);
+    assert_eq!(parse_idle_frames(Some(" 0 ")), 0);
+    assert_eq!(parse_idle_frames(Some("45")), 45);
+}
+
+#[test]
+fn default_lru_eviction_preserves_live_host_heap_textures_until_opt_in() {
+    use descriptor::host::heap_evict_tests::RegisteredHeap;
+
+    let _case = GPU_CASE.lock().unwrap_or_else(|e| e.into_inner());
+    let h = host::host().expect("D3D12 adapter (or WARP)");
+    let _lru = EvictionMode::set(opt_in(Some("1")));
+    let _room = Limit::set(u64::MAX);
+    let _idle = HeapIdle::set(120);
+    let registered = {
+        let _tracking = HeapMode::set(opt_in(Some("1")));
+        let registered = RegisteredHeap::new();
+        registered.host();
+        registered
+    };
+    let heap = registered.host();
+    let cold = Texture::new();
+    let hot_alias = Texture::new();
+    let pinned = Texture::new();
+    drop(host_copy(cold.0).unwrap());
+    drop(host_copy(hot_alias.0).unwrap());
+    let external = host_copy(pinned.0).unwrap().texture.clone();
+    for (index, texture) in [(0, &cold), (1, &cold), (2, &hot_alias), (3, &hot_alias), (4, &pinned)] {
+        registered.bind(index, texture);
+    }
+    frame::advance_for_test(121);
+    for texture in [&cold, &hot_alias, &pinned] {
+        texture.age(121);
+    }
+    assert!(heap.mirror(2, registered.handle(2), true).is_some());
+    if host::coarse_ms() < 1_100 {
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+    }
+    let pressure = Limit::set(0);
+    {
+        let _off = HeapMode::set(opt_in(None));
+        h.with_submit_lock_for_test(|| evict_if_pressured(h));
+        assert!(cold.resident() && !heap.shows_none(0) && !heap.shows_none(1));
+    }
+    let _on = HeapMode::set(opt_in(Some("on")));
+    {
+        let _lru_off = EvictionMode::set(opt_in(None));
+        h.with_submit_lock_for_test(|| evict_if_pressured(h));
+        assert!(cold.resident(), "Tier 3 must not enable ordinary LRU");
+    }
+    evict_lru_textures(u64::MAX, h.completed_fence(), test_policy());
+    assert!(cold.resident(), "off-submit recovery must not unmake descriptors");
+    h.with_submit_lock_for_test(|| {
+        evict_if_pressured(h);
+        descriptor::make_waiting();
+    });
+    assert!(!cold.resident() && heap.shows_none(0) && heap.shows_none(1));
+    assert!(hot_alias.resident() && !heap.shows_none(2) && !heap.shows_none(3));
+    assert!(pinned.resident() && !heap.shows_none(4));
+
+    let evicted_at = frame::current();
+    heap.texture_slots_room(evicted_at + 1);
+    let cold_due = |frame| heap.texture_slots_all_due(frame).into_iter().filter(|&(i, _)| i < 2).count();
+    assert_eq!(cold_due(evicted_at + texture_heap_evict::COOLDOWN_FRAMES - 1), 0);
+    assert_eq!(cold_due(evicted_at + texture_heap_evict::COOLDOWN_FRAMES), 2);
+    drop(pressure);
+    drop(host_copy(cold.0).unwrap());
+    h.with_submit_lock_for_test(descriptor::make_waiting);
+    assert!(cold.resident() && !heap.shows_none(0) && !heap.shows_none(1));
+    drop(external);
 }
 
 #[derive(Default)]

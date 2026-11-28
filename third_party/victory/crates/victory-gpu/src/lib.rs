@@ -111,6 +111,8 @@ mod residency;
 pub mod resource;
 #[cfg(windows)]
 pub(crate) use resource::texture_lru;
+#[cfg(windows)]
+mod texture_heap_evict;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
