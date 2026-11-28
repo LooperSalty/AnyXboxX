@@ -573,7 +573,9 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    static KEEP_SCRATCH: OnceLock<bool> = OnceLock::new();
+    let keep = *KEEP_SCRATCH.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_KEEP"));
+    if should_trim_scratch(crate::residency::pressured(), keep, crate::residency::critical_commit) {
         trim_spare_chunks();
     }
     let host = host();
@@ -1860,6 +1862,10 @@ impl Recording {
         if self.0.compare_exchange(Self::OPEN, Self::LEFT_OPEN, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             lists.left.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn is_left_open(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == Self::LEFT_OPEN
     }
 
     /// The list is to be closed: whether it was open, so that its native
@@ -3285,24 +3291,24 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// With VICTORY_SCRATCH_KEEP=1, reuse the bounded spare pool through
+/// ordinary RAM pressure. Sample commit only when it can affect the sweep.
+fn should_trim_scratch(pressure: bool, keep: bool, critical_commit: impl FnOnce() -> bool) -> bool {
+    pressure && (!keep || critical_commit())
+}
+
 /// Drops spare scratch chunks kept idle when host memory is pressured.
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
+    let freed = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        spare.low = 0;
-        std::mem::take(&mut spare.kept)
+        std::mem::replace(&mut *spare, Spare::new())
     };
-    let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
-    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
-    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
-    drop(freed);
+    ALIVE[3].fetch_sub(freed.kept.len() as u64, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(freed.bytes, Ordering::Relaxed);
+    scratch_release::release(freed);
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -5440,6 +5446,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod scratch_release;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -7436,6 +7443,15 @@ impl Host {
         heap_sync: Option<u64>,
         preplan: Option<card_steps::Preplan>,
     ) -> Submission<'a> {
+        // A replacement can be submitted again without a title reset, even
+        // on a synchronous queue that never detaches it: it is closed here,
+        // before any preparation, for repeated entries too (the taken
+        // `Closing::Taken` count, as `close_if_open` does).
+        for list in runs {
+            if list.is_left_open() {
+                list.close_if_open();
+            }
+        }
         // A list is whole only when it is closed.
         closed_for_execution(runs);
         #[cfg(feature = "diagnostics")]
@@ -8342,6 +8358,18 @@ impl HostList {
         times
     }
 
+    /// Only called on a newly created or just-reset list from the idle pool,
+    /// before handing it to the title as its logically closed replacement.
+    /// Left open unless `VICTORY_LEAVE_OPEN=0`, which closes it at once.
+    pub(crate) fn prepare_replacement(&self) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_LEAVE_OPEN").is_none_or(|v| v != "0")) {
+            self.left_open();
+        } else {
+            self.close();
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.close_as(Closing::Recorded);
     }
@@ -8356,6 +8384,11 @@ impl HostList {
     /// recording a submission took, and stays open (`crate::list::detach`).
     pub(crate) fn left_open(&self) {
         self.recording.left_open(&OPEN_LISTS);
+    }
+
+    /// Whether the list was left open and its title has not reset it yet.
+    pub(crate) fn is_left_open(&self) -> bool {
+        self.recording.is_left_open()
     }
 
     fn close_as(&self, how: Closing) {
@@ -12958,7 +12991,17 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::{Spare, allocator_old_enough, refresh_allocator_at};
+    use super::{Spare, allocator_old_enough, refresh_allocator_at, should_trim_scratch};
+
+    #[test]
+    fn keeping_idle_scratch_changes_only_noncritical_pressure_sweeps() {
+        for keep in [false, true] {
+            assert!(!should_trim_scratch(false, keep, || panic!("no pressure")));
+        }
+        assert!(should_trim_scratch(true, false, || panic!("ordinary sweep")));
+        assert!(!should_trim_scratch(true, true, || false));
+        assert!(should_trim_scratch(true, true, || true));
+    }
 
     #[test]
     fn allocator_age_requires_the_whole_interval() {

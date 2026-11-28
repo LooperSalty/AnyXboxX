@@ -20,6 +20,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 pub(crate) mod thin;
+#[cfg(all(test, windows))]
+mod replacement_tests;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
@@ -545,7 +547,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // A new host list is open, and stays so: the title's next call on
         // its list is a reset, which closes a recording that is discarded
         // (see `detach`).
-        fresh.left_open();
+        fresh.prepare_replacement();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -624,7 +626,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         // reset runs on the thread that translates the title's calls. A list the title
         // submits again without a reset gives this one, open: closed when
         // it is taken (`close_if_open`).
-        fresh.left_open();
+        fresh.prepare_replacement();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
