@@ -58,12 +58,16 @@ pub struct Running {
 
 pub struct App {
     pub repo: Option<PathBuf>,
+    /// Where `repo` came from, for the Setup page.
+    pub repo_source: Option<crate::repo_dir::Source>,
     /// Prebuilt `victory.exe` passed via `--victory-exe`: skips the cargo build and needs no repo.
     pub victory_exe: Option<PathBuf>,
     pub profiles: Profiles,
     pub host: Host,
     pub gpu: GpuVendor,
     pub adapter_name: Option<String>,
+    pub framegen_unavailable: Option<&'static str>,
+    pub streamline_check: Option<(String, Result<(), String>)>,
     adapters: Option<Vec<Adapter>>,
     pub setup: Vec<Item>,
     pub settings: Settings,
@@ -143,11 +147,17 @@ impl App {
             .and_then(host::main_adapter)
             .map(|a| a.name.clone());
         let mut app = App {
-            repo: anyxboxx::run::find_repo(None),
+            repo: None,
+            repo_source: None,
             victory_exe: None,
             profiles,
             host,
             gpu,
+            framegen_unavailable: crate::framegen::unavailable(
+                gpu, adapter_name.as_deref().unwrap_or_default(),
+                host == Host::Windows && crate::framegen::detect_hags(),
+            ),
+            streamline_check: None,
             adapter_name,
             setup: read_setup(adapters.as_deref()),
             adapters,
@@ -184,6 +194,7 @@ impl App {
             title_id_cache: None,
         };
         app.find_game_folder();
+        app.refresh_repo();
         if app.settings.game_path().is_some() {
             app.start_verify();
         }
@@ -211,12 +222,14 @@ impl App {
         self.open_dialog(Pick::XgLibrary);
     }
 
-    fn open_dialog(&mut self, kind: Pick) {
+    pub(crate) fn open_dialog(&mut self, kind: Pick) {
         if self.pick_rx.is_some() {
             return;
         }
         let start = match kind {
+            Pick::Streamline => Some(PathBuf::from(&self.settings.options.dlss.streamline_dir)),
             Pick::GameFolder => self.settings.game_path(),
+            Pick::RepoFolder => self.repo.clone(),
             Pick::XgLibrary => PathBuf::from(self.settings.xg_dll.trim())
                 .parent()
                 .map(PathBuf::from),
@@ -237,6 +250,39 @@ impl App {
         }
     }
 
+    /// Opens the folder dialog for the AnyXboxX clone.
+    pub fn pick_repo_folder(&mut self) {
+        self.open_dialog(Pick::RepoFolder);
+    }
+
+    /// Looks for the AnyXboxX folder again: the saved choice, `ANYXBOXX_REPO`, the launcher's
+    /// surroundings, then the usual places.
+    pub fn refresh_repo(&mut self) {
+        let found = crate::repo_dir::locate(self.settings.repo_path());
+        (self.repo, self.repo_source) = match found {
+            Some((dir, source)) => (Some(dir), Some(source)),
+            None => (None, None),
+        };
+    }
+
+    /// Uses `dir` as the AnyXboxX folder when it is a clone (error toast otherwise).
+    pub fn set_repo_folder(&mut self, dir: &std::path::Path) {
+        match crate::repo_dir::validate(dir) {
+            Ok(()) => {
+                self.settings.repo_dir = dir.display().to_string();
+                self.refresh_repo();
+                self.notice = Some(format!("AnyXboxX folder saved: {}", dir.display()));
+            }
+            Err(reason) => self.notice = Some(format!("Cannot use this folder: {reason}")),
+        }
+    }
+
+    /// Forgets the chosen folder; it is searched for again.
+    pub fn clear_repo_folder(&mut self) {
+        self.settings.repo_dir.clear();
+        self.refresh_repo();
+    }
+
     /// Takes the answer of a dialog, if one came.
     fn poll_dialog(&mut self) {
         let Some(rx) = &self.pick_rx else {
@@ -250,7 +296,9 @@ impl App {
             return;
         };
         match kind {
+            Pick::Streamline => self.settings.options.dlss.streamline_dir = path.display().to_string(),
             Pick::GameFolder => self.set_game_folder(&path),
+            Pick::RepoFolder => self.set_repo_folder(&path),
             Pick::XgLibrary => self.settings.xg_dll = path.display().to_string(),
         }
     }
@@ -323,10 +371,8 @@ impl App {
             (Some(repo), _) => repo.clone(),
             (None, Some(_)) => PathBuf::new(),
             (None, None) => {
-                self.notice = Some(
-                    "AnyXboxX folder not found: run the launcher from the repository (target\\release) or pass --victory-exe <path>."
-                        .to_string(),
-                );
+                self.notice = Some(crate::repo_dir::NOT_FOUND.to_string());
+                self.tab = Tab::Setup;
                 return;
             }
         };
@@ -335,6 +381,7 @@ impl App {
             &repo,
             self.victory_exe.as_deref(),
             &profile,
+            self.framegen_unavailable.is_none(),
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -342,6 +389,10 @@ impl App {
                 return;
             }
         };
+        if let Err(reason) = crate::streamline::check_launch(&plan.env) {
+            self.notice = Some(reason);
+            return;
+        }
         if !precompile_only {
             // NVIDIA Smooth Motion lives in the driver's profile, not in VIctory's environment:
             // written now, so the game starts with the switch as the Play page shows it. A failure
