@@ -161,11 +161,38 @@ impl Front {
 
 /// Streams' memory to use again.
 static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
+/// Maximum word chunks kept idle in [`WORDS`].
+const WORDS_MOST: usize = 1024;
+/// Maximum word chunks kept idle in [`WORDS`] under host memory pressure.
+const WORDS_PRESSURED_MOST: usize = 64;
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
-/// Lists of ours nobody uses, closed.
-static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Lists of ours nobody uses, closed, alongside the [`crate::host::moment`]
+/// they were returned.
+static BACKS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// Maximum idle backing lists retained across bursts.
+const BACKS_MOST: usize = 64;
+
+pub(super) fn backs_cap(pressured: bool, critical: bool) -> usize {
+    if critical {
+        0
+    } else if pressured {
+        16
+    } else {
+        BACKS_MOST
+    }
+}
+
+fn release_back(back: usize) {
+    if back != 0 {
+        // SAFETY: `back` came from `Box::into_raw(super::boxed(...))` in
+        // `back_list` (never passed through `object::hand_out`, so its
+        // `Object::refs` is 0), is closed, and is no longer referenced by any
+        // `Recording` or submission.
+        drop(unsafe { Box::from_raw(back as *mut List) });
+    }
+}
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -279,24 +306,102 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let now = crate::host::moment();
+            let dropped = if super::reclaim_enabled() {
+                let cap = backs_cap(
+                    crate::residency::pressured(),
+                    crate::residency::critical_commit(),
+                );
+                let mut backs = held(&BACKS);
+                if backs.len() < cap {
+                    backs.push((inner.back, now));
+                    0
+                } else {
+                    inner.back
+                }
+            } else {
+                held(&BACKS).push((inner.back, now));
+                0
+            };
+            release_back(dropped);
         }
     }
 }
 
 fn give_back(streams: Vec<Vec<u64>>) {
-    let mut words = held(&WORDS);
-    for mut s in streams {
-        if words.len() < 1024 && s.capacity() <= 16 * CHUNK {
-            s.clear();
-            words.push(s);
+    let cap = if !super::reclaim_enabled() {
+        WORDS_MOST
+    } else if crate::residency::critical_commit() {
+        0
+    } else if crate::residency::pressured() {
+        WORDS_PRESSURED_MOST
+    } else {
+        WORDS_MOST
+    };
+    let mut dropped = Vec::new();
+    {
+        let mut words = held(&WORDS);
+        for mut s in streams {
+            if words.len() < cap && s.capacity() <= 16 * CHUNK {
+                s.clear();
+                words.push(s);
+            } else {
+                dropped.push(s);
+            }
         }
     }
+    drop(dropped);
+}
+
+/// Drops idle backing lists (and excess word buffers under host RAM pressure)
+/// outside their pool locks so their D3D12 command allocators return to the OS.
+pub(super) fn let_go_idle(idle_ms: u64, pressured: bool, critical: bool) {
+    const IDLE_FRAMES: u64 = 4;
+    let cap = backs_cap(pressured, critical);
+    let warm = if critical || pressured {
+        0
+    } else {
+        THREADS.load(Relaxed).max(8)
+    };
+    let (evicted, left) = {
+        let mut backs = held(&BACKS);
+        let evicted = super::evict_idle(&mut backs, warm, cap, critical, |&(_, moment)| {
+            crate::host::long_ago(moment, idle_ms, IDLE_FRAMES)
+        });
+        if backs.is_empty() && backs.capacity() > 32 {
+            backs.shrink_to(16);
+        }
+        (evicted, backs.len())
+    };
+    let went = evicted.len();
+    for (back, _) in evicted {
+        release_back(back);
+    }
+    if went > 0 {
+        crate::host::trail(|| format!("sweep: {went} idle thin backing lists let go ({left} left)"));
+    }
+    let words_cap = if critical {
+        0
+    } else if pressured {
+        WORDS_PRESSURED_MOST
+    } else {
+        WORDS_MOST
+    };
+    let dropped_words: Vec<Vec<u64>> = {
+        let mut words = held(&WORDS);
+        if words.len() > words_cap {
+            let excess = words.len() - words_cap;
+            words.drain(..excess).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    drop(dropped_words);
 }
 
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+    if let Some((back, _)) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
@@ -1014,5 +1119,43 @@ mod tests {
         slot[1] = 99;
         assert_eq!((slot[1], kept[1]), (99, 2));
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    #[test]
+    fn release_back_drops_unreferenced_backing_list() {
+        let raw = Box::into_raw(super::boxed(0, std::ptr::null(), true)) as usize;
+        super::VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                raw,
+                super::ValueWait {
+                    address: 0x1000,
+                    comparison: 2,
+                    reference: 1,
+                    wide: false,
+                },
+            ));
+        // Backing lists never pass through `object::hand_out` (`refs == 0`), so
+        // `release_boxed` is a no-op and would leak the allocation.
+        assert_eq!(crate::object::release_boxed::<List>(raw as This), 0);
+        assert!(
+            super::VALUE_WAITS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|&(list, _)| list == raw)
+        );
+
+        release_back(raw);
+        let still_queued = super::VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(list, _)| list == raw);
+        assert!(
+            !still_queued,
+            "release_back must drop the unreferenced Box<List> (and purge VALUE_WAITS)"
+        );
     }
 }

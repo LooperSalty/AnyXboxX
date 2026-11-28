@@ -136,6 +136,16 @@ struct List {
     thin: thin::Front,
 }
 
+impl Drop for List {
+    fn drop(&mut self) {
+        let addr = std::ptr::from_ref(self) as usize;
+        VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(list, _)| list != addr);
+    }
+}
+
 /// One part of a title list cut at its waits: the waits the queue stands
 /// at, then the host list that runs once they are met.
 #[cfg(windows)]
@@ -274,10 +284,15 @@ pub(crate) fn ran(lists: &mut [Detached]) {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of upload
+/// memory it keeps, and the [`crate::host::moment`] it became idle.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64, u64);
+struct Idle {
+    host: crate::host::HostList,
+    bytes: u64,
+    added_ms: u64,
+    moment: u64,
+}
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -303,6 +318,76 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Maximum idle host lists retained for the current host-RAM regime.
+#[cfg(windows)]
+fn idle_cap(limited: bool, pressured: bool, critical: bool) -> usize {
+    if critical {
+        0
+    } else if pressured {
+        64
+    } else if limited {
+        256
+    } else {
+        IDLE_MOST.0
+    }
+}
+
+/// Warm floor of idle host lists kept across periodic sweeps when not under
+/// critical commit pressure, so steady-state recording avoids allocator churn.
+#[cfg(windows)]
+fn idle_warm_floor(limited: bool, pressured: bool, critical: bool) -> usize {
+    if critical {
+        0
+    } else if pressured {
+        16
+    } else if limited {
+        32
+    } else {
+        64
+    }
+}
+
+/// Evicts cold entries from the front of a LIFO pool (oldest first), keeping
+/// up to `warm_floor` newest entries at the tail unless `force_all` is set or
+/// the pool exceeds `cap`. Preserves the LIFO order of kept entries.
+#[cfg(windows)]
+pub(super) fn evict_idle<T>(
+    pool: &mut Vec<T>,
+    warm_floor: usize,
+    cap: usize,
+    force_all: bool,
+    is_idle: impl Fn(&T) -> bool,
+) -> Vec<T> {
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    if force_all {
+        let keep = warm_floor.min(cap);
+        let drop_n = pool.len().saturating_sub(keep);
+        return pool.drain(..drop_n).collect();
+    }
+    if pool.len() <= warm_floor && pool.len() <= cap {
+        return Vec::new();
+    }
+    let keep_tail = warm_floor.min(cap).min(pool.len());
+    let scan_end = pool.len() - keep_tail;
+    let mut evicted = Vec::new();
+    let mut kept = Vec::with_capacity(pool.len());
+    for (i, item) in pool.drain(..).enumerate() {
+        if i < scan_end && is_idle(&item) {
+            evicted.push(item);
+        } else {
+            kept.push(item);
+        }
+    }
+    if kept.len() > cap {
+        let excess = kept.len() - cap;
+        evicted.extend(kept.drain(..excess));
+    }
+    *pool = kept;
+    evicted
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -325,6 +410,15 @@ fn idle_trim_seconds() -> Option<u64> {
     })
 }
 
+/// Whether idle host-list allocator reclamation, thin backing-list eviction,
+/// pooled `boxed()` reuse, and spike indirect-buffer trimming on reset are
+/// active (`VICTORY_RECLAIM_LISTS=1`; off by default until A/B-measured).
+#[cfg(windows)]
+pub(crate) fn reclaim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECLAIM_LISTS").is_some_and(|v| v == "1"))
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -334,22 +428,29 @@ fn fresh_list() -> Option<crate::host::HostList> {
         let mut expired = Vec::new();
         if let Some(seconds) = idle_trim_seconds() {
             let now = crate::host::now_ms();
-            while idle.0.first().is_some_and(|item| idle_expired(item.2, now, seconds)) {
+            while idle.0.first().is_some_and(|item| idle_expired(item.added_ms, now, seconds)) {
                 let item = idle.0.remove(0);
-                idle.1 -= item.1;
+                idle.1 = idle.1.saturating_sub(item.bytes);
                 expired.push(item);
             }
         }
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes, _)) = &taken {
-            idle.1 -= bytes;
+        if let Some(Idle { bytes, .. }) = &taken {
+            idle.1 = idle.1.saturating_sub(*bytes);
         }
         (taken, expired)
     };
     drop(expired);
     match idle {
-        Some(Idle(list, _, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle { host, .. }) => Some(host),
+        None => crate::host::host().and_then(|h| match h.new_list() {
+            Ok(list) => Some(list),
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(error = %e, "no host command list"));
+                None
+            }
+        }),
     }
 }
 
@@ -368,18 +469,31 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let now = crate::host::now_ms();
         let gone = {
             let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-            let count = stale_count(idle.0.iter().map(|item| item.2), now, seconds.saturating_mul(1000));
+            let count = stale_count(idle.0.iter().map(|item| item.added_ms), now, seconds.saturating_mul(1000));
             let gone: Vec<_> = idle.0.drain(..count).collect();
-            idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+            idle.1 = idle.1.saturating_sub(gone.iter().map(|item| item.bytes).sum::<u64>());
             gone
         };
         drop(gone);
     }
+    let cap = if reclaim_enabled() {
+        idle_cap(
+            crate::residency::limited_host_ram(),
+            crate::residency::pressured(),
+            crate::residency::critical_commit(),
+        )
+    } else {
+        IDLE_MOST.0
+    };
+    if cap == 0 {
+        return;
+    }
+    let moment = crate::host::moment();
     for (i, Detached { host, _uploads, state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= cap {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -387,14 +501,19 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < cap && idle.1 + bytes <= IDLE_MOST.1 {
             let now = crate::host::now_ms();
-            idle.0.push(Idle(host, bytes, now));
+            idle.0.push(Idle {
+                host,
+                bytes,
+                added_ms: now,
+                moment,
+            });
             idle.1 += bytes;
             if let Some(seconds) = idle_trim_seconds() {
-                let count = stale_count(idle.0.iter().map(|item| item.2), now, seconds.saturating_mul(1000));
+                let count = stale_count(idle.0.iter().map(|item| item.added_ms), now, seconds.saturating_mul(1000));
                 let gone: Vec<_> = idle.0.drain(..count).collect();
-                idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+                idle.1 = idle.1.saturating_sub(gone.iter().map(|item| item.bytes).sum::<u64>());
                 drop(idle);
                 drop(gone);
             }
@@ -428,6 +547,43 @@ fn only_the_oldest_idle_lists_are_stale() {
     assert_eq!(stale_count([950].into_iter(), 1000, 100), 0);
     assert_eq!(stale_count(std::iter::empty(), 1000, 100), 0);
     assert_eq!(stale_count([2000].into_iter(), 1000, 100), 0);
+}
+
+/// Drops idle host lists (and thin-list backing lists) that have sat unused
+/// past the host-RAM idle timeout, releasing their high-water-mark D3D12
+/// command allocators and per-list scratch/indirect buffers back to the OS.
+/// Called once a second by `crate::host::sweep`.
+#[cfg(windows)]
+pub(crate) fn let_go_idle() {
+    if !reclaim_enabled() {
+        return;
+    }
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    let limited = crate::residency::limited_host_ram();
+    let pressured = crate::residency::pressured();
+    let critical = crate::residency::critical_commit();
+    let cap = idle_cap(limited, pressured, critical);
+    let warm = idle_warm_floor(limited, pressured, critical);
+    let (evicted, left) = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let evicted = evict_idle(&mut idle.0, warm, cap, critical, |entry| {
+            crate::host::long_ago(entry.moment, idle_ms, IDLE_FRAMES)
+        });
+        let freed_bytes: u64 = evicted.iter().map(|e| e.bytes).sum();
+        idle.1 = idle.1.saturating_sub(freed_bytes);
+        if idle.0.is_empty() && idle.0.capacity() > 64 {
+            idle.0.shrink_to(32);
+        }
+        (evicted, idle.0.len())
+    };
+    let went = evicted.len();
+    // Drop D3D12 command allocators and per-list buffers outside the lock.
+    drop(evicted);
+    if went > 0 {
+        crate::host::trail(|| format!("sweep: {went} idle host lists let go ({left} left)"));
+    }
+    thin::let_go_idle(idle_ms, pressured, critical);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -751,13 +907,13 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: if thin {
+            None
+        } else if reclaim_enabled() {
+            fresh_list()
+        } else {
+            crate::host::host().and_then(|h| h.new_list().ok())
+        },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -3035,5 +3191,49 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(tex_a), 0);
         assert_eq!(release(tex_b), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn evict_idle_preserves_lifo_warm_tail_and_drops_cold_front() {
+        // Pool holds (id, is_old) in oldest-to-newest order (back is LIFO top).
+        let mut pool = vec![(1, true), (2, false), (3, true), (4, true), (5, false)];
+        let evicted = evict_idle(&mut pool, 2, 10, false, |&(_, old)| old);
+        assert_eq!(evicted, vec![(1, true), (3, true)]);
+        // Warm tail (4, 5) stayed untouched even though 4 is old; fresh 2 stayed in order.
+        assert_eq!(pool, vec![(2, false), (4, true), (5, false)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn evict_idle_enforces_pressure_cap_and_critical_drain() {
+        let mut pool = vec![10, 20, 30, 40, 50];
+        // None are old, but pressure lowered cap from 5 to 2 -> oldest 3 evicted.
+        let evicted = evict_idle(&mut pool, 2, 2, false, |_| false);
+        assert_eq!(evicted, vec![10, 20, 30]);
+        assert_eq!(pool, vec![40, 50]);
+
+        // Critical commit forces full drain to warm_floor=0, cap=0.
+        let drained = evict_idle(&mut pool, 0, 0, true, |_| false);
+        assert_eq!(drained, vec![40, 50]);
+        assert!(pool.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_pool_caps_and_warm_floors_scale_with_ram_pressure() {
+        assert_eq!(idle_cap(false, false, false), IDLE_MOST.0);
+        assert_eq!(idle_cap(true, false, false), 256);
+        assert_eq!(idle_cap(false, true, false), 64);
+        assert_eq!(idle_cap(true, true, true), 0);
+
+        assert_eq!(idle_warm_floor(false, false, false), 64);
+        assert_eq!(idle_warm_floor(true, false, false), 32);
+        assert_eq!(idle_warm_floor(false, true, false), 16);
+        assert_eq!(idle_warm_floor(false, false, true), 0);
+
+        assert_eq!(thin::backs_cap(false, false), 64);
+        assert_eq!(thin::backs_cap(true, false), 16);
+        assert_eq!(thin::backs_cap(false, true), 0);
     }
 }
