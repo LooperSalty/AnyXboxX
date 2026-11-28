@@ -6,6 +6,7 @@ Jusqu'au 21 novembre 2026, AnyXboxX était sous LGPL 2.1 ou ultérieure. La clau
 
 | Composant | Origine | Licence | Utilisation dans AnyXboxX |
 | --- | --- | --- | --- |
+| [Skyfrye/AnyXboxX](https://github.com/Skyfrye/AnyXboxX) (Skyfrye) | GPL-3.0 ou ultérieure | | Réutilisation des références des descripteurs et cache de textures placées par thread (`579499d`), attente des slots dynamiques au fil des atterrissages (`VICTORY_SLOT_WAIT=1`, `510fe21`) |
 | Module `Task` de libHttpClient | [microsoft/libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | File de tâches du runtime GDK (`runtime/third_party/libhttpclient-task`) |
 | Tests d'encodage AMDGPU de LLVM | [llvm/llvm-project](https://github.com/llvm/llvm-project), `llvm/test/MC/AMDGPU` | Apache 2.0 avec exception LLVM | Tables générées `PrototypeScarlett/emu/rdna2_ops.py` et `rdna2_shapes.py` (outils `tools/rdna2_*.py`) |
 | `AMDGPUInstPrinter::printSwizzle`, `printExpSrcN`, `printExpTgt`, `Exp::getTgtName` et constantes `Swizzle`/`Exp` (`SIDefines.h`) de LLVM | [llvm/llvm-project](https://github.com/llvm/llvm-project), `llvm/lib/Target/AMDGPU` | Apache 2.0 avec exception LLVM | Ports en Python : `PrototypeScarlett/emu/rdna2_swizzle.py` (offset de `ds_swizzle_b32`) et `rdna2_exp.py` (exports EXP) |

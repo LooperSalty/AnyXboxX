@@ -372,6 +372,15 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    // What the translating took to bind views: the views of lists asked for
+    // and made (`crate::descriptor::host::HostHeap::make_listed`; the rest
+    // were copied from the thread's own), the views made ready to be read
+    // (`crate::draw`'s `readable`).
+    let [asked, made] = crate::descriptor::host::take_listed_counts().map(|n| n as f64 / frames);
+    let [read, buffers] = crate::draw::take_readable_counts().map(|n| n as f64 / frames);
+    tracing::info!(
+        "views of lists per frame: {asked:.0} asked, {made:.0} made; made ready to be read {read:.0}, {buffers:.0} of them of buffers"
+    );
 }
 
 #[inline]
