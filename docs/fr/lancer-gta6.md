@@ -390,6 +390,7 @@ Ils demandent le build `diag`.
 | `VICTORY_D3D12_DRED=1` | En cas de panne du GPU, donne les commandes en cours. Ralentit le monde d'environ 2,5 fois : à n'activer que pour enquêter sur un device removed. |
 | `VICTORY_D3D12_DEBUG=1` | Couche de débogage D3D12 (Graphics Tools requis). |
 | `VICTORY_GPU_TIMING=1` | Chronomètre chaque liste de commandes et journalise les lentes. |
+| `VICTORY_SHADER_CENSUS=<fichier>` (avec `victory translate`, et `VICTORY_TRANSLATE_ONLY=<hash,...>` pour choisir les shaders) | Ajoute une ligne par shader traduit, nommé par `#` et son hash de 16 chiffres. Des comptes seulement, aucun code : types d'instructions, barrières de groupe ajoutées par la traduction quand un programme wave64 tourne en deux vagues de 32, sélections des déplacements de registres indexés par M0, résultats 64 bits, boucles, octets de LDS, groupe de threads, taille de vague exigée, forme dans laquelle un programme wave64 a été traduit, et liaisons. |
 | `VICTORY_SKIP_PIPELINES=<hash,...>` | Omet les dessins et dispatchs qui utilisent les hash de shader à 16 chiffres listés. |
 | `VICTORY_LOG=<cible>=debug,...` | Sortie debug et trace. |
 

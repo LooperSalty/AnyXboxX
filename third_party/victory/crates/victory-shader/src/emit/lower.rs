@@ -5161,7 +5161,8 @@ impl<'a> Lower<'a> {
     fn group_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let barrier = self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.m.tag(barrier, Tag::Meeting);
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -9340,6 +9341,7 @@ impl<'a> Lower<'a> {
                         let kk = self.s.m.i32(u32::from(k));
                         let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                         r = self.s.m.select(c, is, x, r);
+                        self.s.m.tag(r, Tag::Indexed);
                     }
                     r
                 } else {
@@ -9359,6 +9361,7 @@ impl<'a> Lower<'a> {
                     let kk = self.s.m.i32(u32::from(k));
                     let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                     let x = self.s.m.select(c, is, value, old);
+                    self.s.m.tag(x, Tag::Indexed);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
                 }
                 Ok(())

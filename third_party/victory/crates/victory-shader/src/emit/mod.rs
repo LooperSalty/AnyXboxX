@@ -660,6 +660,7 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    census::set_form("as is");
     let wave32_compute =
         native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
     let listed = WAVE_PAIRS_HERE.get() || wave_pairs_listed(c.input);
@@ -785,6 +786,7 @@ pub fn emit(
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
+                census::set_form(name);
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
@@ -840,6 +842,7 @@ pub fn emit(
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
+                    census::set_form("without skips, scalars followed");
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
@@ -857,6 +860,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
+                        census::set_form("wave-wide branches");
                         let again = widen(c, native, base, why, driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
@@ -875,6 +879,7 @@ pub fn emit(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
+                    census::set_form(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" });
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
@@ -883,6 +888,7 @@ pub fn emit(
                 }
             }
             if idiom(p, st) == exact {
+                census::set_form(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" });
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
@@ -895,6 +901,7 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
+                        census::set_form("local waves (APPROXIMATE, any mask)");
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
@@ -902,6 +909,7 @@ pub fn emit(
                         }
                     }
                 }
+                census::set_form("local waves (APPROXIMATE, any mask)");
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
@@ -918,6 +926,7 @@ pub fn emit(
             let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
             for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
                 if let Some((p, st, io, res)) = f {
+                    census::set_form("loose LDS (APPROXIMATE)");
                     let again = loose_lds::with(|| emit_program(c, native, p, st, io, res));
                     report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
                     if done(&again) {
@@ -925,12 +934,14 @@ pub fn emit(
                     }
                 }
             }
+            census::set_form("loose LDS (APPROXIMATE)");
             let again = loose_lds::with(|| emit_program(c, native, p, st, io, res));
             report("loose LDS (APPROXIMATE)", &again);
             if done(&again) {
                 return again.map(|(shader, _)| shader);
             }
             if local_on && !exact_only {
+                census::set_form("loose LDS + local waves (APPROXIMATE, any mask)");
                 let local = loose_lds::with(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
                 report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
@@ -949,10 +960,14 @@ pub fn emit(
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             // `VICTORY_WAVE_WHY` must stay diagnostic-only (excluded from shader cache key in build.rs).
+            census::set_form("wave-wide branches");
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => {
+                    census::set_form("as is");
+                    emit_program(c, native, p, st, io, res)
+                }
             }
         }
         other => other,
@@ -978,6 +993,7 @@ pub fn emit(
         return original;
     }
     let p = ir::thread_edges(p, &edges)?;
+    census::set_form("constant edges threaded");
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
