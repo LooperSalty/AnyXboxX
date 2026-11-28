@@ -24,6 +24,12 @@ pub(crate) enum Tag {
     Clamp,
     /// The iteration counter and limit test the translation adds to a loop.
     Counter,
+    /// A group barrier the translation adds where the host waves of one
+    /// console wave meet (the console has none there).
+    Meeting,
+    /// A select of an M0-indexed register move (`v_movrel*`), one per
+    /// register the index may name.
+    Indexed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -389,7 +395,7 @@ impl Module {
     /// ([`opt::REUSE`]).
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && (tag == Tag::Clamp || census::enabled())
+            && (tag == Tag::Clamp || census::counting())
         {
             self.tags.insert(i, tag);
         }

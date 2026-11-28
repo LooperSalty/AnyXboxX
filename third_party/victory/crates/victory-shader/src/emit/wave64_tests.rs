@@ -1943,3 +1943,73 @@ fn readfirstlane_uses_both_halves_of_the_console_wave() {
         same_as_console(&actual, &want);
     }
 }
+
+/// The census of one lowered program (`VICTORY_SHADER_CENSUS`'s counts), by kind.
+fn census_of(native: &NativeProgram, host_wave: u32) -> std::collections::HashMap<&'static str, u32> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = super::census::with(|| lowered_on(native, &p, &HashSet::new(), host_wave)).expect("lowered");
+    let census = super::census::take(&shader.dxil).expect("the module was counted");
+    super::census::KINDS.iter().copied().zip(census.counts).collect()
+}
+
+/// The census counts what the translation adds that the console program did not have: the
+/// group barriers and LDS where two host waves of 32 hold one console wave64 and exchange a
+/// lane-mask count, none of them on a host of 64-lane waves or without the exchange; the
+/// program's thread group.
+#[test]
+fn census_counts_the_barriers_and_lds_two_host_waves_add() {
+    let body = |exchange: bool| {
+        let mut w = vec![vop2(0x25, 4, k(1), 0)]; // v_add_nc_u32 v4, 1, v0
+        if exchange {
+            w.extend([
+                vopc(0xC1, LIT, 4), // v_cmp_lt_u32 vcc, 20, v4
+                20,
+                sop1(0x10, 16, VCC), // s_bcnt1_i32_b64 s16, vcc
+                vop1(0x01, 5, 16),   // v_mov_b32 v5, s16
+            ]);
+        } else {
+            w.push(vop1(0x01, 5, k(0))); // v_mov_b32 v5, 0
+        }
+        w.extend(stores([4, 5, 0, 0]));
+        native(&w)
+    };
+    let split = census_of(&body(true), 32);
+    assert!(split["added_barrier"] >= 2, "{split:?}");
+    assert!(split["lds_bytes"] >= 8, "{split:?}");
+    assert_eq!(split["threads"], 64);
+    for (exchange, wave) in [(false, 32), (true, 64)] {
+        let c = census_of(&body(exchange), wave);
+        assert_eq!((c["added_barrier"], c["lds_bytes"]), (0, 0), "exchange {exchange}, host wave {wave}: {c:?}");
+    }
+}
+
+/// An M0-indexed register read (`v_movrels_b32`) is a select per register M0 may name, each
+/// counted; 64-bit results are counted; neither is there in a plain move.
+#[test]
+fn census_counts_indexed_register_selects_and_64_bit_results() {
+    let indexed = native_of(
+        &[
+            vop2(0x25, 1, k(1), 0), // v_add_nc_u32 v1, 1, v0
+            vop2(0x25, 2, k(2), 0), // v_add_nc_u32 v2, 2, v0
+            vop2(0x25, 3, k(3), 0), // v_add_nc_u32 v3, 3, v0
+            sop1(0x03, 124, 0),   // s_mov_b32 m0, s0
+            vop1(0x43, 5, v(1)),  // v_movrels_b32 v5, v1
+            vop3(0x2FF, 6, k(1), v(0))[0], // v_lshlrev_b64 v[6:7], 1, v[0:1]
+            vop3(0x2FF, 6, k(1), v(0))[1],
+            vop1(0x01, 4, v(0)),  // v_mov_b32 v4, v0
+        ]
+        .into_iter()
+        .chain(stores([4, 5, 6, 7]))
+        .collect::<Vec<_>>(),
+        false,
+        64,
+    );
+    let c = census_of(&indexed, 32);
+    // a tree of selects over v1..v15 of the program's 16 registers; those the program never
+    // wrote read alike and fold away
+    assert!(c["indexed_select"] >= 3, "{c:?}");
+    assert!(c["wide64"] >= 1, "{c:?}");
+    let plain = native_of(&[vop1(0x01, 4, v(0))].into_iter().chain(stores([4, 4, 4, 4])).collect::<Vec<_>>(), false, 64);
+    let c = census_of(&plain, 32);
+    assert_eq!((c["indexed_select"], c["wide64"], c["added_barrier"]), (0, 0, 0), "{c:?}");
+}

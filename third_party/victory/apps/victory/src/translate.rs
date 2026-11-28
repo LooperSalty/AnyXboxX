@@ -740,9 +740,11 @@ fn translate_programs(
 }
 
 /// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
-/// its label, the console program's instructions by encoding class (a
-/// static count of the whole program, not of one thread's path), and the
-/// host module's instructions by kind (`emit::census::KINDS`).
+/// its label (with `#` and the 16-digit hash a run's log names it by), the
+/// form a wave64 program was emitted in and its host bindings, the console
+/// program's instructions by encoding class (a static count of the whole
+/// program, not of one thread's path), and the host module's instructions
+/// and costs by kind (`emit::census::KINDS`). Counts only, no code.
 fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
     use std::io::Write;
     use victory_shader::gfx10::Fields;
@@ -773,7 +775,16 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         };
         console[k] += 1;
     }
-    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    let mut line = format!(
+        "{label}\twave64={}\tform={}\troot_cbvs={}\troot_srvs={}\troot_uavs={}\tuser_dwords={}\tsamplers={}",
+        u8::from(native.wave64),
+        emit::census::form(),
+        shader.root_cbvs.len(),
+        shader.root_srvs.len(),
+        shader.root_uavs.len(),
+        shader.user_data_dwords(),
+        shader.samplers.len(),
+    );
     for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
         line.push_str(&format!("\t{name}={n}"));
     }

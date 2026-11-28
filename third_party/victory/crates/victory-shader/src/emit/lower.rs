@@ -5157,11 +5157,47 @@ impl<'a> Lower<'a> {
         cl
     }
 
+    /// `regs[m0]`, or 0 when M0 names no register of `regs` (an M0-relative read,
+    /// `v_movrels_b32`): a tree of selects on M0's bits, `log2(regs.len())` deep, rather than a
+    /// compare and select per register in one dependent chain. Both are a select per register;
+    /// the chain makes every read wait for all of them in turn, the tree for a few levels
+    /// (measured on an RTX 4060 Laptop, `movrel_tests`).
+    fn indexed_read(&mut self, c: usize, m0: V, regs: Vec<V>) -> V {
+        let zero = self.s.m.i32(0);
+        if regs.is_empty() {
+            return zero;
+        }
+        let levels = regs.len().next_power_of_two().trailing_zeros();
+        let (mut level, one) = (regs, self.s.m.i32(1));
+        for bit in 0..levels {
+            let at = self.s.m.i32(bit);
+            let shifted = self.s.m.bin(c, Bin::LShr, m0, at);
+            let low = self.s.m.bin(c, Bin::And, shifted, one);
+            let set = self.s.m.cmp(c, pred::NE, low, zero);
+            level = level
+                .chunks(2)
+                .map(|pair| {
+                    let hi = pair.get(1).copied().unwrap_or(zero);
+                    let v = self.s.m.select(c, set, hi, pair[0]);
+                    self.s.m.tag(v, Tag::Indexed);
+                    v
+                })
+                .collect();
+        }
+        // past the last power of two the tree covers: no register
+        let span = self.s.m.i32(1 << levels);
+        let within = self.s.m.cmp(c, pred::IULT, m0, span);
+        let v = self.s.m.select(c, within, level[0], zero);
+        self.s.m.tag(v, Tag::Indexed);
+        v
+    }
+
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let barrier = self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.m.tag(barrier, Tag::Meeting);
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -9331,17 +9367,14 @@ impl<'a> Lower<'a> {
                 };
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
+                    let mut regs = Vec::new();
                     for k in 0..=255u8.saturating_sub(sreg) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
                             break;
                         };
-                        let x = self.i32_of(x)?;
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                        r = self.s.m.select(c, is, x, r);
+                        regs.push(self.i32_of(x)?);
                     }
-                    r
+                    self.indexed_read(c, m0, regs)
                 } else {
                     s(self, 0)?
                 };
@@ -9359,6 +9392,7 @@ impl<'a> Lower<'a> {
                     let kk = self.s.m.i32(u32::from(k));
                     let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                     let x = self.s.m.select(c, is, value, old);
+                    self.s.m.tag(x, Tag::Indexed);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
                 }
                 Ok(())
