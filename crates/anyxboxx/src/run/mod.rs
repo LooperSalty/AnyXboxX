@@ -108,12 +108,18 @@ pub struct RunArgs {
     /// Turn on device-removed data (VICTORY_D3D12_DRED); needs the diagnostics build, so implies --diag.
     #[arg(long, alias = "Dred")]
     pub dred: bool,
-    /// Check for .rpf archives and warm the recorded host pipelines before the game.
+    /// Before the game: translate the game's shaders (`victory shaders --if-needed`, about 30
+    /// minutes once per translator version, then seconds), then make the pipelines earlier runs
+    /// drew with (`victory warm --used`, seconds).
     #[arg(long, alias = "Warm")]
     pub warm: bool,
-    /// Check the shader archive and required DLLs, then warm the recorded host pipelines.
+    /// Like --warm, after checking that the shader archive and the required DLLs are there.
     #[arg(long, alias = "Precompile")]
     pub precompile: bool,
+    /// With --warm or --precompile: make the host pipelines of EVERY pipeline ever created
+    /// instead (the old complete warm: several hours).
+    #[arg(long, alias = "WarmAll")]
+    pub warm_all: bool,
     /// Your own copy of the GDK's offline PC xg_xs.dll (never in this repository).
     #[arg(long, alias = "XgDll")]
     pub xg_dll: Option<PathBuf>,
@@ -196,17 +202,38 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
         println!("Building VIctory ({profile})...");
         victory.exe = steps::build_executable(&mut build)?;
     }
-    if args.warm {
-        println!("Warming the host pipeline cache...");
-        warm_or_fail(&mut victory.warm_command(&[], &env))?;
-    } else if args.precompile {
-        println!("Preparing the recorded host pipelines before launch...");
-        warm_or_fail(&mut victory.warm_command(&[], &env))?;
+    for (label, mut command) in warm_commands(args, &victory, &env) {
+        println!("{label}...");
+        warm_or_fail(&mut command)?;
     }
     status(
         &mut victory.game_command_as(&args.game_dir, &env, args.console),
         "victory",
     )
+}
+
+/// The warm commands of `--warm` / `--precompile`, in order, each with its message: translate the
+/// shaders then make the used pipelines, or the single complete warm with `--warm-all`.
+pub fn warm_commands(args: &RunArgs, victory: &Victory, env: &Env) -> Vec<(&'static str, Command)> {
+    if !(args.warm || args.precompile) {
+        return Vec::new();
+    }
+    if args.warm_all {
+        eprintln!(
+            "warning: --warm-all makes the host pipelines of every pipeline ever created:              several hours."
+        );
+        return vec![("Warming every host pipeline", victory.warm_command(&[], env))];
+    }
+    vec![
+        (
+            "Translating shaders",
+            victory.shaders_command(&args.game_dir, env, None),
+        ),
+        (
+            "Preparing the pipelines you used",
+            victory.warm_used_command(env, None),
+        ),
+    ]
 }
 
 fn warm_or_fail(command: &mut Command) -> Result<(), RunError> {

@@ -29,9 +29,15 @@ BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics "
 GAME = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_DIAG = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_ARCHIVES = r"<root>\game\A.rpf <root>\game\b.rpf"
-# Vice-Tay's `warm` takes no files: it remakes the pipelines earlier runs noted.
-WARM_ARCHIVES = r"victory warm | "
-WARM_PRECOMPILE = r"victory warm | "
+# On the Vice-Tay base the warm is two steps: translate the game's shaders once per translator
+# version (`shaders --if-needed <game>`), then make only the pipelines earlier runs drew with.
+SHADERS = r"victory shaders --if-needed <root>\game | "
+WARM_USED = r"victory warm --used | "
+
+
+def warm(env, exe="victory"):
+    """The two warm calls of `anyxboxx run --warm/--precompile`, run by `exe`."""
+    return [step.replace("victory ", exe + " ", 1) + env for step in (SHADERS, WARM_USED)]
 
 
 # ---- the golden script and the Rust settings ------------------------------------------------
@@ -247,7 +253,7 @@ def test_overrides_apply_to_warm_and_run_after_all_switches(tmp_path, fake_tool,
                 r"VICTORY_XG_DLL=<root>\xg_xs.dll", "VICTORY_XG_MODE=compare")
     env = ";".join(sorted(expected))
     assert calls == [BUILD + "VICTORY_D3D12_DRED=1;VICTORY_FRAMETIME_DUMP=parent",
-                     WARM_ARCHIVES + env, GAME + env], done.stderr
+                     *warm(env), GAME + env], done.stderr
     assert done.returncode == VICTORY_EXIT
 
 
@@ -297,7 +303,7 @@ def test_invalid_override_stops_before_building(tmp_path, fake_tool, binary):
 
 def test_warm_runs_the_game_archives_only_before_the_game(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--warm"])
-    assert calls == [BUILD, WARM_ARCHIVES + default_env(), GAME + default_env()], done.stderr
+    assert calls == [BUILD, *warm(default_env()), GAME + default_env()], done.stderr
 
 
 def test_warm_needs_an_archive(tmp_path, fake_tool, binary):
@@ -310,7 +316,7 @@ def test_precompile_warms_the_shader_archive_and_binaries_with_the_game_environm
     done, calls = launch(tmp_path, fake_tool, binary, ["--no-tuned-settings", "--precompile"],
                          precompile_inputs=True)
     env = ";".join(sorted((GAME_DIR, "VICTORY_DISCORD=0")))
-    assert calls == [BUILD, WARM_PRECOMPILE + env, GAME + env], done.stderr
+    assert calls == [BUILD, *warm(env), GAME + env], done.stderr
     assert done.returncode == VICTORY_EXIT
 
 
@@ -322,7 +328,7 @@ def test_precompile_needs_the_shader_archive(tmp_path, fake_tool, binary):
 
 def test_warm_and_precompile_share_one_pipeline_warm(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--warm", "--precompile"], precompile_inputs=True)
-    assert calls == [BUILD, WARM_ARCHIVES + default_env(), GAME + default_env()], done.stderr
+    assert calls == [BUILD, *warm(default_env()), GAME + default_env()], done.stderr
     assert done.returncode == VICTORY_EXIT
 
 
@@ -345,7 +351,7 @@ def test_cargo_reported_executable_runs_warm_and_game(tmp_path, fake_tool, binar
     monkeypatch.setenv("FAKE_CARGO_ARTIFACT", str(output))
     monkeypatch.setenv("FAKE_TOOL_EXIT_REPORTED_RUN", str(VICTORY_EXIT))
     done, calls = launch(tmp_path, fake_tool, binary, ["--warm"])
-    assert calls == [BUILD, WARM_ARCHIVES.replace("victory ", "reported ", 1) + default_env(),
+    assert calls == [BUILD, *warm(default_env(), "reported"),
                      GAME.replace("victory ", "reported ", 1) + default_env()], done.stderr
     assert done.returncode == VICTORY_EXIT
 

@@ -86,19 +86,17 @@ pub fn play_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> 
     let rebuilds = build.is_some();
     let mut steps: Vec<Step> = build.into_iter().collect();
     if let Some(warm) = plan.warm.as_ref() {
-        let step = warm_step(&victory, plan, warm_first, warm.marker.clone())?;
+        let warm_steps = warm_steps(&victory, plan, warm_first, warm.marker.clone())?;
         if warm.needed {
-            steps.push(step);
+            steps.extend(warm_steps);
         } else if rebuilds {
-            steps.push(step.with_run_if(stale_after_build(
-                &victory,
-                plan,
-                warm_first,
-                warm.marker.clone(),
-            )?));
+            for step in warm_steps {
+                let check = stale_after_build(&victory, plan, warm_first, warm.marker.clone())?;
+                steps.push(step.with_run_if(check));
+            }
         }
     } else if warm_first {
-        steps.push(precompile_step(&victory, plan)?);
+        steps.extend(precompile_steps_unmarked(&victory, plan)?);
     }
     let command = victory.game_command(&plan.game_dir, &plan.env);
     steps.push(match &plan.game_log {
@@ -108,14 +106,14 @@ pub fn play_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> 
     Ok(steps)
 }
 
-/// "Warm now": the full warm of the game's archives (and game binaries when `warm_first` is on),
-/// whatever the marker says.
+/// "Warm now": translate the shaders, then make the pipelines earlier runs drew with, whatever
+/// the marker says.
 pub fn precompile_steps(plan: &Plan, warm_first: bool) -> Result<Vec<Step>, RunError> {
     let victory = resolve_victory(plan)?;
     anyxboxx::run::game_exe(&plan.game_dir)?;
     let mut steps: Vec<Step> = build_step(&victory).into_iter().collect();
     let marker = plan.warm.as_ref().and_then(|warm| warm.marker.clone());
-    steps.push(warm_step(&victory, plan, warm_first, marker)?);
+    steps.extend(warm_steps(&victory, plan, warm_first, marker)?);
     Ok(steps)
 }
 
@@ -151,41 +149,45 @@ fn build_step(victory: &Victory) -> Option<Step> {
         .map(|command| Step::new("Building VIctory", command))
 }
 
-/// `victory warm` on the game folder's own `.rpf` archives (plus the game executable and its DLLs
-/// when `include_precompile` is true, deduplicated), with the game's environment. After a success
-/// the marker gets the fingerprint of that moment (after any build), so the next launch skips the
-/// warm while nothing changed.
-fn warm_step(
+/// Label of the shader translation step.
+pub const TRANSLATE_LABEL: &str = "Translating shaders";
+/// Label of the step that makes the pipelines earlier runs drew with.
+pub const USED_LABEL: &str = "Preparing the pipelines you used";
+
+/// The two steps of the shader preparation: `victory shaders --if-needed <game folder>` (about
+/// 30 minutes once per translator version, seconds afterwards), then `victory warm --used` (only
+/// the pipelines earlier runs drew with). `victory warm` alone would make every pipeline ever
+/// created, hours of work. After the last step succeeds the marker gets the fingerprint of that
+/// moment (after any build), so the next launch skips both while nothing changed.
+fn warm_steps(
     victory: &Victory,
     plan: &Plan,
     include_precompile: bool,
     marker: Option<PathBuf>,
-) -> Result<Step, RunError> {
+) -> Result<Vec<Step>, RunError> {
     let inputs = warm_inputs(&plan.game_dir, include_precompile)?;
-    let mut command = victory.warm_command(&inputs, &plan.env);
-    if let Some(jobs) = plan.jobs {
-        command.arg("--jobs").arg(jobs.to_string());
-    }
-    let step = Step::new("Warming the shader cache", command);
-    Ok(match marker {
+    let translate = Step::new(
+        TRANSLATE_LABEL,
+        victory.shaders_command(&plan.game_dir, &plan.env, plan.jobs),
+    );
+    let used = Step::new(USED_LABEL, victory.warm_used_command(&plan.env, plan.jobs));
+    let used = match marker {
         Some(path) => {
             let (exe, env) = (victory.exe.clone(), plan.env.clone());
-            step.with_after(Box::new(move || {
+            used.with_after(Box::new(move || {
                 warm_state::write_marker(&path, &fingerprint_now(&exe, &env, &inputs))
                     .map_err(|e| format!("could not write {}: {e}", path.display()))
             }))
         }
-        None => step,
-    })
+        None => used,
+    };
+    Ok(vec![translate, used])
 }
 
-/// `victory warm` on shaders.rpf, the game and its DLLs (fallback when no warm state exists).
-fn precompile_step(victory: &Victory, plan: &Plan) -> Result<Step, RunError> {
-    let mut command = victory.precompile_command(&plan.game_dir, &plan.env)?;
-    if let Some(jobs) = plan.jobs {
-        command.arg("--jobs").arg(jobs.to_string());
-    }
-    Ok(Step::new("Preloading shaders", command))
+/// The same two steps when no warm state exists (fallback): checks the game's DLLs and shader
+/// archive first, writes no marker.
+fn precompile_steps_unmarked(victory: &Victory, plan: &Plan) -> Result<Vec<Step>, RunError> {
+    warm_steps(victory, plan, true, None)
 }
 
 /// The fingerprint of this launch: the victory.exe identity, the environment, and the warm inputs.
@@ -287,7 +289,7 @@ mod tests {
             let mut steps = play_steps(plan, false).expect("steps");
             let warm = steps
                 .iter_mut()
-                .find(|s| s.label == "Warming the shader cache")
+                .find(|s| s.label == USED_LABEL)
                 .expect("warm listed after the build");
             (warm.run_if.take().expect("decided after the build"))()
         };
@@ -299,24 +301,76 @@ mod tests {
     }
 
     #[test]
-    fn precompile_step_passes_the_jobs_limit_after_the_inputs() {
-        let (_repo, _game, plan) = fixture();
+    fn warm_now_translates_the_shaders_then_makes_the_used_pipelines() {
+        let (_repo, game, plan) = fixture();
         let steps = precompile_steps(&plan, false).expect("steps");
-        let args = args_of(&steps[1].command);
-        assert_eq!(args.first().map(String::as_str), Some("warm"));
-        let at = args
-            .iter()
-            .position(|a| a == "--jobs")
-            .expect("--jobs given");
-        assert_eq!(args.get(at + 1).map(String::as_str), Some("4"));
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Building VIctory",
+                "Translating shaders",
+                "Preparing the pipelines you used"
+            ]
+        );
+        assert_eq!(
+            args_of(&steps[1].command),
+            vec![
+                "shaders".to_string(),
+                "--if-needed".to_string(),
+                "--jobs".to_string(),
+                "4".to_string(),
+                game.path().to_string_lossy().into_owned(),
+            ]
+        );
+        assert_eq!(args_of(&steps[2].command), ["warm", "--used", "--jobs", "4"]);
     }
 
     #[test]
     fn no_jobs_limit_means_no_flag() {
-        let (_repo, _game, mut plan) = fixture();
+        let (_repo, game, mut plan) = fixture();
         plan.jobs = None;
         let steps = precompile_steps(&plan, false).expect("steps");
-        assert!(!args_of(&steps[1].command).iter().any(|a| a == "--jobs"));
+        assert_eq!(
+            args_of(&steps[1].command),
+            vec![
+                "shaders".to_string(),
+                "--if-needed".to_string(),
+                game.path().to_string_lossy().into_owned(),
+            ]
+        );
+        assert_eq!(args_of(&steps[2].command), ["warm", "--used"]);
+    }
+
+    #[test]
+    fn a_needed_warm_runs_both_steps_and_a_matching_marker_skips_them() {
+        let (_repo, _game, mut plan) = fixture();
+        let prebuilt_dir = tempfile::tempdir().expect("tempdir");
+        let exe = prebuilt_dir.path().join("victory.exe");
+        std::fs::write(&exe, b"MZ").expect("write");
+        plan.victory_exe = Some(exe.clone());
+        let marker_dir = tempfile::tempdir().expect("tempdir");
+        let marker = marker_dir.path().join("warm-state.txt");
+        let check = warm_check(&exe, &plan.env, &plan.game_dir, false, false, Some(marker.clone()))
+            .expect("check");
+        assert!(check.needed);
+        plan.warm = Some(check);
+        let mut steps = play_steps(&plan, false).expect("steps");
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![TRANSLATE_LABEL, USED_LABEL, "Running the game"]
+        );
+        // Only the last step writes the marker.
+        assert!(steps[0].after.is_none());
+        (steps[1].after.take().expect("marker writer"))().expect("write marker");
+        let again = warm_check(&exe, &plan.env, &plan.game_dir, false, false, Some(marker))
+            .expect("check");
+        assert!(!again.needed);
+        plan.warm = Some(again);
+        let steps = play_steps(&plan, false).expect("steps");
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["Running the game"]);
     }
 
     #[test]
@@ -351,7 +405,7 @@ mod tests {
 
         let warm = precompile_steps(&plan, false).expect("warm steps");
         let warm_labels: Vec<&str> = warm.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(warm_labels, vec!["Warming the shader cache"]);
+        assert_eq!(warm_labels, vec![TRANSLATE_LABEL, USED_LABEL]);
         assert_eq!(Path::new(warm[0].command.get_program()), exe.as_path());
     }
 
@@ -391,13 +445,13 @@ mod tests {
             "enabling warm_first after an archives-only warm must warm the binaries once"
         );
 
-        // 2. When warm is needed and warm_first is on: ONE victory warm step.
+        // 2. When warm is needed and warm_first is on: ONE `warm --used` step (after the shaders).
         plan.warm = Some(with_binaries);
         let mut steps = play_steps(&plan, true).expect("play steps");
         let warm_idx: Vec<usize> = steps
             .iter()
             .enumerate()
-            .filter(|(_, s)| args_of(&s.command).first().map(String::as_str) == Some("warm"))
+            .filter(|(_, s)| s.label == USED_LABEL)
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
@@ -405,13 +459,10 @@ mod tests {
             1,
             "warm_first must not run two separate victory warm processes"
         );
-        // Vice-Tay's `warm` takes no archives (it remakes the pipelines earlier runs noted): the
-        // archives and binaries only enter the fingerprint, never the command line.
+        // Vice-Tay's `warm` takes no archives: the archives and binaries only enter the
+        // fingerprint, never the command line.
         let args = args_of(&steps[warm_idx[0]].command);
-        assert!(
-            !args.iter().any(|a| [".rpf", ".exe", ".dll"].iter().any(|ext| a.ends_with(ext))),
-            "Vice-Tay's victory warm refuses file arguments: {args:?}"
-        );
+        assert_eq!(args, ["warm", "--used", "--jobs", "4"]);
 
         // 3. After the combined warm writes its marker, the next launch skips warm completely.
         (steps[warm_idx[0]].after.take().expect("marker writer"))().expect("write marker");
@@ -421,9 +472,7 @@ mod tests {
         plan.warm = Some(after);
         let steps_warm = play_steps(&plan, true).expect("play steps when already warm");
         assert!(
-            !steps_warm
-                .iter()
-                .any(|s| args_of(&s.command).first().map(String::as_str) == Some("warm")),
+            !steps_warm.iter().any(|s| s.label == USED_LABEL || s.label == TRANSLATE_LABEL),
             "warm_first must not re-run victory warm on every launch when cache is already warm"
         );
     }

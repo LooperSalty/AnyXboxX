@@ -18,7 +18,7 @@ impl Stage {
     pub fn label(self) -> &'static str {
         match self {
             Stage::Build => "Building VIctory",
-            Stage::Shaders => "Preloading shaders",
+            Stage::Shaders => "Translating shaders",
             Stage::Start => "Starting the game",
         }
     }
@@ -28,7 +28,10 @@ impl Stage {
         let lower = label.to_lowercase();
         if lower.contains("build") {
             Stage::Build
-        } else if lower.contains("shader") || lower.contains("warm") || lower.contains("preload") {
+        } else if lower.contains("shader")
+            || lower.contains("warm")
+            || lower.contains("preload")
+            || lower.contains("pipeline") {
             Stage::Shaders
         } else {
             Stage::Start
@@ -194,6 +197,11 @@ mod tests {
         assert_eq!(Stage::of_step("Building VIctory"), Stage::Build);
         assert_eq!(Stage::of_step("Warming the shader cache"), Stage::Shaders);
         assert_eq!(Stage::of_step("Preloading shaders"), Stage::Shaders);
+        assert_eq!(Stage::of_step("Translating shaders"), Stage::Shaders);
+        assert_eq!(
+            Stage::of_step("Preparing the pipelines you used"),
+            Stage::Shaders
+        );
         assert_eq!(Stage::of_step("Running the game"), Stage::Start);
     }
 

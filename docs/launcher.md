@@ -36,7 +36,7 @@ The launcher needs your AnyXboxX clone (the folder holding `third_party\victory\
 1. Double-click `anyxboxx-launcher.exe`.
 2. **Setup** page: every line must be green or explained. Rust, the Direct3D 12 runtime, the VC++ redistributable and the GPU driver are checked; the Windows SDK `dxc.exe` is only needed for the repository's GPU tests. Links go to official pages only; the launcher installs nothing itself.
 3. **Game folder** page: pick the folder that holds `game_scarlett_master.exe` (folder picker or automatic detection). The quick check reads only that folder's own files.
-4. **Home**: press **PLAY**. The first time, a full-window screen shows the stages: building VIctory (several minutes, once), preloading shaders, then starting the game. Cancel stops the running step.
+4. **Home**: press **PLAY**. The first time, a full-window screen shows the stages: building VIctory (several minutes, once), translating shaders (`victory shaders --if-needed`: about 30 minutes once per translator version, seconds afterwards), preparing the pipelines you used (`victory warm --used`: only the pipelines earlier runs drew with, seconds), then starting the game. A marker skips both steps while nothing changed. Cancel stops the running step. The old complete warm (`victory warm` alone, which makes every pipeline ever created) takes several hours and is only available as `anyxboxx run --warm-all`.
 5. The game starts in its own window and the launcher closes, unless "Keep the launcher open" is on.
 
 The first run after a new build or a new setting recompiles hundreds of pipelines and runs at well under 1 fps for a while: judge the speed on the second run, once the cache is filled.
