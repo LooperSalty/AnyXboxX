@@ -297,7 +297,7 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
                 _ if ranges.is_empty() => (false, 0),
                 &Step::Copy(_, src, len) => (touches(&ranges, src, src + len), 1),
                 &Step::Fill(_, src, len, _) => (touches(&ranges, src, src + len), 2),
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) | Step::GpuTexture(staging, _, _) => {
                     let (at, len) = staging.memory();
                     (touches(&ranges, at, at + len), 3)
                 }

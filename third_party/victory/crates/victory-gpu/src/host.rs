@@ -40,8 +40,9 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
-    /// The last value signalled on `fence`, behind the submission lock.
+    /// The latest submission fence value reserved under the submission lock.
     submitted: Mutex<u64>,
+    last_signalled: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -1084,7 +1085,10 @@ fn bury_lag() -> u64 {
 
 /// Drops the eligible prefix of each stamp-ordered retirement shard.
 fn bury(finished: u64) {
-    let finished = finished.saturating_sub(bury_lag());
+    bury_up_to(finished.saturating_sub(bury_lag()));
+}
+
+fn bury_up_to(finished: u64) {
     for part in &RETIRED {
         let done: Vec<(u64, Retired)> = {
             let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
@@ -1566,6 +1570,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            last_signalled: Default::default(),
             event,
             rtvs,
             rtv_size,
@@ -3564,8 +3569,12 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a title copy intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
-    GpuTexture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::detile::Upload>),
+    Texture(std::sync::Arc<crate::texture::Staging>, Option<std::sync::Arc<crate::resource::HostTexture>>),
+    GpuTexture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::detile::Upload>,
+        Option<std::sync::Arc<crate::resource::HostTexture>>,
+    ),
     /// Reads a CPU-written linear movie plane into a per-list upload buffer.
     Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
@@ -4476,7 +4485,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) | Step::GpuTexture(staging, _) => {
+                Step::Texture(staging, _) | Step::GpuTexture(staging, _, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -6882,7 +6891,7 @@ impl Host {
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    self.signal_submission(*submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -7442,10 +7451,11 @@ impl Host {
         // the title submitted it, if that is known (`crate::port_journal`),
         // otherwise the enqueue-time `heap_sync` stamp (`SyncRounds`).
         let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
+        let mut heaps_synced = Some(match crate::port_journal::needed() {
             0 => crate::descriptor::begin_sync_heaps_for(heap_sync),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
-        };
+        });
+        let mut heaps_waited_ns = 0u64;
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -7480,6 +7490,15 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        if !behind && crate::texture_lru::needs_submit_maintenance()
+            && self.last_signalled_fence() == *submitted
+            && self.completed_fence() == *submitted
+        {
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced.take());
+            heaps_waited_ns = heaps_began.elapsed().as_nanos() as u64;
+            crate::texture_lru::evict_if_pressured(self);
+        }
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -7664,7 +7683,10 @@ impl Host {
         stage.next("submit: waiting for the heaps' records");
         let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        crate::port_journal::heaps_waited(
+            heaps_waited_ns.saturating_add(heaps_began.elapsed().as_nanos() as u64),
+            heaps_on,
+        );
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -7689,8 +7711,14 @@ impl Host {
         };
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        let texture_frame = crate::texture_lru::enabled().then(crate::frame::current);
         if late {
             *submitted += 1;
+            if let Some(frame) = texture_frame {
+                for list in runs {
+                    list.stamp_textures(frame, *submitted);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             let compare_at = if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -7705,7 +7733,7 @@ impl Host {
                 for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
                     self.queue.ExecuteCommandLists(batch);
                 }
-                self.queue.Signal(&self.fence, *submitted)
+                self.signal_submission(*submitted)
             };
             if crate::detile::on() { crate::detile::sent(*submitted); }
             if crate::feedback::on() {
@@ -7771,6 +7799,11 @@ impl Host {
         submitting(2, runs.len());
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
+            if let Some(frame) = texture_frame {
+                for list in runs {
+                    list.stamp_textures(frame, *submitted);
+                }
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -7779,9 +7812,7 @@ impl Host {
                     self.queue.ExecuteCommandLists(comparison);
                 }
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
+                let waited = self.signal_submission(*submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
@@ -8482,6 +8513,21 @@ impl HostList {
                     self.changed_something();
                 }
                 (before != wanted).then_some((before, wanted))
+            }
+        }
+    }
+
+    /// Records the most recent submission of barrier-tracked and staged textures.
+    fn stamp_textures(&self, frame: u64, fence: u64) {
+        {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, _, copy) in states.values() {
+                copy.note_submitted(frame, fence);
+            }
+        }
+        for step in &self.deferred().copies {
+            if let Step::Texture(_, Some(copy)) | Step::GpuTexture(_, _, Some(copy)) = step {
+                copy.note_submitted(frame, fence);
             }
         }
     }
@@ -9432,14 +9478,25 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len)));
     }
 
-    /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// Keeps the staging buffer alive until reset, and pins the host copy
+    /// for eviction tracking when that experiment is enabled.
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        let pin = crate::texture_lru::enabled().then(|| copy.clone());
+        self.deferred().copies.push(Step::Texture(staging, pin));
     }
 
-    pub(crate) fn defer_gpu_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, upload: std::sync::Arc<crate::detile::Upload>) {
-        self.deferred().copies.push(Step::GpuTexture(staging, upload));
+    pub(crate) fn defer_gpu_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        upload: std::sync::Arc<crate::detile::Upload>,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        let pin = crate::texture_lru::enabled().then(|| copy.clone());
+        self.deferred().copies.push(Step::GpuTexture(staging, upload, pin));
     }
 
 
@@ -9590,12 +9647,12 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuTexture(staging, upload) => {
+                Step::GpuTexture(staging, upload, _) => {
                     batch.texture_due(staging);
                     staging.gpu_fill(upload);
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     if batch.texture_due(staging) {
                         batch.due.push(staging.clone());
                         if !wide_textures() {
@@ -9992,7 +10049,7 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
             Some(Touch::Refresh(key, *from, *from + *len))
         }
         Step::GpuWrite(shadow, ..) => Some(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-        Step::Texture(staging) if textures => {
+        Step::Texture(staging, _) if textures => {
             staged.push(staging.clone());
             None
         }
@@ -10406,7 +10463,7 @@ impl Batch {
                         touches.push(Touch::Refresh(key, *at, *at + *len));
                     }
                     Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-                    Step::Texture(staging) if wide_textures() => {
+                    Step::Texture(staging, _) if wide_textures() => {
                         if self.texture_due(staging) {
                             due.push(staging.clone());
                         }
@@ -11097,6 +11154,62 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    fn signal_submission(&self, value: u64) -> windows::core::Result<()> {
+        // SAFETY: called with the submission lock held; the queue and fence are ours.
+        unsafe { self.queue.Signal(&self.fence, value)? };
+        if crate::texture_lru::enabled() || crate::descriptor::host::kept_views_yield() {
+            self.last_signalled.store(value, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain query on the host fence.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    pub(crate) fn last_signalled_fence(&self) -> u64 {
+        self.last_signalled.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_submit_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    /// Bypass the grace lag only after queued and submitted work has finished.
+    #[cfg(test)]
+    pub(crate) fn flush_retired_for_test(&self) {
+        let (started, finished) = submissions();
+        assert_eq!(started, finished);
+        assert!(self.completed_fence() >= self.last_signalled_fence());
+        bury_up_to(finished);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_fenced_for_test(&self, list: &HostList, gate: Option<&ID3D12Fence>) -> u64 {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        list.stamp_textures(crate::frame::current(), *submitted);
+        list.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let cmd = list.list.cast::<ID3D12CommandList>().expect("closed command list");
+        // SAFETY: closed list, live resources and the host fence, under the submit lock.
+        unsafe {
+            if let Some(gate) = gate {
+                self.queue.Wait(gate, 1).expect("gate host queue");
+            }
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+        }
+        self.signal_submission(*submitted).expect("signal host fence");
+        *submitted
     }
 
     pub(crate) fn texture_readback_buffer(&'static self, size: u64) -> Option<TextureReadback> {

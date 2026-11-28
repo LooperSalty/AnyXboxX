@@ -866,7 +866,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if prefill.is_none() && !baking && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
+        list.defer_texture(staging, &copy);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -921,9 +921,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // memory, which the card drops).
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     if let Some(upload) = gpu {
-        list.defer_gpu_texture(staging.clone(), upload);
+        list.defer_gpu_texture(staging.clone(), upload, &copy);
     } else {
-        list.defer_texture(staging.clone());
+        list.defer_texture(staging.clone(), &copy);
     }
     let Some(on_demand) = on_demand else {
         list.defer_host(move || noted.note_held());
@@ -1911,6 +1911,19 @@ pub(crate) fn unstage(resource: This) {
     {
         crate::resource::set_staged_first(resource, u32::MAX);
     }
+}
+
+/// Detaches staging only for the evicted copy, not for a concurrent replacement.
+pub(crate) fn take_staged(resource: This, serial: u64) -> Option<Arc<Staging>> {
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.as_mut()?;
+    let key = resource as usize;
+    if map.get(&key)?.serial != serial {
+        return None;
+    }
+    let old = map.remove(&key);
+    crate::resource::set_staged_first(resource, u32::MAX);
+    old
 }
 
 /// Where a staged title texture's memory is: address and bytes.

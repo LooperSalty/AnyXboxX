@@ -175,6 +175,9 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Slots still showing a superseded record, changed under `made`'s lock.
+    keeping: Mutex<std::collections::HashMap<u32, u64>>,
+    keeping_slots: Slots,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1933,6 +1936,8 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            keeping: Mutex::default(),
+            keeping_slots: Slots::new(if sampler || !kept_views_yield() { 0 } else { count as usize }),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2702,6 +2707,8 @@ impl HostHeap {
             if shown == key || record_key(handle) != key {
                 return false;
             }
+            // A scheduled publication is not an abandoned view.
+            self.clear_keeping(index);
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
@@ -2767,6 +2774,10 @@ impl HostHeap {
         let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
         let origin = (std::ptr::from_ref(list) as usize, list.epoch());
         {
+            let _made = self.made.lock(index);
+            if record_key(handle) == key {
+                self.clear_keeping(index);
+            }
             let mut pending = PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             pending.push(PendingListFlip {
                 id,
@@ -3006,6 +3017,74 @@ impl HostHeap {
         if !away.is_empty() {
             away.remove(&index);
         }
+    }
+
+    fn set_keeping(&self, index: u32, shown: u64) {
+        if self.sampler || index >= self.count || shown == 0 || !kept_views_yield() {
+            return;
+        }
+        // If the record reverts, mirror must take the slot lock and clear
+        // the mark instead of returning on its lock-free path.
+        self.quick_is(index, 0);
+        let mut keeping = self.keeping.lock().unwrap_or_else(|e| e.into_inner());
+        if keeping.insert(index, shown).is_none() {
+            self.keeping_slots.put(index);
+            KEEPING_TOTAL.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn clear_keeping(&self, index: u32) -> bool {
+        if !self.keeping_slots.remove(index) {
+            return false;
+        }
+        let mut keeping = self.keeping.lock().unwrap_or_else(|e| e.into_inner());
+        if keeping.remove(&index).is_some() {
+            KEEPING_TOTAL.fetch_sub(1, Ordering::Release);
+        }
+        true
+    }
+
+    /// Only touches superseded slots. The caller retires displaced references
+    /// after releasing both the slot locks and the live heap table.
+    pub(crate) fn yield_kept_views_into(&self, removed: &mut Vec<ID3D12Resource>) -> usize {
+        if self.sampler || !kept_views_yield() {
+            return 0;
+        }
+        let slots: Vec<_> = self.keeping.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().map(|(&index, &key)| (index, key)).collect();
+        let mut yielded = 0;
+        let own = std::ptr::from_ref(self) as usize;
+        for (index, key) in slots {
+            let _made = self.made.lock(index);
+            if self.made.get(index) != Some(key)
+                || self.keeping.lock().unwrap_or_else(|e| e.into_inner()).get(&index) != Some(&key)
+            {
+                continue;
+            }
+            // A repeated write can mark the old view again after a flip was
+            // queued. A flip that sharpens it still needs the slot to be made.
+            let sharpens = |flip: &Flip| flip.heap == own && flip.index == index && flip.late.is_none();
+            let pending = PENDING_LIST_COUNT.load(Ordering::Acquire) > 0
+                && PENDING_LIST_FLIPS.lock().unwrap_or_else(|e| e.into_inner())
+                    .iter().any(|item| sharpens(&item.flip));
+            if pending || FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(sharpens) {
+                continue;
+            }
+            self.clear_keeping(index);
+            self.quick_is(index, 0);
+            self.made.set(index, 0);
+            match view_at(key as u32, (key >> 32) as u32) {
+                Some(view) => null_for(&view, self.at(index)),
+                None => null_view(self.at(index)),
+            }
+            self.put(index);
+            self.clear_twin(index);
+            self.write_view_metadata(index, 0, 0);
+            let old = self.kept[index as usize].lock().unwrap_or_else(|e| e.into_inner()).take();
+            removed.extend(old);
+            yielded += 1;
+        }
+        yielded
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -3438,6 +3517,7 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.clear_keeping(index);
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3885,6 +3965,7 @@ impl HostHeap {
                 let kin = kin(&old, &view);
                 if kin == Kin::Same {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.set_keeping(index, shown);
                     drop(held);
                     self.unmake_stale(index, stale);
                     return Some(view);
@@ -3896,6 +3977,7 @@ impl HostHeap {
                     let kept = kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
+                        self.set_keeping(index, shown);
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -3918,6 +4000,7 @@ impl HostHeap {
             if let Some(after) = after {
                 // Asked again (each draw that reads the slot, each pass)
                 // while it waits: nothing more to do.
+                self.clear_keeping(index);
                 let own = (std::ptr::from_ref(self) as usize, index, key);
                 if !NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(own) {
                     drop(held);
@@ -3971,6 +4054,8 @@ impl HostHeap {
             self.quick_is(index, ready_key);
             drop(held);
             self.unmake_stale(index, stale);
+        } else if self.clear_keeping(index) {
+            self.quick_is(index, key);
         }
         Some(view)
     }
@@ -5264,18 +5349,52 @@ fn kin(old: &View, new: &View) -> Kin {
     }
 }
 
+static KEEPING_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn keeping_total() -> usize {
+    KEEPING_TOTAL.load(Ordering::Acquire)
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        let marked = self.keeping.get_mut().unwrap_or_else(|e| e.into_inner()).len();
+        KEEPING_TOTAL.fetch_sub(marked, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_YIELD: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Superseded views may yield under pressure only with explicit opt-in.
+pub(crate) fn kept_views_yield() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_YIELD.get() {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::opt_in(std::env::var("VICTORY_KEPT_VIEWS_YIELD").ok().as_deref()))
+}
+
 /// Whether a slot that is written with a view of another texture goes on
 /// showing the one it shows until the new one is made and its upload has run
 /// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
 /// texture; 1: one of the same kind in another place or size; 2: any of the
-/// same dimension.
+/// same dimension. The default is 1 unless kept-view yield is enabled and
+/// there is no room for more textures.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }
-    static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+    static KEEP: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    let explicit = *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()));
+    keep_shown_with(explicit, kept_views_yield(), crate::texture_lru::has_room_lately)
+}
+
+fn keep_shown_with(explicit: Option<u8>, yield_enabled: bool, has_room: impl FnOnce() -> bool) -> u8 {
+    explicit.unwrap_or_else(|| u8::from(!yield_enabled || has_room()))
 }
 
 /// Slots that showed a texture and were written with a view of another,
@@ -5700,6 +5819,10 @@ mod typed_uav_tests;
 #[cfg(test)]
 #[path = "alpha_view_tests.rs"]
 mod alpha_view_tests;
+
+#[cfg(test)]
+#[path = "kept_yield_tests.rs"]
+mod kept_yield_tests;
 
 #[cfg(test)]
 mod tests {
