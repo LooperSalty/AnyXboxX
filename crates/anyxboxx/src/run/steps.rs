@@ -69,7 +69,7 @@ impl Victory {
         } else {
             command.args(["build", "--release", "-p", "victory"]);
         }
-        command.arg("--manifest-path").arg(manifest);
+        command.arg("--locked").arg("--manifest-path").arg(manifest);
         Some(command)
     }
 

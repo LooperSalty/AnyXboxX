@@ -22,9 +22,9 @@ GOLDEN = REPO / "tests" / "fixtures" / "lancer_victory_vicetay.ps1"
 SETTINGS = REPO / "crates" / "anyxboxx" / "src" / "run" / "settings.rs"
 CARGO_FAILURE, VICTORY_EXIT = 101, 7
 GAME_DIR = "VICTORY_GAME_DIR=<root>\\game"
-BUILD = (r"cargo build --release -p victory --manifest-path <root>\depot\third_party\victory\Cargo.toml "
+BUILD = (r"cargo build --release -p victory --locked --manifest-path <root>\depot\third_party\victory\Cargo.toml "
          "--message-format=json-render-diagnostics | ")
-BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics "
+BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics --locked "
               r"--manifest-path <root>\depot\third_party\victory\Cargo.toml --message-format=json-render-diagnostics | ")
 GAME = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_DIAG = r"victory run <root>\game\game_scarlett_master.exe --execute | "
