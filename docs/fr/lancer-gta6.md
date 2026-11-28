@@ -389,7 +389,7 @@ Ils demandent le build `diag`.
 | `VICTORY_SHOW_TARGET=busiest` | Affiche la cible de rendu la plus chargée à la place de l'image finale (par exemple le G-buffer). |
 | `VICTORY_D3D12_DRED=1` | En cas de panne du GPU, donne les commandes en cours. Ralentit le monde d'environ 2,5 fois : à n'activer que pour enquêter sur un device removed. |
 | `VICTORY_D3D12_DEBUG=1` | Couche de débogage D3D12 (Graphics Tools requis). |
-| `VICTORY_GPU_TIMING=1` | Chronomètre chaque liste de commandes et journalise les lentes. |
+| `VICTORY_GPU_TIMING=1` | Chronomètre chaque liste de commandes et journalise les lentes, avec leurs commandes les plus lentes et le temps par commande dans les statistiques de copie. Fonctionne avec `VICTORY_D3D12_DRED=light` (le jeu de réglages du lanceur) ou sans DRED ; le DRED complet n'est pas nécessaire. |
 | `VICTORY_SKIP_PIPELINES=<hash,...>` | Omet les dessins et dispatchs qui utilisent les hash de shader à 16 chiffres listés. |
 | `VICTORY_LOG=<cible>=debug,...` | Sortie debug et trace. |
 

@@ -1632,6 +1632,41 @@ mod tests {
         host.execute(&[&list]);
     }
 
+    /// Timing names and times the commands without full device-removed
+    /// data (`VICTORY_D3D12_DRED=light` or off), with no marker each; full
+    /// device-removed data keeps markers, timed or not.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn timing_notes_commands_without_full_device_removed_data() {
+        assert_eq!(super::noting(false, true), (true, false));
+        assert_eq!(super::noting(true, false), (true, true));
+        assert_eq!(super::noting(true, true), (true, true));
+        assert_eq!(super::noting(false, false), (false, false));
+    }
+
+    /// A slow list is one whose wait was long, not one whose report took
+    /// long: with the report's work delayed, the commands are named and the
+    /// list is not slow; with its wait delayed, the same names and slow
+    /// (the control andrewpozdnakov7-jpg ran in Marvisak/VIctory#3623, here
+    /// without a device).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_slow_list_is_its_wait_not_the_time_its_report_takes() {
+        let named = || vec![(2.5, "Dispatch 8x1x1".to_owned()), (0.5, "CopyBufferRegion".to_owned())];
+        let pause = super::SLOW_LIST + std::time::Duration::from_millis(10);
+        let started = std::time::Instant::now();
+        let collected = super::timed_list(started, || {
+            std::thread::sleep(pause);
+            named()
+        });
+        assert_eq!((collected.slow, &collected.commands), (false, &named()));
+        let started = std::time::Instant::now();
+        std::thread::sleep(pause);
+        let waited = super::timed_list(started, named);
+        assert_eq!((waited.slow, &waited.commands), (true, &named()));
+        assert!(waited.wall >= pause);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2661,11 +2696,48 @@ fn card_budget() -> bool {
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds; the commands are noted whatever `VICTORY_D3D12_DRED` is).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// A list that took longer than this from its submission to its fence is
+/// logged as slow, with its slowest commands (`VICTORY_GPU_TIMING`).
+#[cfg(feature = "diagnostics")]
+const SLOW_LIST: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What timing reports of one list: its wall time from submission to its
+/// fence, whether that makes it slow, and its noted commands' GPU times,
+/// longest first.
+#[cfg(feature = "diagnostics")]
+struct TimedList {
+    wall: std::time::Duration,
+    slow: bool,
+    commands: Vec<(f64, String)>,
+}
+
+/// Times a list submitted at `started` whose fence was just reached: the
+/// wall time is read before `samples` reads and sorts the command
+/// timestamps (once, for the totals and the slow-list lines), so the time
+/// the report takes never makes a list look slow.
+#[cfg(feature = "diagnostics")]
+fn timed_list(started: std::time::Instant, samples: impl FnOnce() -> Vec<(f64, String)>) -> TimedList {
+    let wall = started.elapsed();
+    let commands = samples();
+    TimedList { wall, slow: wall > SLOW_LIST, commands }
+}
+
+/// What [`HostList::note`] keeps of a command, by whether full
+/// device-removed data and timing are on: (its text and a timestamp before
+/// it, a marker command with the text). Timing needs the texts and the
+/// stamps, not the markers: with `VICTORY_D3D12_DRED=light` (the launcher's
+/// tuned set) or no device-removed data at all, the commands are still
+/// timed and named, without a marker each.
+#[cfg(feature = "diagnostics")]
+const fn noting(dred_on: bool, timing: bool) -> (bool, bool) {
+    (dred_on || timing, dred_on)
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -7800,31 +7872,29 @@ impl Host {
             self.verify_texture_readback_fence(*submitted, report_removed);
             // With timing on, record each list's time to signal separately.
             // For title lists, also add their commands' times by pipeline.
-            #[cfg(feature = "diagnostics")]
-            if timing() {
-                let wall = started.elapsed().as_micros() as u64;
-                let mut noted = 0.0;
-                if let crate::copystat::Timed::Title(run) = _kind {
-                    // SAFETY: a plain query.
-                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                    for (ms, op) in runs[run].slowest(frequency, usize::MAX) {
-                        crate::copystat::command_took(&op, ms);
-                        noted += ms;
-                    }
-                }
-                crate::copystat::list_took(_kind, wall, (noted * 1e3) as u64);
-            }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay
             // frame, each a submission of its own, printed nothing.
             #[cfg(feature = "diagnostics")]
-            if let (true, crate::copystat::Timed::Title(i)) = (timing() && started.elapsed() > std::time::Duration::from_millis(50), _kind) {
+            if timing() {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                let report = timed_list(started, || match _kind {
+                    crate::copystat::Timed::Title(run) => runs[run].slowest(frequency, usize::MAX),
+                    _ => Vec::new(),
+                });
+                let mut noted = 0.0;
+                for (ms, op) in &report.commands {
+                    crate::copystat::command_took(op, *ms);
+                    noted += ms;
+                }
+                crate::copystat::list_took(_kind, report.wall.as_micros() as u64, (noted * 1e3) as u64);
+                if let (true, crate::copystat::Timed::Title(i)) = (report.slow, _kind) {
+                    let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    tracing::warn!(ms = report.wall.as_millis(), commands, "slow host list");
+                    for (ms, op) in report.commands.iter().take(6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
             }
         }
@@ -8835,7 +8905,8 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        let (keep, marker) = noting(dred_on(), timing());
+        if !keep {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -8848,12 +8919,14 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if marker {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

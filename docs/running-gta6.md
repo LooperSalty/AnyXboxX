@@ -389,7 +389,7 @@ These need the `diag` build.
 | `VICTORY_SHOW_TARGET=busiest` | Shows the busiest render target instead of the final image (for example the G-buffer). |
 | `VICTORY_D3D12_DRED=1` | On a GPU failure, reports the commands in flight. It slows the world by about 2.5x: turn it on only to investigate a device removed. |
 | `VICTORY_D3D12_DEBUG=1` | D3D12 debug layer (Graphics Tools required). |
-| `VICTORY_GPU_TIMING=1` | Times each command list and logs the slow ones. |
+| `VICTORY_GPU_TIMING=1` | Times each command list and logs the slow ones, with their slowest commands and the per-command time in the copy statistics. Works with `VICTORY_D3D12_DRED=light` (the launcher's tuned set) or no DRED at all; full DRED is not needed. |
 | `VICTORY_SKIP_PIPELINES=<hash,...>` | Omits the draws and dispatches that use the listed 16-digit shader hashes. |
 | `VICTORY_LOG=<target>=debug,...` | Debug and trace output. |
 
