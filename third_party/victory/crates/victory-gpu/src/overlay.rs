@@ -6,6 +6,7 @@
 //! while one of this process's windows is in front. Not for exclusive fullscreen (the swap chain
 //! is windowed, flip model, so a topmost window above it is composed as usual).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 
@@ -22,14 +23,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::cpucores::CpuMeter;
+use crate::frame_rate::FrameRate;
 use crate::pixels::{Bitmap, short_cpu, short_gpu};
 
 mod pools;
 use pools::PoolFigures;
 pub(crate) use pools::{Pool, set_pool, set_pool_off, set_pool_threads};
 
-/// Frames per second and ms per frame, times 100, from the present path's one-second meter.
-static FPS_X100: AtomicU64 = AtomicU64::new(0);
+/// Render time used to calculate worker pool utilization, in hundredths of a millisecond.
 static MS_X100: AtomicU64 = AtomicU64::new(0);
 /// The newest machine sample, for the window and for screenshots.
 static STATS: Mutex<Option<Stats>> = Mutex::new(None);
@@ -43,7 +44,7 @@ const KEYS: usize = 2;
 /// What the panel shows.
 #[derive(Clone, Default)]
 pub(crate) struct Stats {
-    fps: f64,
+    rate: FrameRate,
     ms: f64,
     cpu: f64,
     gpu: Option<f64>,
@@ -65,30 +66,43 @@ pub(crate) struct Stats {
     making: u64,
 }
 
-/// Draws per frame, times 100, and the meter's last thirty frame rates (one a second).
-static DRAWS_X100: AtomicU64 = AtomicU64::new(0);
-static RATES: Mutex<std::collections::VecDeque<f64>> = Mutex::new(std::collections::VecDeque::new());
+struct FrameHistory {
+    rates: VecDeque<FrameRate>,
+    ms: f64,
+    draws: f64,
+}
 
-/// Called once a second by the present path's meter.
-pub(crate) fn set_frame(fps: f64, ms: f64, draws: f64) {
-    FPS_X100.store((fps * 100.0) as u64, Ordering::Relaxed);
-    MS_X100.store((ms * 100.0) as u64, Ordering::Relaxed);
-    DRAWS_X100.store((draws * 100.0) as u64, Ordering::Relaxed);
-    let mut rates = RATES.lock().unwrap_or_else(|e| e.into_inner());
-    rates.push_back(fps);
-    while rates.len() > 30 {
-        rates.pop_front();
+impl FrameHistory {
+    fn push(&mut self, rate: FrameRate) {
+        if self.rates.len() == 30 {
+            self.rates.pop_front();
+        }
+        self.rates.push_back(rate);
+    }
+
+    fn half_minute(&self) -> Option<(f64, f64, f64)> {
+        (self.rates.len() >= 2).then(|| {
+            let shown = self.rates.iter().map(|rate| rate.shown);
+            let (high, low) = shown.clone().fold((f64::MIN, f64::MAX), |(h, l), r| (h.max(r), l.min(r)));
+            (high, low, shown.sum::<f64>() / self.rates.len() as f64)
+        })
     }
 }
 
-/// Draws per frame, and the highest, lowest and mean of the last thirty seconds' frame rates.
-fn more_figures() -> (f64, Option<(f64, f64, f64)>) {
-    let rates = RATES.lock().unwrap_or_else(|e| e.into_inner());
-    let half_minute = (rates.len() >= 2).then(|| {
-        let (high, low) = rates.iter().fold((f64::MIN, f64::MAX), |(h, l), &r| (h.max(r), l.min(r)));
-        (high, low, rates.iter().sum::<f64>() / rates.len() as f64)
-    });
-    (DRAWS_X100.load(Ordering::Relaxed) as f64 / 100.0, half_minute)
+static HISTORY: Mutex<FrameHistory> = Mutex::new(FrameHistory { rates: VecDeque::new(), ms: 0.0, draws: 0.0 });
+
+/// Called once a second by the present path's meter.
+pub(crate) fn set_frame(rate: FrameRate, ms: f64, draws: f64) {
+    MS_X100.store((ms * 100.0) as u64, Ordering::Relaxed);
+    let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    history.push(rate);
+    history.ms = ms;
+    history.draws = draws;
+}
+
+fn frame_figures() -> (FrameRate, f64, f64, Option<(f64, f64, f64)>) {
+    let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    (history.rates.back().copied().unwrap_or_default(), history.ms, history.draws, history.half_minute())
 }
 
 /// The stats to draw into a screenshot now (`None` when the overlay is off or hidden): the newest
@@ -98,18 +112,13 @@ pub(crate) fn snapshot() -> Option<Stats> {
         return None;
     }
     let mut s = STATS.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    (s.fps, s.ms) = frame_figures();
-    (s.draws, s.half_minute) = more_figures();
+    (s.rate, s.ms, s.draws, s.half_minute) = frame_figures();
     Some(s)
 }
 
 /// Milliseconds per frame, from the present path's meter (0 before the first second).
 pub(crate) fn frame_ms() -> f64 {
     MS_X100.load(Ordering::Relaxed) as f64 / 100.0
-}
-
-fn frame_figures() -> (f64, f64) {
-    (FPS_X100.load(Ordering::Relaxed) as f64 / 100.0, MS_X100.load(Ordering::Relaxed) as f64 / 100.0)
 }
 
 /// Starts the overlay thread for the game window `hwnd` (the first call only).
@@ -260,8 +269,7 @@ fn sample(cpu: &mut Cpu, cores: &mut CpuMeter, gpu: Option<&mut Gpu3d>, adapter:
         Some(Ok(())) => Some((vram.CurrentUsage as f64 / GB, vram.Budget as f64 / GB)),
         _ => None,
     };
-    let (fps, ms) = frame_figures();
-    let (draws, half_minute) = more_figures();
+    let (rate, ms, draws, half_minute) = frame_figures();
     cores.sample();
     Stats {
         cores: cores.cores_pct.clone(),
@@ -269,7 +277,7 @@ fn sample(cpu: &mut Cpu, cores: &mut CpuMeter, gpu: Option<&mut Gpu3d>, adapter:
         making: crate::pipeline::making(),
         draws,
         half_minute,
-        fps,
+        rate,
         ms,
         cpu: cpu.percent(),
         gpu: gpu.and_then(Gpu3d::percent),
@@ -533,10 +541,12 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
         short_gpu(&stats.gpu_name),
         format!("{:.0} GB RAM  \u{b7}  build {}", stats.ram.2.round(), option_env!("VICTORY_BUILD").unwrap_or("?")),
     ];
-    let fps_text = format!("{:.0}", stats.fps);
-    let ms_text = format!("{:.1} ms", stats.ms);
+    let fps_text = format!("{:.0}", stats.rate.shown);
+    let fps_unit = stats.rate.unit("FPS", 0);
+    let ms_unit = if stats.rate.active { "ms/render" } else { "ms" };
+    let ms_text = format!("{:.1} {ms_unit}", stats.ms);
     // Width: the widest line, with at least a comfortable minimum.
-    let top = g.measure(BIG, &fps_text).0 + px(6.0) + g.measure(SMALL, "FPS").0 + gap * 2 + g.measure(VALUE, &ms_text).0;
+    let top = g.measure(BIG, &fps_text).0 + px(6.0) + g.measure(SMALL, &fps_unit).0 + gap * 2 + g.measure(VALUE, &ms_text).0;
     let (bar_min, bar_gap) = (px(3.0), px(2.0));
     let cores_min = stats.cores.len() as i32 * (bar_min + bar_gap);
     let body = items.iter().filter_map(|it| match it {
@@ -566,9 +576,9 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let right = |font, text: &str| w - pad - g.measure(font, text).0;
     let mut y = pad;
     // The big number with FPS beside it on the same baseline; the frame time at the right edge.
-    g.draw(&mut bm, BIG, &fps_text, pad, y, fps_colour(stats.fps));
+    g.draw(&mut bm, BIG, &fps_text, pad, y, fps_colour(stats.rate.shown));
     let nx = pad + g.measure(BIG, &fps_text).0 + px(6.0);
-    g.draw(&mut bm, SMALL, "FPS", nx, y + g.ascent[BIG] - g.ascent[SMALL], DIM);
+    g.draw(&mut bm, SMALL, &fps_unit, nx, y + g.ascent[BIG] - g.ascent[SMALL], DIM);
     g.draw(&mut bm, VALUE, &ms_text, right(VALUE, &ms_text), y + g.ascent[BIG] - g.ascent[VALUE], WHITE);
     y += big_h + sep / 2;
     let line = |bm: &mut Bitmap, y: i32| {
@@ -746,8 +756,8 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
             if TICKS.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
                 let s = &stats;
                 tracing::info!(
-                    "overlay: {:.1} fps {:.1} ms, cpu {:.0}%, gpu {}, ram {:.1}/{:.1} GB (process {:.1}), vram {}, {:.0} draws, 30 s {}, threads: {}",
-                    s.fps, s.ms, s.cpu,
+                    "overlay: {:.1} {} {:.1} ms, cpu {:.0}%, gpu {}, ram {:.1}/{:.1} GB (process {:.1}), vram {}, {:.0} draws, 30 s {}, threads: {}",
+                    s.rate.shown, s.rate.unit("fps", 1), s.ms, s.cpu,
                     s.gpu.map_or("?".into(), |g| format!("{g:.0}%")),
                     s.ram.1, s.ram.2, s.ram.0,
                     s.vram.map_or("?".into(), |(u, b)| format!("{u:.1}/{b:.1} GB")),
@@ -805,6 +815,30 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_minute_tracks_shown_fps_across_mode_changes() {
+        use crate::frame_rate::{FrameCounts, FrameGeneration};
+        use std::time::Duration;
+
+        let mut history = FrameHistory { rates: VecDeque::new(), ms: 0.0, draws: 0.0 };
+        for (sample, fg) in [FrameGeneration::Off, FrameGeneration::Reported(2)].into_iter().enumerate() {
+            let mut counts = FrameCounts::default();
+            for _ in 0..17 {
+                counts.record(fg);
+            }
+            history.push(counts.rates(Duration::from_secs(1)));
+            if sample == 0 {
+                assert_eq!(history.half_minute(), None);
+            }
+        }
+        assert_eq!(history.half_minute(), Some((34.0, 17.0, 25.5)));
+        let active = *history.rates.back().unwrap();
+        for _ in 0..29 {
+            history.push(active);
+        }
+        assert_eq!(history.half_minute(), Some((34.0, 34.0, 34.0)));
+    }
 
     #[test]
     fn bar_height_is_proportional_with_a_one_pixel_floor() {
