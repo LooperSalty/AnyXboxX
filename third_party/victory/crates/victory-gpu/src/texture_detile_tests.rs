@@ -100,6 +100,7 @@ fn staging(device: &ID3D12Device, title: &[u8], layout: &Layout, cpu: bool) -> S
         rows,
         layout: layout.clone(),
         mips: desc.mips,
+        clamp_host_size: None,
         first: 0,
         read: layout.size as usize,
         level0: 0,

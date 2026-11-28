@@ -1120,10 +1120,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        // (Every level of both, before their host copies are asked for:
-        // `crate::resource::keep_whole`.)
-        crate::resource::keep_whole(dst);
-        crate::resource::keep_whole(src);
+        // Restore the original subresource numbering before looking up either side.
+        crate::texture_mip_clamp::ensure_unclamped(dst);
+        crate::texture_mip_clamp::ensure_unclamped(src);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1222,10 +1221,9 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        // Subresources are named by level: every level of both textures
-        // (`crate::resource::keep_whole`; buffers are left alone).
-        crate::resource::keep_whole(dst.resource);
-        crate::resource::keep_whole(src.resource);
+        // Includes the texture source of a readback. Buffers are left alone.
+        crate::texture_mip_clamp::ensure_unclamped(dst.resource);
+        crate::texture_mip_clamp::ensure_unclamped(src.resource);
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1499,9 +1497,8 @@ extern "system" fn resolve(
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && {
-            // (Every level of both: `crate::resource::keep_whole`.)
-            crate::resource::keep_whole(dst);
-            crate::resource::keep_whole(src);
+            crate::texture_mip_clamp::ensure_unclamped(dst);
+            crate::texture_mip_clamp::ensure_unclamped(src);
             true
         }
         && let (Some(to), Some(from)) = (

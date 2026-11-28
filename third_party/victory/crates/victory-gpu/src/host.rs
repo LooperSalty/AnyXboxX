@@ -7479,6 +7479,9 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        if late && crate::texture_mip_clamp::has_unclamped_rebinds() && flying() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
@@ -7665,6 +7668,11 @@ impl Host {
         let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
         crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        crate::texture_mip_clamp::flush_unclamped_rebinds(|| {
+            if flying() {
+                self.settle(&mut submitted, WHY_SYNC);
+            }
+        });
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();

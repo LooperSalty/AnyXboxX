@@ -28,10 +28,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by

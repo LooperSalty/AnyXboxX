@@ -2488,6 +2488,50 @@ impl HostHeap {
     /// gives nothing is a whole texture staged and copied for nothing.
     const WAITING_A_PASS: usize = 128;
 
+    /// Rewrites mirrored SRVs of upgraded textures, including slots still
+    /// showing an older copy from before a view requested larger levels.
+    /// Skips dynamic-table snapshots: recorded but unsubmitted lists may still
+    /// hold the displaced copy's descriptors. Those slots keep their resource
+    /// references until release; retirement of the displaced copy relies on
+    /// fence-aware `crate::host::retire` for submitted work.
+    fn rebind_unclamped(
+        &self,
+        resources: &std::collections::HashSet<usize>,
+        placed: &std::collections::HashSet<u64>,
+    ) {
+        for index in 0..self.count {
+            let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
+                continue;
+            };
+            // Follow the view actually shown, not a newer write still waiting for upload.
+            let view = match view_at(key as u32, (key >> 32) as u32) {
+                Some(view @ View::Shader(r, _)) if resources.contains(&r) => view,
+                Some(View::Placed(false, desc, srv)) => {
+                    let address = u64::from(srv[10]) | u64::from(srv[11]) << 32;
+                    if desc[0] == 1 || !placed.contains(&address) {
+                        continue;
+                    }
+                    let Some(r) = crate::resource::texture_at(address, &desc) else {
+                        continue;
+                    };
+                    if !resources.contains(&(r as usize)) {
+                        continue;
+                    }
+                    View::Shader(r as usize, srv[..10].try_into().ok())
+                }
+                _ => continue,
+            };
+            let _made = self.made.lock(index);
+            if self.made.get(index) != Some(key) {
+                continue;
+            }
+            if let Some(kept) = make(&view, self.at(index)) {
+                self.put(index);
+                self.keep(index, kept);
+            }
+        }
+    }
+
     pub(crate) fn texture_views_remade(&self) -> usize {
         if self.sampler {
             return 0;
@@ -3458,7 +3502,7 @@ impl HostHeap {
     }
 
     /// What slot `index` views.
-    fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+    pub(crate) fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -4887,6 +4931,23 @@ fn constant_twinned(
     true
 }
 
+/// Called only once earlier submissions have settled and heap sync has joined.
+pub(crate) fn rebind_unclamped_srvs(
+    resources: &std::collections::HashSet<usize>,
+    placed: &std::collections::HashSet<u64>,
+) {
+    let heaps = super::SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay alive while this lock is held.
+        let heap = unsafe { &*(at as *const super::Heap) };
+        if let Some(Some(host)) = heap.host.get()
+            && !host.sampler
+        {
+            host.rebind_unclamped(resources, placed);
+        }
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4996,7 +5057,13 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    if copy.clamp_saved_bytes.is_some() {
+                        // SAFETY: a live resource.
+                        let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                        adjust_srv_for_base_mip(desc, copy.base, own_mips);
+                    } else {
+                        from_base(desc, copy.base, None);
+                    }
                 }
                 // Made whole from the store: all its levels.
                 let prefilled = copy.prefill.as_deref().map_or(0, crate::texture::Prefill::published);
@@ -5160,20 +5227,47 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
     t.ResourceMinLODClamp = 0.0;
 }
 
+/// Rebase a view to the budget-clamped host copy and bound its range and LOD.
+/// This is lossy: shader `Load(.., mip)`, `GetDimensions`, and texel-size math
+/// see the rebased view, not the texture's original mip numbering and size.
+pub(crate) fn adjust_srv_for_base_mip(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    base: u32,
+    own_mips: u32,
+) {
+    if base != 0 {
+        from_base(desc, base, Some(own_mips.max(1)));
+    }
+}
+
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
-/// is left out.
+/// is left out. `own_mips` also bounds views of budget-clamped copies.
 /// (A 2D array view of the one-layer texture too: the size cap,
 /// `crate::tiles::max_size`, gives such copies a later first level whatever
 /// views the title makes of them.)
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: Option<u32>) {
     let rebase = |most: &mut u32, mips: &mut u32, clamp: &mut f32| {
         let lost = base.saturating_sub(*most);
         *most = most.saturating_sub(base);
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(lost).max(1);
         }
-        *clamp = (*clamp - base as f32).max(0.0);
+        if let Some(own_mips) = own_mips {
+            *most = (*most).min(own_mips - 1);
+            let remaining = own_mips - *most;
+            let shown = if *mips == u32::MAX {
+                remaining
+            } else {
+                *mips = (*mips).min(remaining);
+                *mips
+            };
+            let last = (*most + shown - 1) as f32;
+            let shifted = if clamp.is_finite() { *clamp - base as f32 } else { 0.0 };
+            *clamp = shifted.clamp(0.0, last);
+        } else {
+            *clamp = (*clamp - base as f32).max(0.0);
+        }
     };
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
@@ -5702,6 +5796,10 @@ mod typed_uav_tests;
 mod alpha_view_tests;
 
 #[cfg(test)]
+#[path = "mip_clamp_tests.rs"]
+mod mip_clamp_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5761,7 +5859,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, None);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
@@ -5776,7 +5874,7 @@ mod tests {
         array.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         array.Anonymous.Texture2DArray =
             D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 1, MipLevels: 5, FirstArraySlice: 0, ArraySize: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
-        from_base(&mut array, 2);
+        from_base(&mut array, 2, None);
         // SAFETY: the member its dimension says.
         let t = unsafe { array.Anonymous.Texture2DArray };
         assert_eq!((t.MostDetailedMip, t.MipLevels, t.ArraySize), (0, 4, 1));
